@@ -906,7 +906,24 @@
     res.changedAt = performance.now();
     try { map.setPixelRatio(r); } catch (e) { /* starší MapLibre */ }
   }
-  function frameBudgetMs() { return 1000 / Math.max(30, PERF.refresh_hz || 60); }
+  // Skutečná kadence snímků stránky: QtWebEngine řídí requestAnimationFrame 60 Hz i na 120Hz
+  // displeji (změřeno: 16,7 ms) – rozpočet podle displeje by každý snímek označil za pomalý
+  // a rozlišení mapy zbytečně snížil. Rozpočet = delší z obou.
+  var rafCadenceMs = 0;
+  function calibrateCadence() {
+    var t = [], last = 0;
+    function f(now) {
+      if (last) t.push(now - last);
+      last = now;
+      if (t.length < 40) { requestAnimationFrame(f); return; }
+      t.sort(function (a, b) { return a - b; });
+      rafCadenceMs = t[Math.floor(t.length / 2)];
+    }
+    requestAnimationFrame(f);
+  }
+  calibrateCadence();
+  window.getFrameCadence = function () { return rafCadenceMs; };
+  function frameBudgetMs() { return Math.max(1000 / Math.max(30, PERF.refresh_hz || 60), rafCadenceMs || 0); }
   function adaptResolution(now) {     // volá se z 'render' během pohybu kamery
     var dt = res.lastFrame ? now - res.lastFrame : 0;
     res.lastFrame = now;

@@ -4787,6 +4787,8 @@ class MainWindow(QMainWindow):
         if self._ai_daemon and self._ai_daemon.isRunning():
             self._ai_daemon.stop()
             self._ai_daemon.wait(2000)
+        # snížený limit kopií videí platí hned (jen mazání nejdéle nepoužitých souborů)
+        video_proxy.enforce_budget(int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB)))
         self._start_ai_daemon()
 
     # ── Vzpomínky (Polish P2) ─────────────────────────────────────────────────

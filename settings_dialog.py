@@ -23,14 +23,19 @@ from ui_controls import AccentPicker, KButton, SegmentedControl, ToggleSwitch
 from config import load_config, save_config, DEFAULT_CONFIG
 from paths import THUMB_DIR, FACE_DIR
 from cache_tools import clear_thumbnail_cache
+import perf_profile
 import preview_cache
 import theme
+import video_proxy
 import tokens
 import brand
 
 THEME_CHOICES = (("dark", "Tmavý"), ("light", "Světlý"), ("system", "Podle systému"))
 PREVIEW_MB_RANGE = (512, 8192)
 PREVIEW_MB_STEP = 256
+PROXY_MB_RANGE = (1024, 32768)
+PROXY_MB_STEP = 512
+PERF_CHOICES = [("Automaticky", "auto"), ("Plný", "high"), ("Vyvážený", "standard"), ("Úsporný", "baseline")]
 
 
 def get_folder_size_mb(path):
@@ -410,6 +415,33 @@ class SettingsDialog(QDialog):
                                "databáze a vaše fotografie se tím nemění."))
         self.refresh_cache_size_label()
 
+        # Fáze 1: adaptivní škálování a proxy videí (rozhodnutí C: limit úložiště v Předvolbách)
+        g = self._group(layout, "Výkon a videa")
+        tier = self.config.get("performance_tier", "auto")
+        self.perf_switch = SegmentedControl(PERF_CHOICES, current=tier if tier in dict(PERF_CHOICES) else "auto")
+        self._row(g, "Výkon", self.perf_switch)
+        detected = perf_profile.classify(os.cpu_count() or 4, perf_profile.total_ram_gb())
+        self._row(g, stacked=_hint(
+            f"Automaticky podle počítače – tento je „{dict(PERF_CHOICES).get(detected, detected)}“. Plný: 4K HDR "
+            "videa přímo, nejostřejší 3D mapa. Úsporný: videa přes 1080p kopie, lehčí mapa a méně práce na pozadí. "
+            "Projeví se po restartu."))
+
+        self.lbl_proxy_mb = QLabel()
+        self.slider_proxy_mb = QSlider(Qt.Orientation.Horizontal)
+        self.slider_proxy_mb.setRange(*PROXY_MB_RANGE)
+        self.slider_proxy_mb.setSingleStep(PROXY_MB_STEP)
+        self.slider_proxy_mb.setPageStep(PROXY_MB_STEP * 4)
+        self.slider_proxy_mb.setValue(int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB)))
+        self.slider_proxy_mb.valueChanged.connect(self._update_proxy_impact)
+        row = self._row(g, "Kopie videí 1080p (4K a HDR)", value=self.lbl_proxy_mb, stacked=self.slider_proxy_mb)
+        self.lbl_proxy_impact = _hint("")
+        row.layout().addWidget(self.lbl_proxy_impact)
+        self.btn_clear_proxies = KButton("Smazat kopie videí", compact=True)
+        self.btn_clear_proxies.setObjectName("btnCleanCache")
+        self.btn_clear_proxies.clicked.connect(self.clear_proxies)
+        self._row(g, "Kopie se na pozadí vytvoří znovu, když je potřeba", self.btn_clear_proxies)
+        self._update_proxy_impact(self.slider_proxy_mb.value())
+
         g = self._group(layout, "Obnovení")
         self.lbl_factory = _hint("")
         self.btn_factory_reset = KButton("Obnovit tovární nastavení…", compact=True)
@@ -465,6 +497,22 @@ class SettingsDialog(QDialog):
         if used > v:
             text += f" Po uložení se uvolní ~{used - v:.0f} MB nejdéle nepoužitých náhledů."
         self.lbl_preview_impact.setText(text)
+
+    def _update_proxy_impact(self, v):
+        v = int(round(v / PROXY_MB_STEP) * PROXY_MB_STEP)
+        self.lbl_proxy_mb.setText(f"{v / 1024:.1f} GB".replace(".", ","))
+        used = video_proxy.cache_size() / (1024 * 1024)
+        text = (f"Nyní obsazeno {used:.0f} MB. " if used else "Zatím prázdné – plní se na pozadí, nikdy během "
+                "přehrávání. ")
+        text += "Kopie slouží k plynulému posouvání časové osy, náhledům a Cestě; originál zůstává beze změny."
+        if used > v:
+            text += f" Po uložení se uvolní ~{used - v:.0f} MB nejdéle nepoužitých kopií."
+        self.lbl_proxy_impact.setText(text)
+
+    def clear_proxies(self):
+        """Kopie se samy vytvoří znovu – bez potvrzení, dopad ukazuje štítek u posuvníku."""
+        video_proxy.clear_cache()
+        self._update_proxy_impact(self.slider_proxy_mb.value())
 
     def _update_factory_label(self):
         import library_tools
@@ -634,6 +682,8 @@ class SettingsDialog(QDialog):
         self.slider_threshold.setValue(int(round(float(DEFAULT_CONFIG.get("face_similarity_threshold", 0.62)) * 100)))
         self.slider_lru.setValue(int(DEFAULT_CONFIG.get("thumbnail_lru_capacity", 1200)))
         self.slider_preview_mb.setValue(int(DEFAULT_CONFIG.get("preview_cache_mb", preview_cache.DEFAULT_BUDGET_MB)))
+        self.slider_proxy_mb.setValue(int(DEFAULT_CONFIG.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB)))
+        self.perf_switch.set_current(DEFAULT_CONFIG.get("performance_tier", "auto"))
         self.theme_switch.set_current(DEFAULT_CONFIG.get("theme", "dark"))
         self.accent_picker.set_value(DEFAULT_CONFIG.get("accent", tokens.DEFAULT_ACCENT))
 
@@ -653,6 +703,8 @@ class SettingsDialog(QDialog):
         self.config["face_similarity_threshold"] = round(self.slider_threshold.value() / 100.0, 2)
         self.config["thumbnail_lru_capacity"] = self.slider_lru.value()
         self.config["preview_cache_mb"] = int(round(self.slider_preview_mb.value() / PREVIEW_MB_STEP) * PREVIEW_MB_STEP)
+        self.config["proxy_cache_mb"] = int(round(self.slider_proxy_mb.value() / PROXY_MB_STEP) * PROXY_MB_STEP)
+        self.config["performance_tier"] = self.perf_switch.current_key() or "auto"
         self.config["theme"] = self.selected_theme()
         if self.slider_threshold.value() != self._saved_threshold:
             self.recluster_requested = True

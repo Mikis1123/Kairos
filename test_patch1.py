@@ -262,9 +262,10 @@ class TestEmbeddings(TempEnv):
         good = self.x("INSERT INTO media_items (file_path) VALUES ('g.jpg')")
         bad = self.x("INSERT INTO media_items (file_path) VALUES ('b.jpg')")
         new = self.x("INSERT INTO media_items (file_path) VALUES ('n.jpg')")
-        self.x("INSERT INTO image_embeddings VALUES (?, ?)", (good, pickle.dumps(self.vec)))
-        self.x("INSERT INTO image_embeddings VALUES (?, ?)", (bad, b"\x80\x04nesmysl"))
-        self.x("INSERT INTO image_embeddings VALUES (?, ?)", (new, ai_engine.encode_embedding(self.vec)))
+        emb_sql = "INSERT INTO image_embeddings (media_id, embedding) VALUES (?, ?)"   # + source_sig (Fáze 1)
+        self.x(emb_sql, (good, pickle.dumps(self.vec)))
+        self.x(emb_sql, (bad, b"\x80\x04nesmysl"))
+        self.x(emb_sql, (new, ai_engine.encode_embedding(self.vec)))
         self.assertEqual(ai_engine.migrate_legacy_embeddings(), (1, 1))
         rows = dict(self.q("SELECT media_id, length(embedding) FROM image_embeddings"))
         self.assertEqual(rows, {good: 2048, new: 2048})
@@ -377,7 +378,7 @@ class TestScannerEndToEnd(TempEnv):
         ids = dict(self.q("SELECT file_name, id FROM media_items"))
         self.x("UPDATE media_items SET is_favorite=1 WHERE id=?", (ids["a.jpg"],))
         self.x("INSERT INTO face_instances (media_id, embedding) VALUES (?, ?)", (ids["a.jpg"], b"e" * 2048))
-        self.x("INSERT INTO image_embeddings VALUES (?, ?)", (ids["a.jpg"], b"y" * 2048))
+        self.x("INSERT INTO image_embeddings (media_id, embedding) VALUES (?, ?)", (ids["a.jpg"], b"y" * 2048))
         for (p,) in self.q("SELECT thumbnail_path FROM media_items"):
             self.assertTrue(p and os.path.exists(p))
 

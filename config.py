@@ -35,6 +35,10 @@ DEFAULT_CONFIG = {
     # Polish P3 – podmnožina library_folders, jejichž změny se naimportují samy (bez dotazu)
     "watched_folders": [],
     "memories_dismissed": "",
+    # Fáze 1 – adaptivní škálování: "auto" | "high" | "standard" | "baseline" (perf_profile.py)
+    "performance_tier": "auto",
+    # Fáze 1 – 1080p SDR kopie videí 4K / HDR (video_proxy.py), limit na disku v MB
+    "proxy_cache_mb": 4096,
 }
 
 
