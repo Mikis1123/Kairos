@@ -1,0 +1,2217 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Kairos – Mapa</title>
+<!-- Batch 6: čistý MapLibre GL JS 5.24.0 (přibalený lokálně v vendor/, ověřené SHA-512 z npm) –
+     skutečná 3D zeměkoule (projekce globe), atmosféra, 3D terén z AWS Terrain Tiles,
+     piny fotek jako HTML značky, klidové otáčení, přelety a přehrávání Cesty.
+     Podklady: Základní a Satelitní vektorově (OpenFreeMap, bez API klíče), bez stylu rastrová
+     záloha (Esri); Turistická rastrově (OpenTopoMap + Waymarked Trails).
+     Vše ostatní blokuje WebUrlInterceptor v main.py (ALLOWED_WEB_HOSTS). -->
+<link rel="stylesheet" href="vendor/maplibre/maplibre-gl.css">
+<script src="vendor/maplibre/maplibre-gl.js"></script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<style>
+  :root { --accent: #8B7CF6; --accent-soft: rgba(139,124,246,0.28);
+          --glass: rgba(30,30,34,0.62); --glass-strong: rgba(30,30,34,0.86);
+          --hair: rgba(255,255,255,0.12); --text: #F5F5F7; --text-2: #A1A1AA; --ease: cubic-bezier(.2,.8,.2,1); }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #06070C;
+               font-family: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, sans-serif; color: var(--text); }
+  /* Vesmír za zeměkoulí: plátno MapLibre je mimo glóbus průhledné */
+  #map { position: absolute; inset: 0;
+         background: radial-gradient(ellipse 70% 60% at 50% 46%, #141B33 0%, #0A0D18 55%, #05060B 100%); }
+  .glass { background: var(--glass); border: 1px solid var(--hair); box-shadow: 0 8px 28px rgba(0,0,0,0.45);
+           backdrop-filter: blur(18px) saturate(1.4); -webkit-backdrop-filter: blur(18px) saturate(1.4); }
+  button { font: inherit; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  /* Den a noc Cesty: tónování mezi mapou a piny (vkládá se do kontejneru plátna) */
+  #tint { position: absolute; inset: 0; pointer-events: none; opacity: 0; mix-blend-mode: multiply;
+          transition: opacity 1.6s ease, background-color 1.6s ease; }
+
+  .maplibregl-ctrl-attrib { background: rgba(28,28,30,0.72) !important; color: #8E8E93 !important; font-size: 10px; }
+  .maplibregl-ctrl-attrib a { color: #AEAEB2 !important; }
+  .maplibregl-ctrl-attrib-button { filter: contrast(0) brightness(2); }   /* bílá ikona (ne invert – žádné filtry přes dlaždice) */
+  .maplibregl-ctrl-group { background: var(--glass) !important; border: 1px solid var(--hair);
+                           box-shadow: 0 6px 22px rgba(0,0,0,0.45) !important; border-radius: 12px !important;
+                           backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); overflow: hidden; }
+  .maplibregl-ctrl-group button + button { border-top: 1px solid var(--hair) !important; }
+  .maplibregl-ctrl-group button .maplibregl-ctrl-icon { filter: contrast(0) brightness(2); }
+  .maplibregl-ctrl-group button:hover { background: rgba(255,255,255,0.08) !important; }
+  .maplibregl-ctrl-group button.tilt-btn { color: #F2F2F7; font: 700 11px/29px -apple-system, "Segoe UI", sans-serif;
+                                           letter-spacing: .04em; }
+  .maplibregl-ctrl-group button.tilt-btn[aria-pressed="true"] { color: var(--accent, #8B7CF6); }
+
+  /* Cesta: nejlepší snímek zastávky – rozbalí se z bodu na mapě */
+  .polaroid.hero { width: 264px; padding: 10px 10px 0; transform-origin: var(--ox, 50%) var(--oy, 100%); }
+  .polaroid.hero .ph { height: 232px; }
+  .polaroid.hero .cap { height: 36px; line-height: 36px; font-size: 13px; }
+
+  /* Plovoucí přepínač podkladů – skleněná kapsle vpravo nahoře (segmentový ovladač) */
+  #layers { position: absolute; top: 16px; right: 16px; z-index: 10; display: flex; gap: 2px; padding: 3px;
+            border-radius: 12px; }
+  #layers button, .seg { all: unset; cursor: pointer; padding: 6px 12px; border-radius: 9px; color: #EBEBF0;
+                   font-size: 12px; font-weight: 600; transition: background 0.15s ease, color 0.15s ease; }
+  #layers button:hover, .seg:hover { background: rgba(255,255,255,0.10); }
+  #layers button:focus-visible, .seg:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #layers button[aria-pressed="true"] { background: rgba(255,255,255,0.92); color: #1C1C1E; }
+
+  #hud { position: absolute; top: 16px; left: 16px; z-index: 10; display: flex; align-items: center; gap: 2px;
+         padding: 3px 3px 3px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  #hud .count { padding-right: 8px; color: var(--text); }
+  .seg { display: inline-flex; align-items: center; gap: 6px; }
+  .seg svg { width: 14px; height: 14px; }
+
+  /* Výběr Cesty */
+  #jlist { position: absolute; top: 60px; left: 16px; z-index: 11; width: 300px; max-height: calc(100% - 180px);
+           overflow-y: auto; border-radius: 14px; padding: 6px; display: none; }
+  #jlist.open { display: block; animation: sheet-in .22s var(--ease); }
+  #jlist .head { padding: 8px 10px 6px; color: var(--text-2); font-size: 11px; font-weight: 600;
+                 letter-spacing: .06em; text-transform: uppercase; }
+  #jlist button { all: unset; box-sizing: border-box; display: block; width: 100%; cursor: pointer;
+                  padding: 9px 10px; border-radius: 10px; }
+  #jlist button:hover, #jlist button:focus-visible { background: rgba(255,255,255,0.08); }
+  #jlist .t { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #jlist .s { font-size: 11px; color: var(--text-2); margin-top: 2px; }
+  @keyframes sheet-in { from { opacity: 0; transform: translateY(-6px) scale(.98); } }
+
+  /* Piny fotek kreslí WebGL (vrstva „pins“, obrázky z plátna) – drží přesně na souřadnicích
+     i během posunu a přiblížení; HTML značky se k plátnu dorovnávaly se zpožděním („plavaly“) */
+
+  /* Náhledová karta při najetí na pin */
+  #card { position: absolute; z-index: 12; pointer-events: none; width: 216px; padding: 8px; border-radius: 12px;
+          background: rgba(36,36,38,0.92); opacity: 0; transform: translate(-50%, calc(-100% + 6px));
+          transition: opacity .14s ease, transform .14s ease; }
+  #card.show { opacity: 1; transform: translate(-50%, -100%); }
+  .card-thumbs { display: grid; gap: 3px; border-radius: 8px; overflow: hidden; margin-bottom: 7px; }
+  .card-thumbs.n1 { grid-template-columns: 1fr; height: 132px; }
+  .card-thumbs.n2 { grid-template-columns: 1fr 1fr; height: 104px; }
+  .card-thumbs.n3 { grid-template-columns: 2fr 1fr; grid-template-rows: 1fr 1fr; height: 116px; }
+  .card-thumbs.n3 .t:first-child { grid-row: span 2; }
+  .card-thumbs.n4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; height: 132px; }
+  .card-thumbs .t { background: #3A3A3C center/cover no-repeat; }
+  .card-title { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-sub { color: #8E8E93; font-size: 11px; margin-top: 2px; }
+
+  .notice { position: absolute; inset: 0; z-index: 9; display: none; align-items: center; justify-content: center;
+            text-align: center; color: #8E8E93; pointer-events: none; }
+  .notice div { background: rgba(28,28,30,0.9); border-radius: 14px; padding: 22px 28px; max-width: 360px; }
+  .notice b { display: block; color: #F5F5F7; font-size: 16px; margin-bottom: 6px; }
+
+  /* ── Cesta ─────────────────────────────────────────────────────────────── */
+  #jx { position: absolute; inset: 0; z-index: 20; pointer-events: none; display: none; }
+  body.journey #jx { display: block; }
+  body.journey #layers, body.journey #hud, body.journey .maplibregl-ctrl-bottom-right { opacity: 0; pointer-events: none; }
+  #layers, #hud, .maplibregl-ctrl-bottom-right { transition: opacity .4s ease; }
+  /* Časová kapsle: úvodní a závěrečná karta */
+  #jcap { position: absolute; left: 50%; top: 42%; transform: translate(-50%, -50%); min-width: 320px; max-width: 460px;
+          padding: 26px 32px; border-radius: 22px; text-align: center; pointer-events: auto;
+          opacity: 0; visibility: hidden; transition: opacity .6s ease, transform .6s var(--ease), visibility 0s .6s; }
+  #jcap.show { opacity: 1; visibility: visible; transform: translate(-50%, -50%) scale(1); transition-delay: 0s; }
+  #jcap:not(.show) { transform: translate(-50%, -46%) scale(.97); }
+  #jcap .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
+  #jcap .ago { margin-top: 4px; font-size: 13px; color: var(--text-2); }
+  #jcap h1 { margin: 10px 0 6px; font-family: 'Segoe UI Variable Display', 'Segoe UI', sans-serif;
+             font-size: 30px; font-weight: 650; letter-spacing: -.01em; line-height: 1.15; }
+  #jcap .meta { font-size: 13px; color: var(--text-2); }
+  #jcap .actions { display: none; justify-content: center; gap: 8px; margin-top: 18px; }
+  #jcap.end .actions { display: flex; }
+  .pill { all: unset; cursor: pointer; padding: 8px 16px; border-radius: 10px; font-size: 13px; font-weight: 600;
+          background: rgba(255,255,255,0.10); color: var(--text); }
+  .pill:hover { background: rgba(255,255,255,0.16); }
+  .pill.primary { background: var(--accent); color: #FFFFFF; }
+  .pill:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* Popisek zastávky */
+  #jcaption { position: absolute; top: 18px; left: 50%; transform: translateX(-50%); padding: 8px 16px;
+              border-radius: 14px; text-align: center; white-space: nowrap; opacity: 0; transition: opacity .4s ease; }
+  #jcaption.show { opacity: 1; }
+  #jcaption .place { font-size: 15px; font-weight: 650; }
+  #jcaption .when { font-size: 12px; color: var(--text-2); margin-top: 1px; }
+  #jcaption .phase { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
+                     vertical-align: 1px; background: #FFD27A; box-shadow: 0 0 8px currentColor; transition: background 1.2s ease; }
+  #jprogress { position: absolute; left: 0; bottom: 0; height: 2px; background: var(--accent); border-radius: 2px;
+               transition: width .5s var(--ease); }
+  /* Skleněné polaroidy */
+  #jpol { position: absolute; inset: 0; overflow: hidden; }
+  .polaroid { position: absolute; left: 0; top: 0; width: 156px; padding: 8px 8px 0; box-sizing: border-box;
+              border-radius: 8px; background: rgba(255,255,255,0.20); border: 1px solid rgba(255,255,255,0.45);
+              box-shadow: 0 18px 40px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.5);
+              backdrop-filter: blur(16px) saturate(1.7); -webkit-backdrop-filter: blur(16px) saturate(1.7);
+              transform-origin: 50% 60%; will-change: transform, opacity; pointer-events: auto; cursor: pointer; }
+  .polaroid .ph { height: 140px; border-radius: 3px; background: #2C2C2E center/cover no-repeat; }
+  .polaroid .ph.noimg { background: linear-gradient(135deg, #3A3A3C, #232326); }
+  .polaroid .cap { height: 30px; line-height: 30px; text-align: center; font-size: 12px; font-weight: 600;
+                   color: #FFFFFF; text-shadow: 0 1px 3px rgba(0,0,0,0.55); }
+  /* Filmový pás */
+  #jdock { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); width: min(920px, calc(100% - 32px));
+           display: flex; flex-direction: column; align-items: center; gap: 10px; pointer-events: auto; }
+  #jctl { display: flex; gap: 2px; padding: 3px; border-radius: 12px; }
+  #jctl button { all: unset; cursor: pointer; width: 34px; height: 30px; border-radius: 9px; display: grid; place-items: center; }
+  #jctl button:hover { background: rgba(255,255,255,0.10); }
+  #jctl button:focus-visible { outline: 2px solid var(--accent); }
+  #jctl svg { width: 16px; height: 16px; fill: #F5F5F7; }
+  #jstripwrap { position: relative; width: 100%; border-radius: 12px; padding: 10px 12px; box-sizing: border-box;
+                background-color: rgba(14,14,16,0.78);
+                background-image: repeating-linear-gradient(90deg, rgba(255,255,255,0.16) 0 6px, transparent 6px 14px),
+                                  repeating-linear-gradient(90deg, rgba(255,255,255,0.16) 0 6px, transparent 6px 14px);
+                background-size: 100% 3px, 100% 3px; background-position: 0 3px, 0 calc(100% - 3px); background-repeat: no-repeat; }
+  #jstrip { display: flex; gap: 5px; overflow-x: auto; scroll-behavior: smooth; height: 54px; align-items: center;
+            scrollbar-width: none; }
+  #jstrip::-webkit-scrollbar { display: none; }
+  #jstrip:empty::before { content: 'Fotky z cesty se tu poskládají do filmového pásu'; color: #8E8E93; font-size: 12px;
+                          margin: 0 auto; }
+  .frame { flex: 0 0 auto; width: 72px; height: 54px; border-radius: 3px; background: #2C2C2E center/cover no-repeat;
+           cursor: pointer; opacity: 0; transition: opacity .2s ease, transform .15s ease; }
+  .frame.in { opacity: 1; }
+  .frame:hover { transform: translateY(-2px); }
+  .frame.noimg { background: linear-gradient(135deg, #3A3A3C, #232326); }
+  .divider { flex: 0 0 auto; width: 2px; height: 34px; margin: 0 6px; border-radius: 1px; background: var(--accent-soft); }
+  @media (prefers-reduced-motion: reduce) { #jcap, .frame { transition: none; animation: none; } }
+</style>
+</head>
+<body>
+<div id="map" class="theme-standard"></div>
+<div id="layers" class="glass" role="group" aria-label="Mapový podklad">
+  <button type="button" data-layer="standard" aria-pressed="true" title="Světlá vektorová mapa s českými názvy (OpenFreeMap)">Základní</button>
+  <button type="button" data-layer="satellite" aria-pressed="false" title="Letecké snímky (Esri) s vektorovými cestami a názvy">Satelitní</button>
+  <button type="button" data-layer="outdoor" aria-pressed="false" title="Vrstevnice, stínování terénu a značené trasy">Turistická</button>
+</div>
+<div id="hud" class="glass" hidden>
+  <span class="count" id="hudcount"></span>
+  <button type="button" class="seg" id="btn-globe" title="Zpět na zeměkouli (Esc)">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6.3"/><path d="M1.8 8h12.4M8 1.7c2 2 2 10.6 0 12.6M8 1.7c-2 2-2 10.6 0 12.6"/></svg>Zeměkoule</button>
+  <button type="button" class="seg" id="btn-journeys" aria-expanded="false" aria-controls="jlist" hidden title="Přehrát cestu z události">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="3.5" cy="12" r="1.6"/><circle cx="12.5" cy="4" r="1.6"/><path d="M5 11.2c3-1 1.5-4.6 4.5-5.8 1-.4 1.6-.8 1.6-.8" stroke-dasharray="1.6 1.8"/></svg>Cesty</button>
+</div>
+<div id="jlist" class="glass" role="dialog" aria-label="Cesty"></div>
+<div id="card" class="glass"></div>
+<div id="empty" class="notice"><div><b>Žádné fotografie s polohou</b>Fotky s GPS souřadnicemi se tu objeví po importu.</div></div>
+<div id="nogl" class="notice"><div><b>Mapa potřebuje grafickou akceleraci</b>Zeměkouli kreslí WebGL, které tu není k dispozici. Fotky ani jejich polohy se tím nemění.</div></div>
+
+<div id="jx" aria-live="polite">
+  <div id="jpol"></div>
+  <div id="jcaption" class="glass"><div class="place"><span class="phase" id="jphase"></span><span id="jplace"></span></div>
+    <div class="when" id="jwhen"></div></div>
+  <div id="jcap" class="glass" role="dialog" aria-label="Cesta">
+    <div class="eyebrow">Cesta</div><div class="ago" id="jago"></div>
+    <h1 id="jtitle"></h1><div class="meta" id="jmeta"></div>
+    <div class="actions"><button type="button" class="pill" id="jreplay">Přehrát znovu</button>
+      <button type="button" class="pill primary" id="jdone">Hotovo</button></div>
+  </div>
+  <div id="jdock">
+    <div id="jctl" class="glass" role="toolbar" aria-label="Přehrávání cesty">
+      <button type="button" id="jprev" aria-label="Předchozí zastávka"><svg viewBox="0 0 16 16"><path d="M3 2.5h1.6v11H3zM13.5 2.8v10.4L5.8 8z"/></svg></button>
+      <button type="button" id="jplay" aria-label="Pozastavit"><svg viewBox="0 0 16 16"><path id="jplayicon" d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg></button>
+      <button type="button" id="jnext" aria-label="Další zastávka"><svg viewBox="0 0 16 16"><path d="M11.4 2.5H13v11h-1.6zM2.5 2.8v10.4L10.2 8z"/></svg></button>
+      <button type="button" id="jclose" aria-label="Ukončit cestu (Esc)"><svg viewBox="0 0 16 16"><path d="M3.7 2.6 8 6.9l4.3-4.3 1.1 1.1L9.1 8l4.3 4.3-1.1 1.1L8 9.1l-4.3 4.3-1.1-1.1L6.9 8 2.6 3.7z"/></svg></button>
+    </div>
+    <div id="jstripwrap"><div id="jstrip" role="list" aria-label="Filmový pás cesty"></div><div id="jprogress"></div></div>
+  </div>
+</div>
+<script>
+  var CELL_PX = 64;                   // velikost buňky shlukování na obrazovce
+  var PIN_PX = 58;                    // piny blíž než tohle by se překrývaly (pin 52 px + okraj)
+  var MAX_CARD_THUMBS = 4;
+  var TILE_PX = 512;                  // MapLibre: svět na z0 = 512 px
+  var GLOBE_ZOOM = 1.7;               // celá zeměkoule v okně
+  var GLOBE_SPIN_MAX_ZOOM = 4;        // klidové otáčení jen při pohledu na zeměkouli
+  var IDLE_SPIN_MS = 12000;           // tak dlouho bez zásahu, než se zeměkoule začne otáčet
+  var SPIN_DEG_PER_S = 2.4;
+  var TERRAIN_MIN_ZOOM = 8;           // 3D terén až od přiblížení krajiny (na zeměkouli neviditelný)
+  var TERRAIN_EXAGGERATION = 1.35;
+  // Zeměkoule se do roviny překlopí dřív než výchozí „globe“ (z 11–12): terén a jeho mlha
+  // MapLibre fungují jen v mercatoru („terrain is not fully supported on vertical perspective
+  // projection“, „calculateFogMatrix is not supported on globe projection“ za každý snímek)
+  var GLOBE_FLAT_FROM = 6, GLOBE_FLAT_AT = 7.5;   // < TERRAIN_MIN_ZOOM
+  var GLOBE_PROJECTION = ['interpolate', ['linear'], ['zoom'],
+                          GLOBE_FLAT_FROM, 'vertical-perspective', GLOBE_FLAT_AT, 'mercator'];
+  // Výškové dlaždice nesmí jít hlouběji než nejmělčí podklad (vektory OpenMapTiles do z14),
+  // jinak „cannot calculate elevation if elevation maxzoom > source.maxzoom“ u přetažených dlaždic
+  var DEM_MAX_ZOOM = 14;
+  // Tmavá grafitová zeměkoule: do z5 vlastní tmavé vrstvy (pevnina, oceány, ledovce, hranice),
+  // do z6 prolnutí do podkladu – světlá Základní dřív svítila jako bílý kotouč ve tmě vesmíru
+  var GLOBE_DARK_FROM = 5, GLOBE_DARK_TO = 6;
+  var GRAPHITE = { land: '#22262D', water: '#0C0F15', ice: '#3A414C', border: 'rgba(196,206,226,0.26)',
+                   coast: 'rgba(140,162,206,0.22)', label: '#8C95A6', halo: 'rgba(8,10,16,0.85)' };
+  // Rastrové podklady (záloha Základní, Turistická) na zeměkouli ztlumené ke grafitu
+  var GLOBE_RASTER_DIM = { standard: 0.30, outdoor: 0.55 };
+  // Reliéf krajiny: jemné stínování z výškových dat pod cestami a popisky (tmavé stíny, chladné světlo)
+  var HILLSHADE_MIN_ZOOM = 7;
+  var SPIN_MAX_MS = 60000;            // klidové otáčení po minutě dobrzdí – nečinná mapa nekreslí
+  var FLY_PITCH = 52;                 // náklon kamery při příletu ke shluku v krajině (= „3D“ přepínače)
+  var TILT_MS = 650;
+  // Úroveň detailu dlaždic v nakloněném pohledu: výchozí MapLibre (9,3 úrovně zoomu na obrazovce)
+  // dává vzdálené polovině okna dlaždice o 3–4 úrovně hrubší = „půlka ostrá, půlka rozmazaná“.
+  // 6 drží vzdálené dlaždice ostřejší za cenu pár dlaždic navíc (jen při náklonu).
+  var TILE_LOD_ZOOM_LEVELS = 6, TILE_LOD_RATIO = 3;
+  var bridge = null;
+  var map = null;                     // maplibregl.Map, vzniká až na viditelné stránce
+  var markers = [];                   // [{id, lat, lon, name, city, date, thumb}]
+  var clusters = [];                  // poslední shlukování [{items, lat, lon, px}]
+  var fitted = false;
+  var mapActive = true;               // záložka mapy je vidět (main.py: setMapActive)
+  var mapErrors = [];
+  var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  var OSM = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
+  var TRAILS_MIN_ZOOM = { hiking: 11, cycling: 12 };
+  var ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services/';
+  // 3D terén: AWS Open Data Terrain Tiles (Mapzen terrarium), přesný host v ALLOWED_WEB_HOSTS
+  var DEM_TILES = 'https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png';
+  var DEM_ATTRIBUTION = 'Terén: <a href="https://registry.opendata.aws/terrain-tiles/">Mapzen, AWS Terrain Tiles</a>';
+  // Každý podklad = podkladová vrstva + volitelné průhledné překryvy (hybridní satelit,
+  // značené trasy). Jen hosty z ALLOWED_WEB_HOSTS v main.py, žádné API klíče.
+  // gl = vektorová varianta (OpenFreeMap); layers = rastrová podoba / záloha bez stylu
+  var BASE_LAYERS = {
+    standard: {
+      // Záloha: Esri World Street Map, světlá mapa bez API klíče (CARTO Voyager už klíč vyžaduje –
+      // místo mapy vracel dlaždice „API KEY REQUIRED“, ověřeno)
+      theme: 'theme-standard', maxZoom: 19, gl: true,
+      layers: [{ url: ESRI + 'World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+                 attribution: 'Tiles &copy; Esri &mdash; Source: Esri, HERE, Garmin, USGS, Intermap, NRCan, '
+                            + 'Esri Japan, METI, Esri China, Esri Korea, Esri (Thailand), NGCC, ' + OSM }]
+    },
+    satellite: {
+      theme: 'theme-satellite', maxZoom: 19, gl: true,
+      layers: [
+        { url: ESRI + 'World_Imagery/MapServer/tile/{z}/{y}/{x}',
+          attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community' },
+        { url: ESRI + 'Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}', overlay: true },        // silnice
+        { url: ESRI + 'Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', overlay: true }  // hranice, obce
+      ]
+    },
+    outdoor: {
+      theme: 'theme-outdoor', maxZoom: 17,
+      layers: [
+        { url: 'https://tile.opentopomap.org/{z}/{x}/{y}.png',
+          attribution: 'Data: ' + OSM + ', SRTM | Styl: &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)' },
+        // Patch 12: trasy až od přiblížení obce / údolí – na mapě státu byly jen hustou sítí čar
+        // přes celý reliéf; cyklotrasy (dálkové, hustší) ještě o úroveň později
+        { url: 'https://tile.waymarkedtrails.org/hiking/{z}/{x}/{y}.png', overlay: true, opacity: 0.9,
+          minZoom: TRAILS_MIN_ZOOM.hiking,
+          attribution: 'Trasy: &copy; <a href="https://waymarkedtrails.org">waymarkedtrails.org</a> (CC-BY-SA)' },
+        { url: 'https://tile.waymarkedtrails.org/cycling/{z}/{x}/{y}.png', overlay: true, opacity: 0.75,
+          minZoom: TRAILS_MIN_ZOOM.cycling }
+      ]
+    }
+  };
+  var LEGACY_LAYERS = { dark: 'standard', topo: 'outdoor' };   // hodnoty uložené starší verzí
+
+  // ── Vektorové podklady (OpenFreeMap) ─────────────────────────────────────────
+  var OFM = 'https://tiles.openfreemap.org/';
+  var VECTOR_STYLE_URL = OFM + 'styles/liberty';
+  var VECTOR_TILES_URL = OFM + 'planet';
+  var OFM_ATTRIBUTION = '<a href="https://openfreemap.org">OpenFreeMap</a> &copy; '
+                      + '<a href="https://www.openmaptiles.org/">OpenMapTiles</a> Data from ' + OSM;
+  var VECTOR_RETRY_MS = 60000;        // po výpadku sítě zkusit styl znovu nejdřív za minutu
+  var vectorStyle = null;             // styl „liberty“ stažený jednou za běh (HTTP cache ho drží na disku)
+  var vectorState = 'idle';           // idle | loading | ready | failed
+  var vectorFailedAt = 0;
+  var engine = 'none';                // čím se kreslí aktuální podklad: 'vector' | 'raster' | 'none' (mapa ještě není)
+
+  function glSupported() {
+    if (!window.maplibregl) return false;
+    try {
+      var c = document.createElement('canvas');
+      return !!c.getContext('webgl2');           // MapLibre 5 vyžaduje WebGL 2
+    } catch (e) { return false; }
+  }
+
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+
+  // České názvy: name:cs, jinak latinka, jinak místní název (liberty ukazuje anglické name_en)
+  var CS_NAME = ['coalesce', ['get', 'name:cs'], ['get', 'name:latin'], ['get', 'name']];
+  function isNameField(tf) {
+    var s = JSON.stringify(tf || '');
+    return s.indexOf('name') >= 0 && s.indexOf('"ref"') < 0;
+  }
+  // Kairos: filtry liberty porovnávají vlastnosti, které část prvků nemá ([">=", ["get", "rank"], 20]
+  // u POI, ["<=", ["get", "ref_length"], 6] u štítků silnic). MapLibre pak za každý takový prvek
+  // vypíše „Expected value to be of type number, but found null instead.“ Stráž typeof (stejná,
+  // jakou styl sám používá u boundary_3) prvek bez hodnoty tiše vyřadí – výsledek je stejný.
+  var NUMERIC_CMP = { '<': 1, '<=': 1, '>': 1, '>=': 1 };
+  function guardNumericFilter(f) {
+    if (!Array.isArray(f)) return f;
+    if (NUMERIC_CMP[f[0]] && f.length === 3) {
+      var guards = [f[1], f[2]].filter(function (a) { return Array.isArray(a) && a[0] === 'get'; })
+        .map(function (a) { return ['==', ['typeof', a], 'number']; });
+      return guards.length ? ['all'].concat(guards, [f]) : f;
+    }
+    if (f[0] === 'all' || f[0] === 'any') {        // pod „!“ by stráž výsledek obrátila – ne
+      return [f[0]].concat(f.slice(1).map(guardNumericFilter));
+    }
+    return f;
+  }
+  function localizeStyle(style) {
+    var s = clone(style);
+    s.layers.forEach(function (l) {
+      if (l.layout && l.layout['text-field'] && isNameField(l.layout['text-field'])) l.layout['text-field'] = CS_NAME;
+      if (l.filter) l.filter = guardNumericFilter(l.filter);
+    });
+    return s;
+  }
+
+  // Satelit: snímky Esri + z vektorových dat jen cesty, hranice a názvy (světlé, s tmavým lemem)
+  var SAT_ROADS = /^(road|bridge)_(motorway|motorway_link|trunk_primary|secondary_tertiary|link|minor)$/;
+  function satelliteStyle(base) {
+    var layers = [{ id: 'esri-imagery', type: 'raster', source: 'esri' }];
+    base.layers.forEach(function (l) {
+      var sl = l['source-layer'], c;
+      if (l.type === 'line' && SAT_ROADS.test(l.id)) {
+        c = clone(l);
+        c.paint = Object.assign({}, c.paint, {
+          'line-color': /motorway|trunk/.test(l.id) ? 'rgba(255,214,110,0.85)' : 'rgba(255,255,255,0.55)' });
+        delete c.paint['line-dasharray'];
+        layers.push(c);
+      } else if (l.type === 'line' && sl === 'boundary') {
+        c = clone(l);
+        c.paint = Object.assign({}, c.paint, { 'line-color': 'rgba(255,255,255,0.65)' });
+        layers.push(c);
+      } else if (l.type === 'symbol' && (sl === 'place' || sl === 'transportation_name' || sl === 'water_name')
+                 && l.layout && isNameField(l.layout['text-field'])) {
+        c = clone(l);
+        c.layout = Object.assign({}, c.layout);
+        delete c.layout['icon-image'];
+        c.paint = Object.assign({}, c.paint, { 'text-color': '#FFFFFF', 'text-halo-color': 'rgba(0,0,0,0.75)',
+                                               'text-halo-width': 1.4, 'text-halo-blur': 0.4 });
+        layers.push(c);
+      }
+    });
+    return localizeStyle({
+      version: 8, glyphs: base.glyphs, sprite: base.sprite,
+      sources: {
+        esri: { type: 'raster', tileSize: 256, maxzoom: 19,
+                tiles: [ESRI + 'World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+                attribution: 'Snímky &copy; Esri, Maxar, Earthstar Geographics' },
+        openmaptiles: { type: 'vector', url: VECTOR_TILES_URL, attribution: OFM_ATTRIBUTION }
+      },
+      layers: layers
+    });
+  }
+
+  // Pastelová Základní: lesy a parky (národní parky překrývají celé lesy -> sytě zelená plocha)
+  // jen jemně, ať vynikne obsah – cesty, vody a piny fotek
+  var PASTEL_FILLS = { park: 0.32, landcover_wood: 0.26, landcover_grass: 0.22 };
+  function pastelize(style) {
+    style.layers.forEach(function (l) {
+      if (PASTEL_FILLS[l.id] !== undefined && l.type === 'fill') {
+        l.paint = Object.assign({}, l.paint, { 'fill-opacity': PASTEL_FILLS[l.id] });
+        if (l.id === 'park') delete l.paint['fill-outline-color'];
+      }
+    });
+    return style;
+  }
+
+  // Batch 6: s nakloněnou kamerou má 3D vytažení budov smysl (Patch 12 je kvůli Leafletu
+  // zploštil). Budovy bez výšky hlásily „Expected value to be of type number, but found null“
+  // (render_height = null) -> každé čtení výšky obalit coalesce(…, 0).
+  var HEIGHT_PROPS = { render_height: 1, render_min_height: 1 };
+  function guardHeights(v) {
+    if (!Array.isArray(v)) return v;
+    if (v[0] === 'get' && HEIGHT_PROPS[v[1]] && v.length === 2) return ['coalesce', v, 0];
+    return v.map(guardHeights);
+  }
+  function guardBuildings(style) {
+    style.layers.forEach(function (l) {
+      if (l.type !== 'fill-extrusion' || !l.paint) return;
+      Object.keys(l.paint).forEach(function (k) { l.paint[k] = guardHeights(l.paint[k]); });
+    });
+    return style;
+  }
+
+  window.buildVectorStyle = function (name) {      // i pro testy: výsledný styl podkladu (bez zeměkoule)
+    if (!vectorStyle) return null;
+    return name === 'satellite' ? satelliteStyle(vectorStyle)
+                                : pastelize(guardBuildings(localizeStyle(vectorStyle)));
+  };
+
+  function rasterStyle(name) {
+    var def = BASE_LAYERS[name], sources = {}, layers = [];
+    def.layers.forEach(function (l, i) {
+      var id = 'r' + i;
+      sources[id] = { type: 'raster', tiles: [l.url], tileSize: 256, maxzoom: def.maxZoom,
+                      attribution: l.attribution || '' };
+      var layer = { id: 'raster-' + i, type: 'raster', source: id, paint: { 'raster-fade-duration': 200 } };
+      if (l.minZoom) layer.minzoom = l.minZoom;
+      if (l.opacity) layer.paint['raster-opacity'] = l.opacity;
+      if (i === 0 && GLOBE_RASTER_DIM[name] !== undefined) {   // zeměkoule tlumená, krajina beze změny
+        layer.paint['raster-brightness-max'] = ['interpolate', ['linear'], ['zoom'],
+                                                3, GLOBE_RASTER_DIM[name], GLOBE_DARK_TO, 1];
+        layer.paint['raster-saturation'] = ['interpolate', ['linear'], ['zoom'], 3, -0.5, GLOBE_DARK_TO, 0];
+      }
+      layers.push(layer);
+    });
+    return { version: 8, sources: sources, layers: layers };
+  }
+
+  function fadeOut(from, to, start) {
+    return ['interpolate', ['linear'], ['zoom'], from, start === undefined ? 1 : start, to, 0];
+  }
+  function vectorSourceId(style) {
+    return Object.keys(style.sources).filter(function (k) { return style.sources[k].type === 'vector'; })[0] || null;
+  }
+  function styleFont(style) {
+    for (var i = 0; i < style.layers.length; i++) {
+      var f = style.layers[i].layout && style.layers[i].layout['text-font'];
+      if (Array.isArray(f) && typeof f[0] === 'string') return f;
+    }
+    return null;
+  }
+  // Základní (vektor): do z5 jen tmavé vrstvy zeměkoule, podklad liberty od z5 (pod nimi prolnutí)
+  function addGlobeDark(style) {
+    var src = vectorSourceId(style);
+    if (!src) return;
+    var a = GLOBE_DARK_FROM, b = GLOBE_DARK_TO;
+    style.layers.forEach(function (l) { if ((l.minzoom || 0) < a) l.minzoom = a; });
+    var dark = [
+      { id: 'globe-land', type: 'background', maxzoom: b,
+        paint: { 'background-color': GRAPHITE.land, 'background-opacity': fadeOut(a, b) } },
+      { id: 'globe-ice', type: 'fill', source: src, 'source-layer': 'landcover', maxzoom: b,
+        filter: ['==', ['get', 'class'], 'ice'],
+        paint: { 'fill-color': GRAPHITE.ice, 'fill-opacity': fadeOut(a, b, 0.85), 'fill-antialias': false } },
+      // Pobřeží = obrys výplně, NE čárová vrstva nad polygony vody: čára rezervuje 10 vrcholů
+      // na bod a obrys oceánu v dlaždici z2–z5 (~7 800 bodů) přetekl 16bit segment MapLibre
+      // („Max vertices per segment is 65535: bucket requested 77610“ -> rozsypané trojúhelníky).
+      // Obrys výplně sdílí vrcholy polygonu (1 na bod), limit nepřekročí.
+      { id: 'globe-water', type: 'fill', source: src, 'source-layer': 'water', maxzoom: b,
+        paint: { 'fill-color': GRAPHITE.water, 'fill-opacity': fadeOut(a, b), 'fill-antialias': true,
+                 'fill-outline-color': GRAPHITE.coast } },
+      { id: 'globe-border', type: 'line', source: src, 'source-layer': 'boundary', maxzoom: b,
+        filter: ['all', ['==', ['get', 'admin_level'], 2], ['!=', ['get', 'maritime'], 1]],
+        layout: { 'line-join': 'round' },
+        paint: { 'line-color': GRAPHITE.border, 'line-opacity': fadeOut(a, b),
+                 'line-width': ['interpolate', ['linear'], ['zoom'], 1, 0.4, 5, 0.9] } }
+    ];
+    var font = styleFont(style);
+    if (font && style.glyphs) {
+      dark.push({ id: 'globe-country', type: 'symbol', source: src, 'source-layer': 'place', minzoom: 2, maxzoom: b,
+                  filter: ['==', ['get', 'class'], 'country'],
+                  layout: { 'text-field': CS_NAME, 'text-font': font, 'text-size': 10.5,
+                            'text-transform': 'uppercase', 'text-letter-spacing': 0.12, 'text-max-width': 7 },
+                  paint: { 'text-color': GRAPHITE.label, 'text-halo-color': GRAPHITE.halo, 'text-halo-width': 1,
+                           'text-opacity': fadeOut(a, b) } });
+    }
+    style.layers = style.layers.concat(dark);
+  }
+  // Pozadí pod dlaždicemi: póly za hranicí Web Mercatoru (±85°) a chybějící dlaždice (oceány
+  // Turistické, výpadek sítě) byly černé díry do vesmíru
+  function addBaseBackground(style, name) {
+    if (style.layers.length && style.layers[0].type === 'background') return;
+    var color = name === 'satellite' ? '#0B0F17'
+      : ['interpolate', ['linear'], ['zoom'], GLOBE_DARK_FROM - 1, GRAPHITE.water, GLOBE_DARK_TO,
+         name === 'outdoor' ? '#B9D3DC' : '#E4E8EC'];
+    style.layers.unshift({ id: 'base-bg', type: 'background', paint: { 'background-color': color } });
+  }
+  // Reliéf krajiny pod cestami a popisky (vlastní zdroj – terén a stínování ze stejného zdroje
+  // MapLibre nedoporučuje). Turistická má stínování v dlaždicích, satelit ve snímcích.
+  function addHillshade(style) {
+    style.sources['dem-shade'] = { type: 'raster-dem', tiles: [DEM_TILES], tileSize: 256, maxzoom: DEM_MAX_ZOOM,
+                                   encoding: 'terrarium' };
+    var at = style.layers.findIndex(function (l) {
+      return l.type === 'line' || l.type === 'symbol' || l.type === 'fill-extrusion';
+    });
+    style.layers.splice(at < 0 ? style.layers.length : at, 0, {
+      id: 'relief', type: 'hillshade', source: 'dem-shade', minzoom: HILLSHADE_MIN_ZOOM,
+      paint: { 'hillshade-exaggeration': ['interpolate', ['linear'], ['zoom'], HILLSHADE_MIN_ZOOM, 0, 9, 0.38, 14, 0.3],
+               'hillshade-shadow-color': '#262C3A', 'hillshade-highlight-color': 'rgba(255,255,255,0.32)',
+               'hillshade-accent-color': '#39415A', 'hillshade-illumination-anchor': 'viewport' } });
+  }
+
+  // ── Zeměkoule, atmosféra, světlo ────────────────────────────────────────────
+  // Obloha v zastávkách Cesty podle výšky slunce (°); mezi klíči se plynule míchá
+  var SKY_KEYS = [
+    { el: -18, sky: '#070B1E', horizon: '#18224A', fog: '#121A38', tint: '#1A2660', tintA: 0.72, glow: '#8EA2FF' },
+    { el: -7,  sky: '#25336B', horizon: '#8A6FA8', fog: '#4B4E7E', tint: '#2E3480', tintA: 0.52, glow: '#B79CFF' },
+    { el: -1,  sky: '#6A6FA8', horizon: '#F49A6A', fog: '#D99A86', tint: '#D9704A', tintA: 0.32, glow: '#FF9C6B' },
+    { el: 6,   sky: '#8DB4E8', horizon: '#FFD3A0', fog: '#F4DCC4', tint: '#FFA860', tintA: 0.16, glow: '#FFD27A' },
+    { el: 16,  sky: '#6FA6EE', horizon: '#D6E9FF', fog: '#E9F1FA', tint: '#FFFFFF', tintA: 0.0,  glow: '#FFE9A8' }
+  ];
+  var DAY_SKY = SKY_KEYS[SKY_KEYS.length - 1];
+  var skyNow = { el: 40 };            // poslední nastavená výška slunce
+
+  function hexRgb(h) { var n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+  function rgbHex(c) { return '#' + c.map(function (v) { return ('0' + Math.round(v).toString(16)).slice(-2); }).join(''); }
+  function mixHex(a, b, t) { var x = hexRgb(a), y = hexRgb(b); return rgbHex(x.map(function (v, i) { return v + (y[i] - v) * t; })); }
+
+  function skyAt(el) {
+    var k = SKY_KEYS;
+    if (el <= k[0].el) return Object.assign({}, k[0], { el: el });
+    for (var i = 1; i < k.length; i++) {
+      if (el <= k[i].el) {
+        var a = k[i - 1], b = k[i], t = (el - a.el) / (b.el - a.el);
+        return { el: el, sky: mixHex(a.sky, b.sky, t), horizon: mixHex(a.horizon, b.horizon, t), fog: mixHex(a.fog, b.fog, t),
+                 tint: mixHex(a.tint, b.tint, t), tintA: a.tintA + (b.tintA - a.tintA) * t, glow: mixHex(a.glow, b.glow, t) };
+      }
+    }
+    return Object.assign({}, k[k.length - 1], { el: el });
+  }
+
+  function skySpec(s) {
+    return { 'sky-color': s.sky, 'horizon-color': s.horizon, 'fog-color': s.fog,
+             'sky-horizon-blend': 0.6, 'horizon-fog-blend': 0.5, 'fog-ground-blend': 0.6,
+             // jemná záře kolem tmavé zeměkoule (plná atmosféra kolem grafitu působila jako halo
+             // reflektoru), v krajině (z > 7) už jen obloha nad horizontem
+             'atmosphere-blend': ['interpolate', ['linear'], ['zoom'], 0, 0.62, 5, 0.62, 7, 0] };
+  }
+
+  // Poloha slunce z místního času fotky: výška a azimut (°). Hodiny fotek jsou místní
+  // čas bez pásma – sluneční čas ≈ hodiny (v létě na severu -1 h za letní čas); na
+  // barvu oblohy to stačí (den / zlatá hodina / soumrak / noc).
+  function parseLocal(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/.exec(s || '');
+    if (!m) return null;
+    return { y: +m[1], mo: +m[2], d: +m[3], h: m[4] === undefined ? null : +m[4], mi: m[5] === undefined ? 0 : +m[5] };
+  }
+  function sunPosition(lat, lon, when) {
+    var t = parseLocal(when);
+    if (!t || t.h === null) return null;
+    var doy = Math.floor((Date.UTC(t.y, t.mo - 1, t.d) - Date.UTC(t.y, 0, 0)) / 864e5);
+    var hours = t.h + t.mi / 60;
+    if (lat > 25 && t.mo >= 4 && t.mo <= 10) hours -= 1;        // letní čas (severní polokoule)
+    var rad = Math.PI / 180;
+    var decl = 23.44 * Math.sin(2 * Math.PI * (284 + doy) / 365) * rad;
+    var ha = 15 * (hours - 12) * rad, phi = lat * rad;
+    var el = Math.asin(Math.sin(phi) * Math.sin(decl) + Math.cos(phi) * Math.cos(decl) * Math.cos(ha));
+    var az = Math.atan2(Math.sin(ha), Math.cos(ha) * Math.sin(phi) - Math.tan(decl) * Math.cos(phi)) / rad + 180;
+    return { el: el / rad, az: (az + 360) % 360, morning: hours < 12 };
+  }
+  window.sunPosition = sunPosition;
+
+  function phaseLabel(sun) {
+    if (!sun) return '';
+    if (sun.el > 10) return 'Den';
+    if (sun.el > -1) return 'Zlatá hodina';
+    if (sun.el > -9) return sun.morning ? 'Svítání' : 'Soumrak';
+    return 'Noc';
+  }
+
+  var styleReady = false;            // po style.load; isStyleLoaded() čeká i na sprite a písma
+  var skyAnim = 0;
+  function applySky(s) {
+    skyNow = s;
+    if (!map || !styleReady) return;
+    try {
+      map.setSky(skySpec(s));
+      // světlo = směr slunce (stínování budov a terénu, odlesk atmosféry)
+      map.setLight({ anchor: 'map', position: [1.5, s.az === undefined ? 210 : s.az,
+                                                Math.max(10, Math.min(88, 90 - Math.max(s.el, -10) * 1.4))],
+                     color: s.el > 6 ? '#FFFFFF' : mixHex('#8EA2FF', '#FFC48A', Math.max(0, (s.el + 10) / 16)),
+                     intensity: s.el > 0 ? 0.35 : 0.2 });
+    } catch (e) { /* styl se právě vyměňuje – nastaví se při style.load */ }
+    var tint = document.getElementById('tint');
+    if (tint) { tint.style.backgroundColor = s.tint; tint.style.opacity = String(s.tintA); }
+  }
+  // Plynulý přechod oblohy (MapLibre obloze přechody nedělá)
+  function transitionSky(target, ms) {
+    cancelAnimationFrame(skyAnim);
+    var from = skyNow, t0 = performance.now();
+    if (reduceMotion || !ms || from.sky === undefined) { applySky(target); return; }
+    (function frame(now) {
+      var t = Math.min(1, (now - t0) / ms), e = t * t * (3 - 2 * t);
+      var el = from.el + (target.el - from.el) * e;
+      var s = skyAt(el);
+      s.az = target.az;
+      applySky(s);
+      if (t < 1) skyAnim = requestAnimationFrame(frame);
+    })(t0);
+  }
+
+  // ── Styl = podklad + zeměkoule + atmosféra + zdroj terénu ───────────────────
+  function styleFor(name) {
+    var def = BASE_LAYERS[name], vector = def.gl && vectorState === 'ready' && vectorStyle;
+    var s = vector ? window.buildVectorStyle(name) : rasterStyle(name);
+    if (vector && name !== 'satellite') {
+      Object.keys(s.sources).forEach(function (k) { s.sources[k].attribution = OFM_ATTRIBUTION; });
+      addHillshade(s);
+      addGlobeDark(s);
+    }
+    addBaseBackground(s, name);
+    s.projection = { type: GLOBE_PROJECTION };
+    s.sky = skySpec(skyNow.sky ? skyNow : DAY_SKY);
+    s.sources.dem = { type: 'raster-dem', tiles: [DEM_TILES], tileSize: 256, maxzoom: DEM_MAX_ZOOM,
+                      encoding: 'terrarium', attribution: DEM_ATTRIBUTION };
+    return { style: s, engine: vector ? 'vector' : 'raster' };
+  }
+
+  function applyStyle() {
+    if (!map) return;
+    var built = styleFor(baseName);
+    engine = built.engine;
+    map.setMaxZoom(BASE_LAYERS[baseName].maxZoom);
+    styleReady = false;
+    // Terén starého stylu by se kreslil s novým, ještě nenačteným stylem (bez projekce) ->
+    // „Cannot read properties of undefined (reading 'shaderPreludeCode')“ za každý snímek.
+    // Po style.load ho syncTerrain zapne znovu.
+    if (map.getTerrain()) map.setTerrain(null);
+    map.setStyle(built.style, { diff: false });
+    if (BASE_LAYERS[baseName].gl && engine === 'raster') loadVectorStyle();   // do načtení stylu drží obraz rastr
+  }
+
+  // Ikona, kterou sprite OpenFreeMap nemá (např. „recycling“ u třídy POI): průhledný 1×1 px
+  // místo chybové hlášky za každou dlaždici; popisek POI zůstane
+  var BLANK_ICON = { width: 1, height: 1, data: new Uint8Array(4) };
+
+  // Styl lze podstrčit (testy bez sítě); v aplikaci se stáhne z OpenFreeMap
+  window.setVectorStyle = function (style) {
+    if (!style || !Array.isArray(style.layers)) return false;
+    vectorStyle = style;
+    vectorState = 'ready';
+    if (map && baseName && BASE_LAYERS[baseName].gl) applyStyle();
+    return true;
+  };
+
+  // Patch 12: styl z minulého spuštění (localStorage trvalého profilu) -> vektorová mapa hned,
+  // bez čekání na síť a bez probliknutí rastru; čerstvý styl se stáhne na pozadí
+  var STYLE_CACHE_KEY = 'omni.vectorStyle.liberty';
+
+  function cachedStyle() {
+    try {
+      var s = JSON.parse(localStorage.getItem(STYLE_CACHE_KEY) || 'null');
+      return s && Array.isArray(s.layers) ? s : null;
+    } catch (e) { return null; }
+  }
+
+  function storeStyle(style) {
+    try { localStorage.setItem(STYLE_CACHE_KEY, JSON.stringify(style)); } catch (e) { /* plná / zakázaná */ }
+  }
+
+  function loadVectorStyle() {
+    if (vectorState === 'loading' || vectorState === 'ready') return;
+    if (vectorState === 'failed' && Date.now() - vectorFailedAt < VECTOR_RETRY_MS) return;
+    vectorState = 'loading';
+    fetch(VECTOR_STYLE_URL).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (style) {
+      if (!window.setVectorStyle(style)) throw new Error('neplatný styl');
+      storeStyle(style);
+    }).catch(function () {
+      vectorState = 'failed';          // zůstává rastrová záloha, která už je zobrazená
+      vectorFailedAt = Date.now();
+    });
+  }
+
+  function refreshCachedStyle() {      // na pozadí; přestavět jen při skutečné změně stylu
+    fetch(VECTOR_STYLE_URL).then(function (r) { return r.ok ? r.json() : null; }).then(function (style) {
+      if (!style || !Array.isArray(style.layers)) return;
+      if (JSON.stringify(style) !== JSON.stringify(vectorStyle)) {
+        storeStyle(style);
+        window.setVectorStyle(style);  // např. nová verze sprite – staré ikony by chyběly
+      }
+    }).catch(function () { /* offline: zůstává uložený styl */ });
+  }
+
+  (function useCachedStyle() {
+    var s = cachedStyle();
+    if (!s) return;
+    vectorStyle = s;
+    vectorState = 'ready';
+    setTimeout(refreshCachedStyle, 3000);   // až po prvním vykreslení
+  })();
+
+  // ── Mapa ────────────────────────────────────────────────────────────────────
+  var mapEl = document.getElementById('map');
+  var baseName = 'standard';
+
+  // Skrytá záložka (QStackedWidget) = nulová velikost: WebGL kontext, shadery a dlaždice by se
+  // připravovaly zbytečně při startu aplikace -> mapa vzniká až na viditelné stránce
+  function hasSize() { return mapEl.clientWidth > 0 && mapEl.clientHeight > 0; }
+
+  function createMap() {
+    if (map || !hasSize()) return;
+    if (!glSupported()) {
+      document.getElementById('nogl').style.display = 'flex';
+      return;
+    }
+    var built = styleFor(baseName);
+    try {
+      map = new maplibregl.Map({
+        container: mapEl, style: built.style, center: [15.5, 49.8], zoom: GLOBE_ZOOM,
+        maxZoom: BASE_LAYERS[baseName].maxZoom, maxPitch: 72, attributionControl: { compact: true },
+        fadeDuration: 180, canvasContextAttributes: { antialias: true }
+      });
+    } catch (e) {
+      map = null;
+      document.getElementById('nogl').style.display = 'flex';
+      return;
+    }
+    engine = built.engine;
+    window.map = map;
+    map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
+    map.addControl(tiltControl, 'bottom-right');
+    map.on('pitchend', syncTiltButton);
+    map.on('error', function (e) { mapErrors.push(String((e && e.error && e.error.message) || e)); });
+    map.on('styleimagemissing', function (e) {
+      if (!map.hasImage(e.id)) map.addImage(e.id, BLANK_ICON);
+    });
+    map.on('style.load', onStyleLoad);
+    map.on('zoomend', function () { syncTerrain(); render(); });
+    // oddalování (přelet zpět na zeměkouli): terén vypnout dřív, než se rovina zakřiví
+    map.on('zoom', function () { if (map.getTerrain() && !terrainAllowed()) syncTerrain(); });
+    map.on('moveend', function () {
+      if (journey.tracing) return;      // kamera Cesty jede po trase (jumpTo za snímek)
+      terrainHold = false; syncTerrain(); render();
+    });
+    map.on('movestart', function (e) { hidePinCard(); if (e.originalEvent) userActed(); });
+    ['mousedown', 'touchstart', 'wheel'].forEach(function (t) { map.on(t, userActed); });
+    map.on('render', function () { renderFrames++; });
+    map.on('mousemove', 'pins', onPinMove);
+    map.on('mouseleave', 'pins', function () { setPinHover(null); });
+    map.on('click', 'pins', onPinClick);
+    var tint = document.createElement('div');
+    tint.id = 'tint';
+    map.getCanvasContainer().insertBefore(tint, map.getCanvasContainer().firstChild.nextSibling);
+    if (BASE_LAYERS[baseName].gl && engine === 'raster') loadVectorStyle();
+    initialView();
+    render();
+  }
+
+  function onStyleLoad() {
+    styleReady = true;
+    mapImages = {};                     // setStyle zahodí obrázky mapy – piny se přidají znovu
+    tileSourceIds = Object.keys((map.getStyle() || {}).sources || {});
+    applyTileLod();
+    applySky(skyNow.sky ? skyNow : DAY_SKY);
+    syncTerrain();
+    addPinLayers();
+    render();
+    if (journey.active) addRouteLayers();
+  }
+
+  // LOD platí pro zdroje stylu; setStyle vytvoří nové -> znovu po každém style.load
+  var tileLod = null;
+  function applyTileLod() {
+    if (!map || typeof map.setSourceTileLodParams !== 'function') return;
+    try {
+      map.setSourceTileLodParams(TILE_LOD_ZOOM_LEVELS, TILE_LOD_RATIO);
+      tileLod = [TILE_LOD_ZOOM_LEVELS, TILE_LOD_RATIO];
+    } catch (e) { tileLod = null; }
+  }
+  window.getTileLod = function () { return tileLod; };
+
+  // ── 2D / 3D: jedno tlačítko, stav vždy ze skutečného náklonu ────────────────
+  // Dřív jen kompas (resetNorthPitch) a tažení pravým tlačítkem: rozjetá animace / setrvačnost
+  // přebíjela náklon a stav „3D“ se nedal spolehlivě vrátit. Teď: zastavit běžící pohyb,
+  // plynule na 0° nebo FLY_PITCH (52°), popisek podle výsledku (pitchend).
+  function isTilted() { return !!map && map.getPitch() > 5; }
+  var tiltBtn = null;
+  var tiltControl = {
+    onAdd: function () {
+      var box = document.createElement('div');
+      box.className = 'maplibregl-ctrl maplibregl-ctrl-group';
+      tiltBtn = document.createElement('button');
+      tiltBtn.type = 'button';
+      tiltBtn.id = 'btn-tilt';
+      tiltBtn.className = 'tilt-btn';
+      tiltBtn.addEventListener('click', function () { window.toggleTilt(); });
+      box.appendChild(tiltBtn);
+      syncTiltButton();
+      return box;
+    },
+    onRemove: function () { tiltBtn = null; }
+  };
+  function syncTiltButton() {
+    if (!tiltBtn) return;
+    var tilted = isTilted();
+    tiltBtn.textContent = tilted ? '2D' : '3D';
+    tiltBtn.title = tilted ? 'Pohled shora (2D)' : 'Naklonit (3D)';
+    tiltBtn.setAttribute('aria-pressed', tilted ? 'true' : 'false');
+  }
+  window.toggleTilt = function () {
+    if (!map || journey.active) return null;
+    var to3d = !isTilted();
+    map.stop();                         // setrvačnost / let by cílový náklon přepsaly
+    userActed();
+    var cam = { pitch: to3d ? FLY_PITCH : 0, duration: reduceMotion ? 0 : TILT_MS, essential: true };
+    if (!to3d) cam.bearing = 0;         // 2D = sever nahoře
+    map.easeTo(cam);
+    if (tiltBtn) tiltBtn.textContent = to3d ? '2D' : '3D';   // hned, pitchend ho potvrdí
+    return to3d;
+  };
+
+  // 3D terén jen v krajině: na zeměkouli by se stahovaly výškové dlaždice celých kontinentů.
+  // A NIKDY během kreslení zeměkoule (přechod projekce, přelet přes oddálení): terén s projekcí
+  // vertical-perspective MapLibre nepodporuje – za každý snímek hlásil „calculateFogMatrix is not
+  // supported on globe projection“ a „terrain is not fully supported on vertical perspective“.
+  var terrainHold = false;            // dlouhý přelet: terén až v cíli (moveend)
+  function globeRendering() {
+    try { return !!(map && map.transform && map.transform.isGlobeRendering); } catch (e) { return false; }
+  }
+  function terrainAllowed() {
+    return !!map && map.getZoom() >= TERRAIN_MIN_ZOOM && !terrainHold && !(map.getTerrain() && globeRendering());
+  }
+  var terrainRetry = false;
+  function syncTerrain() {
+    if (!map || !styleReady || !map.getSource('dem')) return;
+    var on = !!map.getTerrain();
+    var want = terrainAllowed() && (on || !map.isMoving());       // zapnout až v klidu
+    if (want === on) return;
+    if (want && globeRendering()) {
+      // skok ze zeměkoule rovnou do krajiny: projekce se překlopí až příštím snímkem
+      if (!terrainRetry) {
+        terrainRetry = true;
+        map.once('render', function () { terrainRetry = false; syncTerrain(); });
+        map.triggerRepaint();
+      }
+      return;
+    }
+    try { map.setTerrain(want ? { source: 'dem', exaggeration: TERRAIN_EXAGGERATION } : null); } catch (e) { /* styl se mění */ }
+  }
+  function holdTerrain() {            // před dlouhým přeletem: rovina bez terénu, zapne se v cíli
+    terrainHold = true;
+    if (map && map.getTerrain()) { try { map.setTerrain(null); } catch (e) { /* styl se mění */ } }
+  }
+
+  // Počítadlo vykreslených snímků: nečinná mapa má kreslit 0 snímků za sekundu (testy, ladění)
+  var renderFrames = 0;
+  window.renderStats = function () { return { frames: renderFrames, moving: !!(map && map.isMoving()),
+                                              spinning: spinning, globe: globeRendering() }; };
+  window.isTerrainOn = function () { return !!(map && map.getTerrain()); };
+
+  window.setBaseLayer = function (name, notify) {
+    name = LEGACY_LAYERS[name] || name;
+    if (!BASE_LAYERS[name]) name = 'standard';
+    var changed = name !== baseName || !engineMatches(name);
+    baseName = name;
+    mapEl.classList.remove('theme-standard', 'theme-satellite', 'theme-outdoor');
+    mapEl.classList.add(BASE_LAYERS[name].theme);
+    document.querySelectorAll('#layers button').forEach(function (b) {
+      b.setAttribute('aria-pressed', b.dataset.layer === name ? 'true' : 'false');
+    });
+    if (map && changed) applyStyle();
+    else if (!map && BASE_LAYERS[name].gl && glSupported()) loadVectorStyle();
+    if (notify && bridge && bridge.setMapLayer) bridge.setMapLayer(name);   // zapamatovat v config.json
+    return baseName;
+  };
+  function engineMatches(name) {    // vektorový styl mezitím dorazil -> přestavět i bez změny podkladu
+    var want = BASE_LAYERS[name].gl && vectorState === 'ready' ? 'vector' : 'raster';
+    return engine === want;
+  }
+  window.getBaseLayer = function () { return baseName; };
+  window.getBaseLayerEngine = function () { return engine; };
+  window.getBaseLayerUrls = function () {           // pro testy: zdroje aktivního podkladu
+    if (engine === 'vector') {
+      return baseName === 'satellite' ? [ESRI + 'World_Imagery/MapServer/tile/{z}/{y}/{x}', VECTOR_TILES_URL]
+                                      : [VECTOR_STYLE_URL];
+    }
+    return BASE_LAYERS[baseName].layers.map(function (l) { return l.url; });
+  };
+  window.getMapErrors = function () { return mapErrors.slice(); };
+  window.isMapCreated = function () { return !!map; };
+  document.querySelectorAll('#layers button').forEach(function (b) {
+    b.addEventListener('click', function () { setBaseLayer(b.dataset.layer, true); });
+  });
+
+  if (window.qt && qt.webChannelTransport) {
+    new QWebChannel(qt.webChannelTransport, function (ch) { bridge = ch.objects.bridge; });
+  }
+
+  // Zvýraznění aplikace (tokens.accent) – trasa Cesty, odznaky, tlačítka. Běžící Cesta může mít
+  // vlastní odstín z obálky události (data.accent, Polish P4); po jejím konci se vrátí baseAccent.
+  var baseAccent = '#8B7CF6';
+  function validHex(hex) { return /^#[0-9a-fA-F]{6}$/.test(hex || ''); }
+  window.setAccent = function (hex) {
+    if (!validHex(hex)) return false;
+    baseAccent = hex;
+    if (!(journey && journey.active && journey.tint)) applyAccent(hex);
+    return true;
+  };
+  window.getBaseAccent = function () { return baseAccent; };
+  function applyAccent(hex) {
+    document.documentElement.style.setProperty('--accent', hex);
+    var c = hexRgb(hex);
+    document.documentElement.style.setProperty('--accent-soft', 'rgba(' + c.join(',') + ',0.30)');
+    if (map) {                       // běžící Cesta se přebarví na místě (žádné setStyle = dlaždice zůstanou)
+      if (map.getLayer('pins-halo')) map.setPaintProperty('pins-halo', 'circle-color', hex);
+      if (styleReady) render();      // odznaky pinů ve zvýraznění (klíč obrázku obsahuje barvu)
+      ['j-all', 'j-done', 'j-glow'].forEach(function (id) {
+        if (map.getLayer(id)) map.setPaintProperty(id, 'line-color', hex);
+      });
+      if (map.getLayer('j-stops')) {
+        map.setPaintProperty('j-stops', 'circle-stroke-color',
+                             ['case', ['==', ['get', 'current'], 1], hex, 'rgba(0,0,0,0.35)']);
+      }
+    }
+  }
+  function accent() { return getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#8B7CF6'; }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function bg(url) {               // URL náhledu jako CSS pozadí (žádné <img> = žádné vkládání HTML)
+    return url ? ' style="background-image:url(&quot;' + esc(url) + '&quot;)"' : '';
+  }
+  function setBg(el, url) {
+    if (url) el.style.backgroundImage = 'url("' + String(url).replace(/["\\\n\r]/g, '') + '")';
+    else el.classList.add('noimg');
+  }
+
+  function fmtDate(s) {            // '2026-07-12 10:30' -> '12. 7. 2026'
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s || '');
+    return m ? (+m[3]) + '. ' + (+m[2]) + '. ' + m[1] : '';
+  }
+  function fmtTime(s) {            // '2026-07-12 09:05' -> '9:05'
+    var m = /[ T](\d{2}):(\d{2})/.exec(s || '');
+    return m ? (+m[1]) + ':' + m[2] : '';
+  }
+
+  function dateRange(items) {
+    var ds = items.map(function (m) { return m.date || ''; }).filter(Boolean).sort();
+    if (!ds.length) return '';
+    var a = fmtDate(ds[0]), b = fmtDate(ds[ds.length - 1]);
+    return a === b ? a : a + ' – ' + b;
+  }
+
+  function czCount(n) {
+    return n === 1 ? '1 fotografie' : (n >= 2 && n <= 4 ? n + ' fotografie' : n + ' fotografií');
+  }
+  function czStops(n) {
+    return n === 1 ? '1 zastávka' : (n >= 2 && n <= 4 ? n + ' zastávky' : n + ' zastávek');
+  }
+  function yearsAgo(s, now) {      // „Před 3 lety“ – časová kapsle
+    var t = parseLocal(s);
+    if (!t) return '';
+    now = now || new Date();
+    var y = now.getFullYear() - t.y;
+    if (now.getMonth() + 1 < t.mo || (now.getMonth() + 1 === t.mo && now.getDate() < t.d)) y -= 1;
+    return y <= 0 ? '' : (y === 1 ? 'Před rokem' : 'Před ' + y + ' lety');
+  }
+  window.yearsAgo = yearsAgo;
+
+  // Náhledová karta: až 4 náhledy, místo, rozsah dat, počet
+  function tipHtml(cluster) {
+    var items = cluster.items;
+    var withThumb = items.filter(function (m) { return m.thumb; }).slice(0, MAX_CARD_THUMBS);
+    var thumbs = withThumb.length
+      ? '<div class="card-thumbs n' + withThumb.length + '">'
+        + withThumb.map(function (m) { return '<div class="t"' + bg(m.thumb) + '></div>'; }).join('')
+        + '</div>'
+      : '';
+    var cities = items.map(function (m) { return m.city; }).filter(Boolean);
+    var city = cities.length ? cities[0] : '';
+    var title, sub;
+    if (items.length > 1) {
+      title = city ? esc(city) : 'Více míst';
+      sub = [czCount(items.length), dateRange(items)].filter(Boolean).join(' · ');
+    } else {
+      title = esc(items[0].name);
+      sub = [items[0].city, fmtDate(items[0].date)].filter(Boolean).join(' · ');
+    }
+    return thumbs + '<div class="card-title">' + title + '</div><div class="card-sub">' + esc(sub) + '</div>';
+  }
+
+  // ── Shlukování: mřížka v pixelech Web Mercatoru aktuálního přiblížení ─────────
+  function mercPx(lat, lon, z) {
+    var size = TILE_PX * Math.pow(2, z);
+    var s = Math.max(-0.9999, Math.min(0.9999, Math.sin(lat * Math.PI / 180)));
+    return { x: (lon + 180) / 360 * size, y: (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * size };
+  }
+  function pxDist(a, b) { return Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)); }
+
+  function viewFilter() {          // jen viditelná oblast + okraj; zeměkoule = vše
+    if (!map || map.getZoom() < 4) return null;
+    var b = map.getBounds(), w = b.getWest(), e = b.getEast(), s = b.getSouth(), n = b.getNorth();
+    if (e - w >= 300) return null;
+    var dx = (e - w) * 0.5, dy = (n - s) * 0.5;
+    return function (m) {
+      var lon = m.lon;
+      while (lon < w - dx) lon += 360;
+      while (lon > e + dx) lon -= 360;
+      return m.lat >= s - dy && m.lat <= n + dy && lon >= w - dx && lon <= e + dx;
+    };
+  }
+
+  function computeClusters(zoom) {
+    var keep = viewFilter(), cells = {};
+    markers.forEach(function (m) {
+      if (keep && !keep(m)) return;
+      var p = mercPx(m.lat, m.lon, zoom);
+      var key = Math.floor(p.x / CELL_PX) + ':' + Math.floor(p.y / CELL_PX);
+      var c = cells[key] || (cells[key] = { items: [], lat: 0, lon: 0 });
+      c.items.push(m); c.lat += m.lat; c.lon += m.lon;
+    });
+    // Buňky mřížky dělí hustá místa podle hranic buněk -> dva piny přes sebe. Shluky, jejichž
+    // piny by se překrývaly, sloučit (od největších, těžiště v pixelech).
+    var list = Object.keys(cells).map(function (k) {
+      var c = cells[k];
+      c.lat /= c.items.length; c.lon /= c.items.length;
+      c.px = mercPx(c.lat, c.lon, zoom);
+      return c;
+    }).sort(function (a, b) { return b.items.length - a.items.length; });
+    var merged = [];
+    list.forEach(function (c) {
+      var host = null;
+      for (var i = 0; i < merged.length; i++) {
+        if (pxDist(merged[i].px, c.px) < PIN_PX) { host = merged[i]; break; }
+      }
+      if (!host) { merged.push(c); return; }
+      var n = host.items.length, m = c.items.length;
+      host.lat = (host.lat * n + c.lat * m) / (n + m);
+      host.lon = (host.lon * n + c.lon * m) / (n + m);
+      host.items = host.items.concat(c.items);
+      host.px = mercPx(host.lat, host.lon, zoom);
+    });
+    return merged;
+  }
+  window.computeClusters = computeClusters;
+
+  function currentZoom() { return map ? map.getZoom() : GLOBE_ZOOM; }
+
+  // ── Piny jako nativní vrstva WebGL ──────────────────────────────────────────
+  // Dřív HTML značky (maplibregl.Marker): DOM se k plátnu WebGL dorovnával se zpožděním snímku
+  // a během posunu / přiblížení piny „plavaly“. Teď každý shluk = prvek GeoJSON a vrstva symbol
+  // s obrázkem pinu (náhled v kruhu, bílý lem, stín, odznak počtu) nakresleným jednou do plátna.
+  // Piny se tak kreslí ve stejném snímku jako mapa – přesně na souřadnicích, na zadní straně
+  // zeměkoule je MapLibre sám skryje.
+  var PIN_D = 52, PIN_PAD = 14, PIN_BOX = PIN_D + 2 * PIN_PAD;
+  var PIN_DPR = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+  var PIN_IMAGE_BUDGET = 500;          // obrázků pinů v paměti GPU nejvýš tolik (nejstarší pryč)
+  var pinImages = {};                  // klíč -> {data, used}; přežije setStyle (znovu addImage)
+  var mapImages = {};                  // klíče už přidané do aktuálního stylu
+  var thumbs = {};                     // url náhledu -> Image | 'loading' | 'error'
+  var pinGeo = { type: 'FeatureCollection', features: [] };
+  var pinTick = 0, pinRefresh = 0;
+
+  function roundRect(g, x, y, w, h, r) {
+    g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+    g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+  }
+  function disc(g, x, y, r) { g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI); g.fill(); }
+
+  function drawPin(img, count, hex) {
+    var s = PIN_DPR, box = Math.round(PIN_BOX * s);
+    var cv = document.createElement('canvas');
+    cv.width = cv.height = box;
+    var g = cv.getContext('2d');
+    g.scale(s, s);
+    var c = PIN_BOX / 2, r = PIN_D / 2;
+    if (count > 1) {                                   // balíček fotek za pinem
+      g.fillStyle = 'rgba(255,255,255,0.28)'; disc(g, c + 7, c + 7, r - 2);
+      g.fillStyle = 'rgba(255,255,255,0.55)'; disc(g, c + 3.5, c + 3.5, r - 1);
+    }
+    g.save();
+    g.shadowColor = 'rgba(0,0,0,0.55)'; g.shadowBlur = 10; g.shadowOffsetY = 3;
+    g.fillStyle = '#FFFFFF'; disc(g, c, c, r);
+    g.restore();
+    var ir = r - 2.5;
+    g.save();
+    g.beginPath(); g.arc(c, c, ir, 0, 2 * Math.PI); g.clip();
+    g.fillStyle = '#3A3A3C'; g.fillRect(c - ir, c - ir, 2 * ir, 2 * ir);
+    if (img) {                                         // výřez na střed (object-fit: cover)
+      var iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+      var k = Math.max(2 * ir / iw, 2 * ir / ih);
+      g.drawImage(img, c - iw * k / 2, c - ih * k / 2, iw * k, ih * k);
+    } else {
+      g.fillStyle = '#8E8E93'; disc(g, c, c, ir - 11.5);
+    }
+    g.restore();
+    if (count > 1) {                                   // odznak počtu vpravo nahoře
+      var label = String(count);
+      g.font = '600 12px "Segoe UI", sans-serif';
+      var w = Math.max(22, Math.ceil(g.measureText(label).width) + 12), h = 22;
+      var x = c + r + 8 - w, y = c - r - 6;
+      roundRect(g, x, y, w, h, h / 2);
+      g.fillStyle = hex; g.fill();
+      g.lineWidth = 2; g.strokeStyle = '#1C1C1E'; g.stroke();
+      g.fillStyle = '#FFFFFF'; g.textAlign = 'center'; g.textBaseline = 'middle';
+      g.fillText(label, x + w / 2, y + h / 2 + 0.5);
+    }
+    return g.getImageData(0, 0, box, box);           // náhled z cizího původu = SecurityError
+  }
+
+  function loadThumb(url) {
+    if (thumbs[url]) return;
+    thumbs[url] = 'loading';
+    var im = new Image();
+    im.onload = function () { thumbs[url] = im; schedulePinRefresh(); };
+    im.onerror = function () { thumbs[url] = 'error'; schedulePinRefresh(); };
+    im.src = url;
+  }
+  function schedulePinRefresh() {       // náhledy dorazí po jednom – přestavět piny jednou za snímek
+    if (pinRefresh) return;
+    pinRefresh = requestAnimationFrame(function () { pinRefresh = 0; if (map) render(); });
+  }
+
+  // Klíč obrázku pinu pro shluk; obrázek se nakreslí, jakmile je náhled načtený (do té doby šedý)
+  function pinImageFor(c) {
+    var url = c.items[0].thumb || '', n = c.items.length, hex = accent();
+    var t = url ? thumbs[url] : 'error';
+    if (url && !t) { loadThumb(url); t = 'loading'; }
+    var ready = t && typeof t === 'object';
+    var key = 'pin:' + (ready ? url : '-') + '|' + n + (n > 1 ? '|' + hex : '');
+    if (!pinImages[key]) {
+      var data = null;
+      try { data = drawPin(ready ? t : null, n, hex); } catch (e) {
+        thumbs[url] = 'error';                         // zamčené plátno: pin bez náhledu
+        key = 'pin:-|' + n + (n > 1 ? '|' + hex : '');
+        if (!pinImages[key]) data = drawPin(null, n, hex);
+      }
+      if (data) pinImages[key] = { data: data };
+    }
+    pinImages[key].used = ++pinTick;
+    if (map && styleReady && !mapImages[key]) {
+      if (!map.hasImage(key)) map.addImage(key, pinImages[key].data, { pixelRatio: PIN_DPR });
+      mapImages[key] = true;
+    }
+    return key;
+  }
+  function prunePinImages() {
+    var keys = Object.keys(pinImages);
+    if (keys.length <= PIN_IMAGE_BUDGET) return;
+    var inUse = {};
+    pinGeo.features.forEach(function (f) { inUse[f.properties.img] = true; });
+    keys.filter(function (k) { return !inUse[k]; })
+        .sort(function (a, b) { return pinImages[a].used - pinImages[b].used; })
+        .slice(0, keys.length - PIN_IMAGE_BUDGET)
+        .forEach(function (k) {
+          delete pinImages[k];
+          if (mapImages[k]) { delete mapImages[k]; if (map && map.hasImage(k)) map.removeImage(k); }
+        });
+  }
+
+  function addPinLayers() {
+    if (!map || !styleReady || map.getSource('pins')) return;
+    map.addSource('pins', { type: 'geojson', data: pinGeo });
+    map.addLayer({ id: 'pins-halo', type: 'circle', source: 'pins',
+                   layout: { visibility: journey.active ? 'none' : 'visible' },
+                   paint: { 'circle-radius': PIN_D / 2 + 7, 'circle-color': accent(), 'circle-blur': 0.55,
+                            'circle-opacity': ['case', ['boolean', ['feature-state', 'hover'], false], 0.6, 0],
+                            'circle-opacity-transition': { duration: 140, delay: 0 },
+                            'circle-pitch-alignment': 'viewport' } });
+    map.addLayer({ id: 'pins', type: 'symbol', source: 'pins',
+                   layout: { 'icon-image': ['get', 'img'], 'icon-allow-overlap': true, 'icon-ignore-placement': true,
+                             'icon-pitch-alignment': 'viewport', 'icon-rotation-alignment': 'viewport',
+                             'symbol-sort-key': ['get', 'count'], visibility: journey.active ? 'none' : 'visible' } });
+  }
+  function setPinsVisible(on) {
+    if (!map) return;
+    ['pins', 'pins-halo'].forEach(function (id) {
+      if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none');
+    });
+    if (!on) hidePinCard();
+  }
+
+  // Najetí a klik: shluk, jehož kruh je pod kurzorem (obrázek má okraj na stín a odznak)
+  function pinAt(e) {
+    var best = null, bestD = PIN_D / 2 + 3;
+    (e.features || []).forEach(function (f) {
+      var c = clusters[f.id];
+      if (!c) return;
+      var p = map.project([c.lon, c.lat]), d = Math.hypot(p.x - e.point.x, p.y - e.point.y);
+      if (d <= bestD) { best = f.id; bestD = d; }
+    });
+    return best;
+  }
+  var hoverPin = null;
+  function setPinHover(id) {
+    if (id === hoverPin) return;
+    if (hoverPin !== null && map.getSource('pins')) map.setFeatureState({ source: 'pins', id: hoverPin }, { hover: false });
+    hoverPin = id;
+    if (id !== null && map.getSource('pins')) map.setFeatureState({ source: 'pins', id: id }, { hover: true });
+    map.getCanvas().style.cursor = id === null ? '' : 'pointer';
+    if (id === null) hidePinCard(); else showPinCard(id);
+  }
+  function onPinMove(e) { setPinHover(pinAt(e)); }
+  function onPinClick(e) {
+    var id = pinAt(e);
+    if (id === null || !clusters[id]) return;
+    hidePinCard();
+    openCluster(clusters[id]);
+  }
+
+  var card = document.getElementById('card'), cardFor = null;
+  function showPinCard(i) {
+    var c = clusters[i];
+    if (!c || !map) return;
+    cardFor = c;
+    card.innerHTML = tipHtml(c);
+    var p = map.project([c.lon, c.lat]);
+    card.style.left = Math.max(116, Math.min(window.innerWidth - 116, p.x)) + 'px';
+    card.style.top = (p.y - PIN_D / 2 - 8) + 'px';
+    card.classList.add('show');
+  }
+  function hidePinCard() {
+    cardFor = null;
+    card.classList.remove('show');
+  }
+  function hideCard() { hidePinCard(); }
+  window.hoverCluster = function (i) { if (!clusters[i]) return false; showPinCard(i); return true; };
+
+  function render() {
+    clusters = computeClusters(currentZoom());
+    if (!map) return;
+    if (hoverPin !== null) setPinHover(null);          // id prvků se přečíslují
+    pinGeo = { type: 'FeatureCollection', features: clusters.map(function (c, i) {
+      return { type: 'Feature', id: i, properties: { img: pinImageFor(c), count: c.items.length },
+               geometry: { type: 'Point', coordinates: [c.lon, c.lat] } };
+    }) };
+    var src = map.getSource('pins');
+    if (src) src.setData(pinGeo);
+    else addPinLayers();
+    prunePinImages();
+  }
+
+  // ── Kamera: přelety ke shlukům, návrat na zeměkouli, klidové otáčení ─────────
+  function flyIn(items) {
+    var lats = items.map(function (m) { return m.lat; }), lons = items.map(function (m) { return m.lon; });
+    var b = new maplibregl.LngLatBounds([Math.min.apply(null, lons), Math.min.apply(null, lats)],
+                                        [Math.max.apply(null, lons), Math.max.apply(null, lats)]);
+    var cam = map.cameraForBounds(b, { padding: 90, maxZoom: map.getMaxZoom() - 1 }) || {};
+    var zoom = cam.zoom === undefined ? map.getZoom() + 2 : cam.zoom;
+    var opts = { center: cam.center || b.getCenter(), zoom: zoom,
+                 pitch: zoom >= TERRAIN_MIN_ZOOM ? FLY_PITCH : (zoom >= 5 ? 25 : 0),
+                 bearing: zoom >= TERRAIN_MIN_ZOOM ? map.getBearing() : 0 };
+    stopSpin();
+    if (reduceMotion || !hasSize()) { map.jumpTo(opts); return; }
+    var hops = Math.abs(zoom - map.getZoom());
+    map.flyTo(Object.assign(opts, { duration: Math.min(4200, 1400 + hops * 260), curve: 1.5, essential: true }));
+  }
+
+  function openCluster(c) {
+    var items = c.items;
+    if (items.length === 1) {
+      if (bridge) bridge.openPhotoFromMap(items[0].id);
+      return;
+    }
+    var maxZ = map ? map.getMaxZoom() : 19;
+    var px = items.map(function (m) { return mercPx(m.lat, m.lon, maxZ); });
+    var xs = px.map(function (p) { return p.x; }), ys = px.map(function (p) { return p.y; });
+    var samePlace = pxDist({ x: Math.min.apply(null, xs), y: Math.min.apply(null, ys) },
+                           { x: Math.max.apply(null, xs), y: Math.max.apply(null, ys) }) < CELL_PX;
+    if (map && map.getZoom() < maxZ - 0.5 && !samePlace) {
+      flyIn(items);                                         // plynulý přelet do shluku
+    } else if (bridge) {
+      bridge.openPhotosFromMap(JSON.stringify(items.map(function (m) { return m.id; })));
+    }
+  }
+  window.getClusters = function () {
+    return clusters.map(function (c) { return { count: c.items.length, ids: c.items.map(function (m) { return m.id; }),
+                                                lat: c.lat, lon: c.lon, card: tipHtml(c) }; });
+  };
+  window.clickCluster = function (i) { if (clusters[i]) openCluster(clusters[i]); return !!clusters[i]; };
+
+  function centroid() {            // střed fotek na zeměkouli (kruhový průměr délek – přes 180° poledník)
+    if (!markers.length) return [15.5, 49.8];
+    var sx = 0, sy = 0, lat = 0;
+    markers.forEach(function (m) { sx += Math.cos(m.lon * Math.PI / 180); sy += Math.sin(m.lon * Math.PI / 180); lat += m.lat; });
+    return [Math.atan2(sy, sx) * 180 / Math.PI, Math.max(-50, Math.min(60, lat / markers.length))];
+  }
+
+  // Úvodní pohled: zeměkoule natočená k fotkám (dřív fitBounds na všechny piny)
+  function initialView() {
+    if (fitted || !map || !markers.length) return;
+    fitted = true;
+    map.jumpTo({ center: centroid(), zoom: GLOBE_ZOOM, pitch: 0, bearing: 0 });
+  }
+
+  window.pullBack = function () {                       // plynulý návrat na zeměkouli
+    if (!map) return false;
+    var c = map.getCenter();
+    var target = { center: [c.lng, Math.max(-35, Math.min(50, c.lat))], zoom: GLOBE_ZOOM, pitch: 0, bearing: 0 };
+    hideCard();
+    if (map.getZoom() >= TERRAIN_MIN_ZOOM) holdTerrain();   // let na zeměkouli bez terénu
+    if (reduceMotion || !hasSize()) map.jumpTo(target);
+    else map.flyTo(Object.assign(target, { duration: Math.min(3600, 1600 + map.getZoom() * 140), curve: 1.6, essential: true }));
+    lastAct = Date.now() - IDLE_SPIN_MS + 2500;          // po návratu se zeměkoule brzy rozjede
+    spinRested = false;
+    return true;
+  };
+  document.getElementById('btn-globe').addEventListener('click', function () { window.pullBack(); });
+
+  var lastAct = Date.now(), spinning = false, spinFrame = 0, spinT = 0, spinSpeed = 0;
+  var spinStarted = 0, spinRested = false;   // rested = dotočeno, znovu až po zásahu uživatele
+  function userActed() { lastAct = Date.now(); spinRested = false; stopSpin(); }
+  function canSpin() {
+    return !!map && !reduceMotion && mapActive && !journey.active && hasSize() && !cardFor
+        && document.visibilityState !== 'hidden' && map.getZoom() <= GLOBE_SPIN_MAX_ZOOM && map.getPitch() < 5;
+  }
+  function startSpin() {
+    if (spinning || !canSpin() || map.isMoving()) return;
+    spinning = true; spinSpeed = 0; spinT = spinStarted = performance.now();
+    spinFrame = requestAnimationFrame(spinStep);
+  }
+  function spinStep(now) {
+    if (!spinning) return;
+    if (!canSpin()) { stopSpin(); return; }
+    var dt = Math.min(0.1, (now - spinT) / 1000);
+    spinT = now;
+    if (now - spinStarted > SPIN_MAX_MS) {                                         // dobrzdění 2,5 s
+      spinSpeed -= SPIN_DEG_PER_S * dt / 2.5;
+      if (spinSpeed <= 0) { stopSpin(); spinRested = true; return; }
+    } else {
+      spinSpeed = Math.min(SPIN_DEG_PER_S, spinSpeed + SPIN_DEG_PER_S * dt / 2.5); // rozjezd 2,5 s
+    }
+    var c = map.getCenter();
+    // od západu k východu jako skutečná Země: povrch se pohybuje zleva doprava
+    map.setCenter([((c.lng - spinSpeed * dt + 540) % 360) - 180, c.lat]);
+    spinFrame = requestAnimationFrame(spinStep);
+  }
+  function stopSpin() { spinning = false; cancelAnimationFrame(spinFrame); }
+  setInterval(function () { if (!spinning && !spinRested && Date.now() - lastAct > IDLE_SPIN_MS) startSpin(); }, 1000);
+  window.isSpinning = function () { return spinning; };
+  window.startSpinNow = function () { lastAct = 0; spinRested = false; startSpin(); return spinning; };
+  window.setMapActive = function (on) {                  // main.py: záložka mapy shown / hidden
+    mapActive = !!on;
+    if (!mapActive) { stopSpin(); if (journey.active && !journey.paused) togglePause(); }
+    else { lastAct = Date.now(); spinRested = false; onResize(); }
+    return mapActive;
+  };
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') stopSpin(); });
+
+  window.setMarkers = function (data) {
+    markers = Array.isArray(data) ? data : [];
+    var hud = document.getElementById('hud');
+    hud.hidden = markers.length === 0;
+    document.getElementById('hudcount').textContent = czCount(markers.length) + ' na mapě';
+    document.getElementById('empty').style.display = markers.length ? 'none' : 'flex';
+    initialView();
+    render();
+    return markers.length;
+  };
+  window.getMarkerCount = function () { return markers.length; };
+  window.getClusterCount = function () { return clusters.length; };
+  window.getPinCount = function () {             // piny skutečně ve vrstvě WebGL
+    return map && map.getSource('pins') ? pinGeo.features.length : 0;
+  };
+  window.getPinState = function () {
+    return { layer: !!(map && map.getLayer('pins')), images: Object.keys(pinImages).length,
+             visible: !!(map && map.getLayer('pins')) && map.getLayoutProperty('pins', 'visibility') !== 'none',
+             thumbs: Object.keys(thumbs).filter(function (u) { return typeof thumbs[u] === 'object'; }).length,
+             keys: pinGeo.features.map(function (f) { return f.properties.img; }) };
+  };
+  window.isFitted = function () { return fitted; };
+
+  // ── Cesta: kinematické přehrávání výletu ────────────────────────────────────
+  var journey = { active: false, data: null, i: -1, paused: false, timers: [], stripped: {}, raf: 0, ended: false };
+  var journeyList = [];
+
+  window.setJourneys = function (list) {
+    journeyList = Array.isArray(list) ? list : [];
+    var btn = document.getElementById('btn-journeys');
+    btn.hidden = journeyList.length === 0;
+    var box = document.getElementById('jlist');
+    box.innerHTML = '<div class="head">Přehrát cestu</div>' + journeyList.map(function (j, i) {
+      var sub = [j.location, dateRange([{ date: j.start }, { date: j.end }]), czCount(j.count)].filter(Boolean).join(' · ');
+      return '<button type="button" data-i="' + i + '"><div class="t">' + esc(j.title) + '</div><div class="s">'
+           + esc(sub) + '</div></button>';
+    }).join('');
+    box.querySelectorAll('button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        toggleList(false);
+        var j = journeyList[+b.dataset.i];
+        if (j && bridge && bridge.requestJourney) bridge.requestJourney(j.id);
+      });
+    });
+    return journeyList.length;
+  };
+  function toggleList(open) {
+    var box = document.getElementById('jlist'), btn = document.getElementById('btn-journeys');
+    open = open === undefined ? !box.classList.contains('open') : open;
+    box.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) { stopSpin(); var f = box.querySelector('button'); if (f) f.focus(); }
+  }
+  document.getElementById('btn-journeys').addEventListener('click', function (e) { e.stopPropagation(); toggleList(); });
+  document.addEventListener('click', function (e) {
+    if (!document.getElementById('jlist').contains(e.target)) toggleList(false);
+  });
+
+  function haversineKm(a, b) {
+    var r = Math.PI / 180, dLat = (b[1] - a[1]) * r, dLon = (b[0] - a[0]) * r;
+    var h = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+          + Math.cos(a[1] * r) * Math.cos(b[1] * r) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+  function bearingDeg(a, b) {
+    var r = Math.PI / 180, y = Math.sin((b[0] - a[0]) * r) * Math.cos(b[1] * r);
+    var x = Math.cos(a[1] * r) * Math.sin(b[1] * r) - Math.sin(a[1] * r) * Math.cos(b[1] * r) * Math.cos((b[0] - a[0]) * r);
+    return (Math.atan2(y, x) / r + 360) % 360;
+  }
+  // ── Tvar trasy ──────────────────────────────────────────────────────────────
+  // Dřív pravítkové čáry mezi těžišti zastávek – přes hory i hranice. Teď:
+  //  * let (> FLIGHT_KM): oblouk po hlavní kružnici (na zeměkouli přirozená dráha letu),
+  //  * jinak hladká křivka (centripetální Catmull-Rom) přes skutečná místa: poslední fotka
+  //    zastávky (odjezd) a první fotka další (příjezd) – trasa jde tudy, kudy se opravdu šlo,
+  //  * bez mezilehlých bodů jemný oblouk místo přímky,
+  //  * úsek do LOCAL_KM po skutečných cestách / stezkách OSM (trailLeg), pokud jsou v načtených
+  //    vektorových dlaždicích; delší mezera bez fotek = vysoký oblouk letu (flyTo s výskokem).
+  var FLIGHT_KM = 80, LOCAL_KM = 15, LEG_BULGE = 0.12, SPLINE_STEPS = 14;
+  function llOf(p) {
+    return p && isFinite(p.lat) && isFinite(p.lon) && Math.abs(p.lat) <= 90 && Math.abs(p.lon) <= 180
+      ? [p.lon, p.lat] : null;
+  }
+  function bulgePoint(a, b, f) {      // bod vpravo od směru jízdy, f × délka úseku od středu
+    var k = Math.cos((a[1] + b[1]) / 2 * Math.PI / 180) || 1;
+    var dx = (b[0] - a[0]) * k, dy = b[1] - a[1];
+    return [(a[0] + b[0]) / 2 + dy * f / k, (a[1] + b[1]) / 2 - dx * f];
+  }
+  // Centripetální Catmull-Rom (Barry-Goldman): prochází body, bez smyček a přestřelení
+  function catmullRom(pts, steps) {
+    if (pts.length < 3) return pts.slice();
+    var k = Math.cos(pts[0][1] * Math.PI / 180) || 1;
+    var P = pts.map(function (p) { return [p[0] * k, p[1]]; });
+    var n = P.length;
+    P.unshift([2 * P[0][0] - P[1][0], 2 * P[0][1] - P[1][1]]);
+    P.push([2 * P[n][0] - P[n - 1][0], 2 * P[n][1] - P[n - 1][1]]);
+    function knot(t, a, b) { return t + Math.max(1e-9, Math.sqrt(Math.hypot(b[0] - a[0], b[1] - a[1]))); }
+    function lerp(a, b, ta, tb, t) {
+      var w = tb - ta < 1e-12 ? 0 : (t - ta) / (tb - ta);
+      return [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w];
+    }
+    var out = [pts[0]];
+    for (var i = 1; i < P.length - 2; i++) {
+      var p0 = P[i - 1], p1 = P[i], p2 = P[i + 1], p3 = P[i + 2];
+      var t0 = 0, t1 = knot(t0, p0, p1), t2 = knot(t1, p1, p2), t3 = knot(t2, p2, p3);
+      for (var s = 1; s <= steps; s++) {
+        var t = t1 + (t2 - t1) * s / steps;
+        var a1 = lerp(p0, p1, t0, t1, t), a2 = lerp(p1, p2, t1, t2, t), a3 = lerp(p2, p3, t2, t3, t);
+        var b1 = lerp(a1, a2, t0, t2, t), b2 = lerp(a2, a3, t1, t3, t);
+        var c = lerp(b1, b2, t1, t2, t);
+        out.push([c[0] / k, c[1]]);
+      }
+    }
+    return out;
+  }
+  function legPath(i) {               // úsek trasy ze zastávky i-1 do i (cache na cestu)
+    var legs = journey.legs || (journey.legs = []);
+    if (legs[i]) return legs[i];
+    var routed = journey.trails && journey.trails[i];
+    if (routed) return (legs[i] = routed);
+    var st = journey.data.stops, A = st[i - 1], B = st[i], a = stopLL(A), b = stopLL(B);
+    var km = haversineKm(a, b), pts;
+    if (km > FLIGHT_KM) {
+      pts = legPoints(a, b);
+    } else {
+      var tol = Math.max(0.15 * km, 0.15), ctrl = [a];
+      var ex = llOf(A.exit), en = llOf(B.entry);
+      if (ex && haversineKm(ex, a) > tol && haversineKm(ex, b) > tol) ctrl.push(ex);
+      if (en && haversineKm(en, a) > tol && haversineKm(en, b) > tol
+          && (ctrl.length === 1 || haversineKm(en, ctrl[ctrl.length - 1]) > tol)) ctrl.push(en);
+      if (ctrl.length === 1 && km > 0.05) ctrl.push(bulgePoint(a, b, LEG_BULGE));
+      ctrl.push(b);
+      pts = catmullRom(ctrl, SPLINE_STEPS);
+    }
+    return (legs[i] = pts);
+  }
+  // (ne window.legPath – deklarace funkce v hlavním skriptu JE window.legPath, přepsání = rekurze)
+  window.getLegPath = function (i) { return journey.data ? legPath(i) : null; };
+
+  // ── Úsek po skutečných cestách (OSM z načtených vektorových dlaždic) ────────
+  // Žádná externí služba: souřadnice fotek neopouštějí počítač (OSRM / GraphHopper by dostaly
+  // celou trasu výletu). Graf se staví z vrstvy „transportation“ (OpenMapTiles) dlaždic, které
+  // MapLibre právě drží – kamera stojí na předchozí zastávce, takže úsek do pár km v nich je.
+  // A* přes body: střed zastávky -> odjezd -> příjezd -> střed další. Pěšky (≤ WALK_KMH mezi
+  // fotkami) stezky a pěšiny levně a dálnice zakázané; autem obráceně. Cokoli nejisté
+  // (fotka daleko od cesty, nesouvislý graf, velká objížďka) = záloha hladká křivka.
+  var TRAIL_SNAP_KM = 0.25;
+  var TRAIL_DETOUR = 3.2, TRAIL_DETOUR_KM = 0.6;
+  var TRAIL_MAX_POINTS = 1500, TRAIL_SIMPLIFY_KM = 0.004;
+  var WALK_KMH = 8;
+  var ROAD_COST = {     // násobek délky; 0 = zakázáno
+    foot: { motorway: 0, trunk: 0, primary: 2.5, secondary: 1.8, tertiary: 1.4, minor: 1.1, service: 1.15,
+            track: 1, path: 1, ferry: 3, raceway: 0, busway: 0, bus_guideway: 0, rail: 0, transit: 0, _other: 1.6 },
+    car: { motorway: 1, trunk: 1, primary: 1.05, secondary: 1.1, tertiary: 1.2, minor: 1.4, service: 1.8,
+           track: 3, path: 0, ferry: 2.5, raceway: 0, busway: 0, bus_guideway: 0, rail: 0, transit: 0, _other: 2 }
+  };
+  function parseWhen(s) {
+    var m = /^(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d)/.exec(String(s || ''));
+    return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : NaN;
+  }
+  function travelMode(A, B, km) {
+    var h = (parseWhen(B.start) - parseWhen(A.end || A.start)) / 3.6e6;
+    return isFinite(h) && h > 0 && km / h > WALK_KMH ? 'car' : 'foot';
+  }
+  function buildRoadGraph(features, bbox, costs) {
+    var nodes = {}, count = 0;
+    function node(c) {
+      var k = Math.round(c[0] * 1e5) + ',' + Math.round(c[1] * 1e5), n = nodes[k];   // ~1 m: švy dlaždic
+      if (!n) { n = nodes[k] = { k: k, c: [c[0], c[1]], e: [] }; count++; }
+      return n;
+    }
+    function inBox(c) { return c[0] >= bbox[0] && c[0] <= bbox[2] && c[1] >= bbox[1] && c[1] <= bbox[3]; }
+    features.forEach(function (f) {
+      var g = f && f.geometry, cls = f && f.properties ? f.properties['class'] : null;
+      var w = costs[cls] !== undefined ? costs[cls] : costs._other;
+      if (!g || !w) return;
+      var lines = g.type === 'LineString' ? [g.coordinates] : g.type === 'MultiLineString' ? g.coordinates : [];
+      lines.forEach(function (line) {
+        for (var i = 1; i < line.length; i++) {
+          var a = line[i - 1], b = line[i];
+          if (!inBox(a) && !inBox(b)) continue;
+          var na = node(a), nb = node(b);
+          if (na === nb) continue;
+          var d = haversineKm(a, b) * w;
+          na.e.push([nb, d]);
+          nb.e.push([na, d]);
+        }
+      });
+    });
+    return { nodes: nodes, count: count };
+  }
+  function nearestNode(graph, c) {
+    var best = null, bd = Infinity;
+    for (var k in graph.nodes) {
+      var d = haversineKm(c, graph.nodes[k].c);
+      if (d < bd) { bd = d; best = graph.nodes[k]; }
+    }
+    return bd <= TRAIL_SNAP_KM ? best : null;
+  }
+  function heapPush(h, item, pri) {
+    h.push([pri, item]);
+    for (var i = h.length - 1; i > 0;) {
+      var p = (i - 1) >> 1;
+      if (h[p][0] <= h[i][0]) break;
+      var t = h[p]; h[p] = h[i]; h[i] = t; i = p;
+    }
+  }
+  function heapPop(h) {
+    var top = h[0], last = h.pop();
+    if (h.length) {
+      h[0] = last;
+      for (var i = 0; ;) {
+        var l = 2 * i + 1, r = l + 1, m = i;
+        if (l < h.length && h[l][0] < h[m][0]) m = l;
+        if (r < h.length && h[r][0] < h[m][0]) m = r;
+        if (m === i) break;
+        var t = h[m]; h[m] = h[i]; h[i] = t; i = m;
+      }
+    }
+    return top[1];
+  }
+  function aStar(from, to) {           // váhy ≥ 1 -> vzdušná vzdálenost je přípustná heuristika
+    if (from === to) return [from.c];
+    var open = [], g = {}, prev = {}, closed = {};
+    g[from.k] = 0;
+    heapPush(open, from, haversineKm(from.c, to.c));
+    while (open.length) {
+      var cur = heapPop(open);
+      if (cur === to) break;
+      if (closed[cur.k]) continue;
+      closed[cur.k] = true;
+      for (var i = 0; i < cur.e.length; i++) {
+        var nb = cur.e[i][0], ng = g[cur.k] + cur.e[i][1];
+        if (g[nb.k] === undefined || ng < g[nb.k]) {
+          g[nb.k] = ng;
+          prev[nb.k] = cur;
+          heapPush(open, nb, ng + haversineKm(nb.c, to.c));
+        }
+      }
+    }
+    if (g[to.k] === undefined) return null;
+    var path = [to.c];
+    for (var n = to; n !== from;) { n = prev[n.k]; if (!n) return null; path.push(n.c); }
+    return path.reverse();
+  }
+  function simplifyLine(pts, tolKm) {  // Douglas–Peucker v místní rovině (km)
+    if (pts.length < 3) return pts;
+    var kx = Math.cos(pts[0][1] * Math.PI / 180) * 111.32, ky = 110.57;
+    var keep = new Uint8Array(pts.length), stack = [[0, pts.length - 1]];
+    keep[0] = keep[pts.length - 1] = 1;
+    while (stack.length) {
+      var s = stack.pop(), a = s[0], b = s[1];
+      var ax = pts[a][0] * kx, ay = pts[a][1] * ky, dx = pts[b][0] * kx - ax, dy = pts[b][1] * ky - ay;
+      var len2 = dx * dx + dy * dy, far = -1, fd = tolKm;
+      for (var i = a + 1; i < b; i++) {
+        var px = pts[i][0] * kx - ax, py = pts[i][1] * ky - ay;
+        var t = len2 > 0 ? Math.max(0, Math.min(1, (px * dx + py * dy) / len2)) : 0;
+        var d = Math.hypot(px - t * dx, py - t * dy);
+        if (d > fd) { fd = d; far = i; }
+      }
+      if (far >= 0) { keep[far] = 1; stack.push([a, far], [far, b]); }
+    }
+    return pts.filter(function (_, i) { return keep[i]; });
+  }
+  function pathKm(pts) {
+    var km = 0;
+    for (var i = 1; i < pts.length; i++) km += haversineKm(pts[i - 1], pts[i]);
+    return km;
+  }
+  function roadFeatures() {
+    if (!map || !styleReady) return [];
+    var style = map.getStyle();
+    var src = style && style.sources ? vectorSourceId(style) : null;
+    if (!src || !map.getSource(src)) return [];
+    try { return map.querySourceFeatures(src, { sourceLayer: 'transportation' }); } catch (e) { return []; }
+  }
+  function trailLeg(i, features) {
+    var st = journey.data.stops, A = st[i - 1], B = st[i];
+    if (!A || !B) return null;
+    var a = stopLL(A), b = stopLL(B), km = haversineKm(a, b);
+    if (km > LOCAL_KM || km < 0.03) return null;
+    var wps = [a];
+    [llOf(A.exit), llOf(B.entry)].forEach(function (p) {
+      if (p && haversineKm(p, wps[wps.length - 1]) > 0.03 && haversineKm(p, b) > 0.03) wps.push(p);
+    });
+    wps.push(b);
+    features = features || roadFeatures();
+    if (!features.length) return null;
+    var pad = Math.max(0.5, 0.3 * km) / 111, lons = wps.map(function (p) { return p[0]; }),
+        lats = wps.map(function (p) { return p[1]; }), kx = Math.cos(a[1] * Math.PI / 180) || 1;
+    var bbox = [Math.min.apply(null, lons) - pad / kx, Math.min.apply(null, lats) - pad,
+                Math.max.apply(null, lons) + pad / kx, Math.max.apply(null, lats) + pad];
+    var graph = buildRoadGraph(features, bbox, ROAD_COST[travelMode(A, B, km)]);
+    if (graph.count < 2) return null;
+    var snapped = wps.map(function (p) { return nearestNode(graph, p); });
+    if (snapped.some(function (n) { return !n; })) return null;
+    var path = [a];
+    for (var j = 1; j < snapped.length; j++) {
+      var seg = aStar(snapped[j - 1], snapped[j]);
+      if (!seg) return null;
+      path = path.concat(seg);
+    }
+    path.push(b);
+    path = path.filter(function (p, k) { return !k || p[0] !== path[k - 1][0] || p[1] !== path[k - 1][1]; });
+    var chord = 0;
+    for (var w = 1; w < wps.length; w++) chord += haversineKm(wps[w - 1], wps[w]);
+    if (pathKm(path) > TRAIL_DETOUR * chord + TRAIL_DETOUR_KM) return null;     // nesmyslná objížďka
+    var tol = TRAIL_SIMPLIFY_KM;
+    path = simplifyLine(path, tol);
+    while (path.length > TRAIL_MAX_POINTS) { tol *= 2; path = simplifyLine(path, tol); }
+    return path.length >= 2 ? path : null;
+  }
+  // Úsek i po cestách, je-li to možné (jinak zůstane křivka). True = trasa vede po cestách.
+  function routeTrail(i, features) {
+    if (!journey.data || i < 1) return false;
+    var trails = journey.trails || (journey.trails = {});
+    if (trails[i]) return true;
+    var pts = trailLeg(i, features);
+    if (!pts) return false;
+    trails[i] = pts;
+    if (journey.legs) journey.legs[i] = null;
+    var all = map && map.getSource('j-all');
+    if (all) all.setData(lineFeature(allRouteCoords()));
+    return true;
+  }
+  // routeTrail je jako deklarace funkce už window.routeTrail (přepsání = nekonečná rekurze)
+  window.trailMode = function (i) {
+    var st = journey.data && journey.data.stops;
+    return st && st[i] && st[i - 1] ? travelMode(st[i - 1], st[i], haversineKm(stopLL(st[i - 1]), stopLL(st[i]))) : null;
+  };
+  function trailZoom(km) {            // krátký úsek blíž (stezka je vidět), delší výš
+    return Math.max(12.6, Math.min(15.4, 15.6 - 1.25 * Math.log2(Math.max(0.3, km) / 0.3)));
+  }
+  function pathAt(pts, f) {           // bod a směr ve zlomku délky křivky
+    var cum = pts.__cum;
+    if (!cum) {
+      cum = [0];
+      for (var i = 1; i < pts.length; i++) cum.push(cum[i - 1] + haversineKm(pts[i - 1], pts[i]));
+      pts.__cum = cum;
+    }
+    var total = cum[cum.length - 1], d = Math.max(0, Math.min(1, f)) * total, j = 1;
+    while (j < cum.length - 1 && cum[j] < d) j++;
+    var seg = cum[j] - cum[j - 1], w = seg > 0 ? (d - cum[j - 1]) / seg : 1;
+    var a = pts[j - 1], b = pts[j] || a;
+    return { ll: [a[0] + (b[0] - a[0]) * w, a[1] + (b[1] - a[1]) * w], bearing: bearingDeg(a, b) };
+  }
+
+  // Úsek trasy po hlavní kružnici (dlouhé lety se na zeměkouli kreslí jako oblouk)
+  function legPoints(a, b) {
+    var km = haversineKm(a, b), n = km > 50 ? Math.min(64, Math.ceil(km / 40)) : 1, pts = [];
+    var r = Math.PI / 180, la1 = a[1] * r, lo1 = a[0] * r, la2 = b[1] * r, lo2 = b[0] * r;
+    var d = km / 6371;
+    for (var i = 0; i <= n; i++) {
+      var f = i / n;
+      if (n === 1 || d < 1e-9) { pts.push([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]); continue; }
+      var A = Math.sin((1 - f) * d) / Math.sin(d), B = Math.sin(f * d) / Math.sin(d);
+      var x = A * Math.cos(la1) * Math.cos(lo1) + B * Math.cos(la2) * Math.cos(lo2);
+      var y = A * Math.cos(la1) * Math.sin(lo1) + B * Math.cos(la2) * Math.sin(lo2);
+      var z = A * Math.sin(la1) + B * Math.sin(la2);
+      pts.push([Math.atan2(y, x) / r, Math.atan2(z, Math.sqrt(x * x + y * y)) / r]);
+    }
+    return pts;
+  }
+  function stopLL(s) { return [s.lon, s.lat]; }
+  function routeCoords(upTo, frac) {       // projetá část trasy: celé úseky do upTo-1 + zlomek dalšího
+    var st = journey.data.stops, out = [stopLL(st[0])];
+    for (var i = 1; i <= upTo && i < st.length; i++) {
+      var pts = legPath(i);
+      if (i === upTo && frac < 1) {
+        var pos = Math.max(0, frac) * (pts.length - 1), k = Math.floor(pos), f = pos - k;
+        var a = pts[k], b = pts[Math.min(k + 1, pts.length - 1)];
+        pts = pts.slice(0, k + 1).concat([[a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]]);
+      }
+      out = out.concat(pts.slice(1));
+    }
+    return out.length > 1 ? out : [out[0], out[0]];
+  }
+  // Čára MapLibre rezervuje 10 vrcholů na bod a jeden segment unese 65 535 -> trasa po cestách
+  // (tisíce bodů) jde po kusech jako MultiLineString, každý kus má vlastní segment
+  var LINE_CHUNK = 2000;
+  function lineFeature(coords) {
+    if (coords.length <= LINE_CHUNK) {
+      return { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } };
+    }
+    var parts = [];
+    for (var i = 0; i < coords.length - 1; i += LINE_CHUNK - 1) parts.push(coords.slice(i, i + LINE_CHUNK));
+    return { type: 'Feature', properties: {}, geometry: { type: 'MultiLineString', coordinates: parts } };
+  }
+  function allRouteCoords() {
+    var st = journey.data.stops, all = [stopLL(st[0])];
+    for (var i = 1; i < st.length; i++) all = all.concat(legPath(i).slice(1));
+    return all;
+  }
+  function stopsFeatures(visited) {
+    return { type: 'FeatureCollection', features: journey.data.stops.map(function (s, i) {
+      return { type: 'Feature', properties: { visited: i <= visited ? 1 : 0, current: i === visited ? 1 : 0 },
+               geometry: { type: 'Point', coordinates: stopLL(s) } };
+    }) };
+  }
+
+  function addRouteLayers() {
+    if (!map || !journey.data || !styleReady || map.getSource('j-all')) return;
+    map.addSource('j-all', { type: 'geojson', data: lineFeature(allRouteCoords()) });
+    map.addSource('j-done', { type: 'geojson', data: lineFeature(routeCoords(Math.max(0, journey.i), 1)) });
+    map.addSource('j-stops', { type: 'geojson', data: stopsFeatures(journey.i) });
+    var a = accent();
+    map.addLayer({ id: 'j-all', type: 'line', source: 'j-all', layout: { 'line-cap': 'round', 'line-join': 'round' },
+                   paint: { 'line-color': a, 'line-opacity': 0.5, 'line-width': 2.4, 'line-dasharray': [1.2, 1.6] } });
+    map.addLayer({ id: 'j-glow', type: 'line', source: 'j-done', layout: { 'line-cap': 'round', 'line-join': 'round' },
+                   paint: { 'line-color': a, 'line-opacity': 0.35, 'line-width': 12, 'line-blur': 8 } });
+    map.addLayer({ id: 'j-done', type: 'line', source: 'j-done', layout: { 'line-cap': 'round', 'line-join': 'round' },
+                   paint: { 'line-color': a, 'line-width': 4 } });
+    map.addLayer({ id: 'j-stops', type: 'circle', source: 'j-stops',
+                   paint: { 'circle-radius': ['case', ['==', ['get', 'current'], 1], 8, 5.5],
+                            'circle-color': ['case', ['==', ['get', 'visited'], 1], '#FFFFFF', 'rgba(255,255,255,0.45)'],
+                            'circle-stroke-color': ['case', ['==', ['get', 'current'], 1], a, 'rgba(0,0,0,0.35)'],
+                            'circle-stroke-width': ['case', ['==', ['get', 'current'], 1], 3, 1.5],
+                            'circle-pitch-alignment': 'map' } });
+  }
+  function removeRouteLayers() {
+    if (!map) return;
+    ['j-stops', 'j-done', 'j-glow', 'j-all'].forEach(function (id) { if (map.getLayer(id)) map.removeLayer(id); });
+    ['j-stops', 'j-done', 'j-all'].forEach(function (id) { if (map.getSource(id)) map.removeSource(id); });
+  }
+  function setRoute(upTo, frac) {
+    if (!map) return;
+    var d = map.getSource('j-done'), s = map.getSource('j-stops');
+    if (d) d.setData(lineFeature(routeCoords(upTo, frac)));
+    if (s && frac >= 1) s.setData(stopsFeatures(upTo));
+  }
+  // Projetá trasa se kreslí souběžně s letem kamery. follow = krátký místní přesun: kamera
+  // jede po křivce trasy v krajině (žádný výskok nad mapu), natáčí se plynule po směru cesty.
+  function animateLeg(i, ms, follow) {
+    cancelAnimationFrame(journey.raf);
+    if (reduceMotion || !ms || i < 1) { setRoute(i, 1); return; }
+    var t0 = performance.now(), pts = follow ? legPath(i) : null, heading = follow ? map.getBearing() : 0;
+    var z0 = follow ? map.getZoom() : 0;
+    journey.tracing = !!follow;
+    (function frame(now) {
+      var t = Math.min(1, (now - t0) / ms), e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      setRoute(i, e);
+      if (follow && map) {
+        var here = pathAt(pts, e), ahead = pathAt(pts, Math.min(1, e + 0.12));
+        var want = bearingDeg(here.ll, ahead.ll), turn = ((want - heading + 540) % 360) - 180;
+        if (Math.hypot(ahead.ll[0] - here.ll[0], ahead.ll[1] - here.ll[1]) > 1e-7) heading += turn * 0.06;
+        var zt = Math.min(1, t / 0.35), zoom = z0 + (follow.zoom - z0) * zt * zt * (3 - 2 * zt);  // bez skoku
+        map.jumpTo({ center: here.ll, bearing: heading, zoom: zoom, pitch: follow.pitch });
+      }
+      if (t < 1) journey.raf = requestAnimationFrame(frame);
+      else { setRoute(i, 1); journey.tracing = false; }
+    })(t0);
+  }
+
+  // ── Přednačtení dlaždic na trase ────────────────────────────────────────────
+  // Během zastávky (polaroidy ~3 s) se stáhnou dlaždice cíle dalšího letu (a středu dlouhého
+  // letu ve výšce) do HTTP cache profilu – MapLibre je pak v cíli načte z disku, bez prázdných
+  // ploch terénu při příletu.
+  var PREFETCH_PARALLEL = 4, PREFETCH_PER_AREA = 40;
+  var prefetchSeen = {}, prefetchQueue = [], prefetchActive = 0, tileSourceIds = [];
+  function lon2tile(lon, z) { return Math.floor((lon + 180) / 360 * Math.pow(2, z)); }
+  function lat2tile(lat, z) {
+    var r = Math.max(-85.05, Math.min(85.05, lat)) * Math.PI / 180;
+    return Math.floor((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * Math.pow(2, z));
+  }
+  function pumpPrefetch() {
+    while (prefetchActive < PREFETCH_PARALLEL && prefetchQueue.length) {
+      var url = prefetchQueue.shift();
+      prefetchActive++;
+      fetch(url).then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+        .catch(function () { /* offline / zablokováno – mapa si dlaždici řekne sama */ })
+        .then(function () { prefetchActive--; pumpPrefetch(); });
+    }
+  }
+  function prefetchArea(ll, zoom, radius) {
+    if (!map || !ll) return 0;
+    var queued = 0;
+    radius = radius === undefined ? 1 : radius;
+    tileSourceIds.forEach(function (id) {
+      var s = map.getSource(id);
+      if (!s || id === 'dem-shade' || !Array.isArray(s.tiles) || !s.tiles.length) return;
+      if (s.type === 'raster-dem' && zoom < TERRAIN_MIN_ZOOM) return;      // terén jen v krajině
+      var ts = s.tileSize || 512, maxz = s.maxzoom === undefined ? 22 : s.maxzoom;
+      var z = Math.max(s.minzoom || 0, Math.min(maxz, Math.round(zoom + Math.log2(512 / ts))));
+      var n = Math.pow(2, z), x = lon2tile(ll[0], z), y = lat2tile(ll[1], z);
+      for (var dx = -radius; dx <= radius; dx++) {
+        for (var dy = -radius; dy <= radius; dy++) {
+          var ty = y + dy, tx = ((x + dx) % n + n) % n;
+          if (ty < 0 || ty >= n || queued >= PREFETCH_PER_AREA) continue;
+          var url = s.tiles[0].replace('{z}', z).replace('{x}', tx).replace('{y}', ty);
+          if (prefetchSeen[url]) continue;
+          prefetchSeen[url] = true;
+          prefetchQueue.push(url);
+          queued++;
+        }
+      }
+    });
+    pumpPrefetch();
+    return queued;
+  }
+  function prefetchStop(i) {
+    if (!journey.active || !journey.data || i < 0 || i >= journey.data.stops.length) return 0;
+    var st = journey.data.stops, n = prefetchArea(stopLL(st[i]), STOP_ZOOM, 2);
+    if (i > 0) {
+      var km = haversineKm(stopLL(st[i - 1]), stopLL(st[i]));
+      if (km > LOCAL_KM) n += prefetchArea(pathAt(legPath(i), 0.5).ll, hopZoom(km), 1);   // vrchol letu
+    }
+    return n;
+  }
+  window.prefetchStop = prefetchStop;
+
+  function later(fn, ms) { journey.timers.push(setTimeout(fn, ms)); }
+  function clearTimers() {
+    journey.timers.forEach(clearTimeout);
+    journey.timers = [];
+    cancelAnimationFrame(journey.raf);
+    journey.tracing = false;
+  }
+
+  function validJourney(d) {
+    return d && Array.isArray(d.stops) && d.stops.length >= 2 && d.stops.every(function (s) {
+      return isFinite(s.lat) && isFinite(s.lon) && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180;
+    });
+  }
+
+  window.playJourney = function (data) {
+    if (!validJourney(data)) return false;
+    if (journey.active) stopJourney(true);
+    toggleList(false);
+    stopSpin(); hideCard();
+    journey = { active: true, data: data, i: -1, paused: false, timers: [], stripped: {}, raf: 0, ended: false,
+                tint: validHex(data.accent) ? data.accent : null };
+    applyAccent(journey.tint || baseAccent);
+    document.body.classList.add('journey');
+    setPinsVisible(false);
+    document.getElementById('jstrip').innerHTML = '';
+    document.getElementById('jpol').innerHTML = '';
+    document.getElementById('jprogress').style.width = '0';
+    setPlayIcon(false);
+    // časová kapsle
+    var cap = document.getElementById('jcap');
+    cap.classList.remove('end');
+    document.getElementById('jago').textContent = yearsAgo(data.start);
+    document.getElementById('jtitle').textContent = data.title || 'Cesta';
+    document.getElementById('jmeta').textContent = [data.location, dateRange([{ date: data.start }, { date: data.end }])]
+      .filter(Boolean).join(' · ') + ' · ' + czStops(data.stops.length) + ' · ' + czCount(data.count || 0);
+    cap.classList.add('show');
+    document.getElementById('jcaption').classList.remove('show');
+    addRouteLayers();
+    // kamera: z výšky nad první zastávkou (zeměkoule), pak dolů
+    var first = data.stops[0];
+    if (map) {
+      map.stop();
+      var start = { center: [first.lon, Math.max(-50, Math.min(55, first.lat))], zoom: Math.min(map.getZoom(), 3.2),
+                    pitch: 0, bearing: 0 };
+      if (reduceMotion || !hasSize()) map.jumpTo(start);
+      else map.flyTo(Object.assign(start, { duration: 2200, curve: 1.4, essential: true }));
+    }
+    later(function () { cap.classList.remove('show'); goStop(0); }, reduceMotion ? 1200 : 2800);
+    return true;
+  };
+
+  var STOP_ZOOM = 13.2;
+  function hopZoom(km) {              // nejvyšší bod letu: dál = výš (200 km ≈ z4.6, 1000 km ≈ zeměkoule)
+    return Math.max(2.4, Math.min(10, 10.5 - 1.45 * Math.log2(Math.max(1, km / 12))));
+  }
+  function flightMs(km) {
+    if (reduceMotion || !map || !hasSize()) return 0;
+    return Math.round(Math.max(2600, Math.min(7000, 2400 + 1300 * Math.log10(1 + km))));
+  }
+  var POP_MS = 700, HOLD_MS = 1700, DROP_MS = 760, ORBIT_MS = 2600;
+
+  function goStop(i) {
+    var st = journey.data.stops;
+    if (i < 0 || i >= st.length) return;
+    clearTimers();
+    journey.i = i;
+    journey.paused = false;
+    if (!journey.ended) document.getElementById('jcap').classList.remove('show');
+    setPlayIcon(false);
+    var s = st[i], prev = i > 0 ? st[i - 1] : null;
+    var km = prev ? haversineKm(stopLL(prev), stopLL(s)) : 0;
+    var ms = i === 0 ? Math.min(flightMs(km), 3600) : flightMs(km);
+    // popisek + obloha podle času fotky
+    var sun = sunPosition(s.lat, s.lon, s.start);
+    var sky = sun ? skyAt(sun.el) : skyAt(40);
+    sky.az = sun ? sun.az : 210;
+    transitionSky(sky, Math.max(1200, ms));
+    document.getElementById('jplace').textContent = s.city || 'Zastávka ' + (i + 1);
+    document.getElementById('jwhen').textContent = [phaseLabel(sun), fmtDate(s.start) + (fmtTime(s.start) ? ' ' + fmtTime(s.start) : ''),
+                                                    czCount(s.count || s.photos.length)].filter(Boolean).join(' · ');
+    document.getElementById('jphase').style.background = sky.glow;
+    document.getElementById('jcaption').classList.add('show');
+    document.getElementById('jprogress').style.width = ((i + 1) / st.length * 100) + '%';
+    var zoom = map ? Math.min(STOP_ZOOM, map.getMaxZoom()) : STOP_ZOOM;
+    var local = !!(prev && ms && map && km <= LOCAL_KM && map.getZoom() >= TERRAIN_MIN_ZOOM);
+    // Krátký úsek: po skutečné stezce / silnici (je-li v načtených dlaždicích), blíž a tempem
+    // podle délky trasy – ne pravítkem přes terén. Dlouhá mezera bez fotek = let s výskokem.
+    if (local && routeTrail(i)) {
+      var routeKm = pathKm(legPath(i));
+      zoom = Math.min(trailZoom(routeKm), map.getMaxZoom());
+      ms = flightMs(routeKm);
+    }
+    animateLeg(i, ms, local ? { zoom: zoom, pitch: FLY_PITCH + 6 } : null);
+    if (map && !local) {
+      var bearing = prev ? bearingDeg(stopLL(prev), stopLL(s)) : map.getBearing();
+      var cam = { center: stopLL(s), zoom: zoom, pitch: FLY_PITCH + 6, bearing: bearing };
+      if (!ms) map.jumpTo(cam);
+      else {
+        // Let: terén až v cíli (přes oddálení by se kreslil se zeměkoulí) a výskok do výšky
+        // úměrné vzdálenosti – nad hory a hranice, ne podél nich
+        holdTerrain();
+        var fly = { duration: ms, curve: km > FLIGHT_KM ? 1.8 : 1.35, essential: true };
+        if (prev) fly.minZoom = hopZoom(km);           // klíč bez hodnoty by MapLibre vzal jako NaN
+        map.flyTo(Object.assign(cam, fly));
+      }
+    }
+    prefetchStop(i);                    // cíl tohoto letu (už je-li v cache, nic se nestahuje)
+    later(function () { arrive(i); }, ms + 120);
+  }
+
+  function arrive(i) {
+    if (!journey.active || journey.i !== i) return;
+    if (map && !reduceMotion && hasSize()) {   // pomalý oblet místa, zatímco se ukazují fotky
+      map.easeTo({ bearing: map.getBearing() + 14, duration: ORBIT_MS + POP_MS + HOLD_MS, easing: function (t) { return t; } });
+    }
+    prefetchStop(i + 1);                // další let: dlaždice se stáhnou, zatímco se ukazují fotky
+    var shown = journey.stripped[i] ? 0 : popPolaroids(i);
+    var wait = shown ? POP_MS + 140 * (shown - 1) + HOLD_MS : 600;
+    later(function () {
+      dropToStrip(i);
+      later(function () { next(); }, shown ? DROP_MS + 90 * shown + 250 : 200);
+    }, wait);
+  }
+
+  function next() {
+    if (!journey.active) return;
+    if (journey.i < journey.data.stops.length - 1) goStop(journey.i + 1);
+    else finishJourney();
+  }
+
+  // Zastávka ukáže JEDEN snímek: nejlepší podle journey.best_shot (oblíbená > série pHash >
+  // ostrost); starší data bez „best“ -> první fotka. Rozbalí se přímo z bodu zastávky na mapě.
+  var HERO_W = 264, HERO_H = 278;
+  function stopShots(s) {
+    var b = s.best || (s.photos || [])[0];
+    return b ? [b] : [];
+  }
+  function popPolaroids(i) {
+    var s = journey.data.stops[i], box = document.getElementById('jpol');
+    var photos = stopShots(s);
+    var w = box.clientWidth || window.innerWidth, h = box.clientHeight || window.innerHeight;
+    var anchor = map && hasSize() ? map.project(stopLL(s)) : { x: w / 2, y: h / 2 };
+    photos.forEach(function (p) {
+      var el = document.createElement('div');
+      el.className = 'polaroid hero';
+      el.dataset.id = p.id;
+      el.innerHTML = '<div class="ph"></div><div class="cap"></div>';
+      setBg(el.firstChild, p.thumb);
+      el.lastChild.textContent = fmtTime(p.date) || fmtDate(p.date);
+      var x = Math.max(16, Math.min(w - HERO_W - 16, anchor.x - HERO_W / 2));
+      var y = Math.max(16, Math.min(h - HERO_H - 150, anchor.y - HERO_H - 30));
+      var base = 'translate(' + x + 'px,' + y + 'px) rotate(-2deg)';
+      el.style.setProperty('--ox', Math.round(anchor.x - x) + 'px');   // roste z bodu zastávky
+      el.style.setProperty('--oy', Math.round(anchor.y - y) + 'px');
+      el.style.transform = base;
+      el.dataset.base = base;
+      el.addEventListener('click', function () { openFromJourney(p.id); });
+      box.appendChild(el);
+      if (!reduceMotion) {
+        el.animate([{ transform: base + ' scale(.06)', opacity: 0 },
+                    { transform: base + ' scale(1.03)', opacity: 1, offset: 0.72 },
+                    { transform: base, opacity: 1 }],
+                   { duration: Math.round(POP_MS * 1.15), easing: 'cubic-bezier(.2,.9,.25,1)', fill: 'backwards' });
+      }
+    });
+    return photos.length;
+  }
+
+  // Polaroidy „padají“ do filmového pásu: každý letí na své políčko (FLIP)
+  function dropToStrip(i) {
+    var s = journey.data.stops[i], strip = document.getElementById('jstrip');
+    if (journey.stripped[i]) return;
+    journey.stripped[i] = true;
+    var pols = Array.prototype.slice.call(document.querySelectorAll('#jpol .polaroid'));
+    if (strip.children.length) {
+      var d = document.createElement('div');
+      d.className = 'divider';
+      d.title = s.city || '';
+      strip.appendChild(d);
+    }
+    var photos = stopShots(s);
+    var frames = photos.map(function (p) {
+      var f = document.createElement('div');
+      f.className = 'frame';
+      f.setAttribute('role', 'listitem');
+      f.title = [s.city, fmtDate(p.date), fmtTime(p.date)].filter(Boolean).join(' · ');
+      f.dataset.id = p.id;
+      setBg(f, p.thumb);
+      f.addEventListener('click', function () { openFromJourney(p.id); });
+      strip.appendChild(f);
+      return f;
+    });
+    strip.scrollLeft = strip.scrollWidth;
+    var host = document.getElementById('jpol').getBoundingClientRect();
+    frames.forEach(function (f, k) {
+      var el = pols[k];
+      if (!el || reduceMotion) { f.classList.add('in'); if (el) el.remove(); return; }
+      var r = f.getBoundingClientRect(), pr = el.getBoundingClientRect();
+      var sc = r.width / pr.width;
+      var tx = r.left - host.left + r.width / 2 - el.offsetWidth / 2, ty = r.top - host.top + r.height / 2 - el.offsetHeight / 2;
+      var a = el.animate([{ transform: el.dataset.base, opacity: 1 },
+                          { transform: 'translate(' + tx + 'px,' + ty + 'px) rotate(0deg) scale(' + sc + ')', opacity: 0.9 }],
+                         { duration: DROP_MS, delay: k * 90, easing: 'cubic-bezier(.55,0,.25,1)', fill: 'forwards' });
+      a.onfinish = function () { f.classList.add('in'); el.remove(); };
+    });
+    pols.slice(frames.length).forEach(function (el) { el.remove(); });
+  }
+
+  function flushPolaroids() {      // přeskočení: fotky zastávky (i ještě neukázané) rovnou do pásu
+    if (journey.i >= 0 && !journey.stripped[journey.i]) {
+      var keep = reduceMotion;
+      reduceMotion = true;
+      dropToStrip(journey.i);
+      reduceMotion = keep;
+    }
+    document.getElementById('jpol').innerHTML = '';
+  }
+
+  function finishJourney() {
+    clearTimers();
+    journey.ended = true;
+    var st = journey.data.stops;
+    setRoute(st.length - 1, 1);
+    document.getElementById('jcaption').classList.remove('show');
+    transitionSky(Object.assign(skyAt(40), { az: 210 }), 2000);
+    if (map) {
+      var lons = st.map(function (s) { return s.lon; }), lats = st.map(function (s) { return s.lat; });
+      var cam = map.cameraForBounds([[Math.min.apply(null, lons), Math.min.apply(null, lats)],
+                                     [Math.max.apply(null, lons), Math.max.apply(null, lats)]],
+                                    { padding: { top: 120, bottom: 200, left: 80, right: 80 }, maxZoom: 12 });
+      var end = { center: cam ? cam.center : stopLL(st[0]), zoom: cam ? cam.zoom : 6, pitch: 0, bearing: 0 };
+      if (reduceMotion || !hasSize()) map.jumpTo(end);
+      else map.flyTo(Object.assign(end, { duration: 3200, curve: 1.5, essential: true }));
+    }
+    var cap = document.getElementById('jcap');
+    document.getElementById('jago').textContent = 'Konec cesty';
+    cap.classList.add('end');
+    later(function () { cap.classList.add('show'); document.getElementById('jdone').focus(); }, reduceMotion ? 0 : 1800);
+    setPlayIcon(true);
+  }
+
+  function stopJourney(silent) {
+    if (!journey.active) return false;
+    clearTimers();
+    if (map) map.stop();
+    removeRouteLayers();
+    journey.active = false;
+    if (journey.tint) { journey.tint = null; applyAccent(baseAccent); }
+    document.body.classList.remove('journey');
+    setPinsVisible(true);
+    document.getElementById('jcap').classList.remove('show', 'end');
+    document.getElementById('jcaption').classList.remove('show');
+    document.getElementById('jpol').innerHTML = '';
+    transitionSky(Object.assign(skyAt(40), { az: 210 }), silent ? 0 : 1500);
+    if (!silent) {
+      window.pullBack();
+      // Fix 1C: uživatel Cestu opustil -> aplikace ho vrátí tam, odkud ji spustil (detail události)
+      if (bridge && bridge.journeyClosed) bridge.journeyClosed();
+    }
+    return true;
+  }
+  // silent = konec vyžádaný aplikací (návrat Zpět): bez oddálení a bez hlášení zpět
+  window.endJourney = function (silent) { return stopJourney(!!silent); };
+
+  function togglePause() {
+    if (!journey.active) return;
+    if (journey.ended) { replay(); return; }
+    if (!journey.paused) {
+      clearTimers();
+      if (map) map.stop();
+      journey.paused = true;
+      setPlayIcon(true);
+    } else {
+      goStop(journey.i);                       // znovu k aktuální zastávce, fotky už v pásu nevyskočí
+    }
+  }
+  function skip(delta) {
+    if (!journey.active) return;
+    var i = journey.ended ? journey.data.stops.length - 1 : journey.i;
+    var target = Math.max(0, Math.min(journey.data.stops.length - 1, i + delta));
+    flushPolaroids();
+    if (journey.ended) { journey.ended = false; document.getElementById('jcap').classList.remove('show', 'end'); }
+    goStop(target);
+  }
+  function replay() {
+    var d = journey.data;
+    stopJourney(true);
+    window.playJourney(d);
+  }
+  function openFromJourney(id) {
+    if (journey.active && !journey.paused && !journey.ended) togglePause();
+    if (bridge) bridge.openPhotoFromMap(id);
+  }
+  function setPlayIcon(paused) {
+    document.getElementById('jplayicon').setAttribute('d', paused ? 'M4 2.4v11.2L13.2 8z' : 'M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z');
+    document.getElementById('jplay').setAttribute('aria-label', paused ? 'Přehrát' : 'Pozastavit');
+  }
+  document.getElementById('jplay').addEventListener('click', togglePause);
+  document.getElementById('jprev').addEventListener('click', function () { skip(-1); });
+  document.getElementById('jnext').addEventListener('click', function () { skip(1); });
+  document.getElementById('jclose').addEventListener('click', function () { stopJourney(false); });
+  document.getElementById('jdone').addEventListener('click', function () { stopJourney(false); });
+  document.getElementById('jreplay').addEventListener('click', replay);
+
+  window.journeyState = function () {
+    return { active: journey.active, index: journey.i, paused: journey.paused, ended: journey.ended,
+             stops: journey.data ? journey.data.stops.length : 0,
+             frames: document.querySelectorAll('#jstrip .frame').length,
+             polaroids: document.querySelectorAll('#jpol .polaroid').length,
+             place: document.getElementById('jplace').textContent,
+             route: !!(map && map.getLayer('j-done')), sky: skyNow.sky || null };
+  };
+  window.journeyPause = togglePause;
+  window.journeySkip = skip;
+
+  document.addEventListener('keydown', function (e) {
+    if (journey.active) {
+      if (e.key === ' ') { e.preventDefault(); togglePause(); }
+      else if (e.key === 'ArrowRight') skip(1);
+      else if (e.key === 'ArrowLeft') skip(-1);
+      else if (e.key === 'Escape') stopJourney(false);
+      return;
+    }
+    if (e.key === 'Escape') {
+      if (document.getElementById('jlist').classList.contains('open')) toggleList(false);
+      else window.pullBack();
+    }
+  });
+
+  // ── Velikost stránky ────────────────────────────────────────────────────────
+  function onResize() {
+    if (!map) { createMap(); return; }      // záložka se poprvé zobrazila
+    map.resize();
+    initialView(); render();
+  }
+  if (window.ResizeObserver) new ResizeObserver(onResize).observe(mapEl);
+  window.addEventListener('resize', onResize);
+  setBaseLayer('standard');
+  createMap();
+  // Pravé tlačítko: žádné menu prohlížeče (v aplikaci ho vypíná i NoContextMenu)
+  document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+</script>
+</body>
+</html>

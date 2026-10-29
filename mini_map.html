@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<title>Kairos – Minimapa</title>
+<!-- Minimapa v panelu Info prohlížeče: stejný přibalený MapLibre GL JS 5 jako map_vault.html.
+     Stránka se načte jednou, další fotky jen posunou pin (window.showPlace) – žádné nové WebGL.
+     Podklad: tmavý vektorový styl OpenFreeMap s českými názvy, bez stylu rastrová záloha (Esri).
+     Vše ostatní blokuje WebUrlInterceptor v main.py (ALLOWED_WEB_HOSTS). -->
+<link rel="stylesheet" href="vendor/maplibre/maplibre-gl.css">
+<script src="vendor/maplibre/maplibre-gl.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #141416;
+               font-family: 'Segoe UI Variable Text', 'Segoe UI', -apple-system, sans-serif; }
+  #map { position: absolute; inset: 0; background: #141416; }
+  #nogl { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+          color: #8E8E93; font-size: 12px; }
+  .pin { width: 24px; height: 29px; }      /* hrot otočené kapky = střed dolní hrany (anchor bottom) */
+  .pin::before { content: ''; position: absolute; left: 0; top: 0; width: 20px; height: 20px;
+                 border-radius: 50% 50% 50% 0; background: #FF3B30; border: 2px solid #FFFFFF;
+                 transform: rotate(-45deg); box-shadow: -2px 3px 8px rgba(0,0,0,0.7); }
+  .pin::after { content: ''; position: absolute; left: 8px; top: 8px; width: 8px; height: 8px;
+                border-radius: 50%; background: #FFFFFF; }
+  .maplibregl-ctrl-attrib { background: rgba(28,28,30,0.75) !important; color: #8E8E93 !important; font-size: 9px; }
+  .maplibregl-ctrl-attrib a { color: #AEAEB2 !important; }
+  .maplibregl-ctrl-attrib-button { filter: contrast(0) brightness(2); }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="nogl">Mapa není k dispozici</div>
+<script>
+(function () {
+  'use strict';
+  var OFM = 'https://tiles.openfreemap.org/';
+  var STYLE_URL = OFM + 'styles/dark';
+  var STYLE_CACHE_KEY = 'omni.vectorStyle.dark';
+  var ESRI_DARK = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}';
+  var ZOOM = 15;
+  var NEAR_DEG = 0.5;                  // sousední fotka blízko = krátký posun místo skoku
+
+  var mapEl = document.getElementById('map');
+  var map = null, marker = null, place = null, engine = 'none', errors = [];
+
+  // Raster bez stylu (offline / styl se ještě nestáhl)
+  var RASTER_STYLE = {
+    version: 8,
+    sources: { esri: { type: 'raster', tileSize: 256, maxzoom: 16, tiles: [ESRI_DARK],
+                       attribution: 'Tiles &copy; Esri &mdash; Esri, HERE, Garmin, &copy; OpenStreetMap' } },
+    layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#141416' } },
+             { id: 'esri', type: 'raster', source: 'esri' }]
+  };
+
+  // České názvy jako v hlavní mapě: name:cs, jinak latinka, jinak místní název
+  var CS_NAME = ['coalesce', ['get', 'name:cs'], ['get', 'name:latin'], ['get', 'name']];
+  function localize(style) {
+    var s = JSON.parse(JSON.stringify(style));
+    s.layers.forEach(function (l) {
+      var tf = l.layout && l.layout['text-field'];
+      var js = JSON.stringify(tf || '');
+      if (tf && js.indexOf('name') >= 0 && js.indexOf('"ref"') < 0) l.layout['text-field'] = CS_NAME;
+    });
+    return s;
+  }
+  function validStyle(s) { return !!(s && Array.isArray(s.layers) && s.sources); }
+
+  function cachedStyle() {
+    try {
+      var s = JSON.parse(localStorage.getItem(STYLE_CACHE_KEY) || 'null');
+      return validStyle(s) ? s : null;
+    } catch (e) { return null; }
+  }
+  var vectorStyle = cachedStyle();
+
+  function useVector(style) {
+    if (!validStyle(style)) return false;
+    vectorStyle = style;
+    if (map) { map.setStyle(localize(style), { diff: false }); engine = 'vector'; }
+    return true;
+  }
+  window.setMiniStyle = useVector;     // testy bez sítě
+
+  function fetchStyle() {               // čerstvý styl na pozadí; přestavět jen při změně
+    fetch(STYLE_URL).then(function (r) { return r.ok ? r.json() : null; }).then(function (s) {
+      if (!validStyle(s)) return;
+      var changed = JSON.stringify(s) !== JSON.stringify(vectorStyle);
+      try { localStorage.setItem(STYLE_CACHE_KEY, JSON.stringify(s)); } catch (e) { /* plná */ }
+      if (changed || engine !== 'vector') useVector(s);
+    }).catch(function () { /* offline: zůstává uložený styl nebo rastr */ });
+  }
+
+  function glSupported() {
+    try { return !!(window.maplibregl && document.createElement('canvas').getContext('webgl2')); }
+    catch (e) { return false; }
+  }
+
+  function pinElement() {
+    var el = document.createElement('div');
+    el.className = 'pin';
+    return el;
+  }
+
+  function createMap() {
+    if (map || !place || mapEl.clientWidth === 0 || mapEl.clientHeight === 0) return;
+    if (!glSupported()) { document.getElementById('nogl').style.display = 'flex'; return; }
+    try {
+      map = new maplibregl.Map({
+        container: mapEl, center: place, zoom: ZOOM, maxZoom: 19,
+        style: vectorStyle ? localize(vectorStyle) : RASTER_STYLE,
+        attributionControl: { compact: true }, dragRotate: false, pitchWithRotate: false,
+        fadeDuration: 0
+      });
+    } catch (e) {
+      map = null;
+      document.getElementById('nogl').style.display = 'flex';
+      return;
+    }
+    engine = vectorStyle ? 'vector' : 'raster';
+    map.touchZoomRotate.disableRotation();
+    map.on('error', function (e) { errors.push(String((e && e.error && e.error.message) || e)); });
+    map.on('styleimagemissing', function (e) {      // ikona, kterou sprite nemá: průhledný 1×1 px
+      if (!map.hasImage(e.id)) map.addImage(e.id, { width: 1, height: 1, data: new Uint8Array(4) });
+    });
+    marker = new maplibregl.Marker({ element: pinElement(), anchor: 'bottom' })
+      .setLngLat(place).addTo(map);
+    window.map = map;
+    setTimeout(fetchStyle, vectorStyle ? 3000 : 0);  // s uloženým stylem až po prvním vykreslení
+  }
+
+  // Volá viewer.py při každé fotce s polohou
+  window.showPlace = function (lat, lon) {
+    lat = Number(lat); lon = Number(lon);
+    if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return false;
+    var prev = place;
+    place = [lon, lat];
+    if (!map) { createMap(); return true; }
+    marker.setLngLat(place);
+    var near = prev && Math.abs(prev[0] - lon) < NEAR_DEG && Math.abs(prev[1] - lat) < NEAR_DEG;
+    if (near && document.visibilityState === 'visible') map.easeTo({ center: place, zoom: ZOOM, duration: 350 });
+    else map.jumpTo({ center: place, zoom: ZOOM });
+    return true;
+  };
+
+  window.miniState = function () {
+    var c = map ? map.getCenter() : null, m = marker ? marker.getLngLat() : null;
+    return { ready: !!map, engine: engine, center: c ? [c.lng, c.lat] : null,
+             pin: m ? [m.lng, m.lat] : null, errors: errors.slice(-5) };
+  };
+
+  function onResize() { if (!map) createMap(); else map.resize(); }
+  if (window.ResizeObserver) new ResizeObserver(onResize).observe(mapEl);
+  window.addEventListener('resize', onResize);
+  document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+})();
+</script>
+</body>
+</html>

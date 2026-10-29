@@ -1,0 +1,26 @@
+# Uživatelská data a stav aplikace
+photos.db
+photos.db-*
+omniphotos.db
+omniphotos.db-*
+config.json
+config.json.*
+paths.txt
+Fotky/
+
+# Mezipaměti, build, nástroje
+.cache/
+build/
+dist/
+__pycache__/
+.pytest_cache/
+.cursor/
+
+# Přibalené binárky a modely (stahují se / kopírují zvlášť, viz app.spec)
+*.exe
+exiftool_files/
+models/
+*.onnx
+
+# Diagnostika výkonu (frametime logy)
+perf_logs/
