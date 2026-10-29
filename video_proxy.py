@@ -1,0 +1,231 @@
+"""1080p SDR proxy videí 4K / HDR (Fáze 1, adaptivní video engine).
+
+Originál 4K HEVC Main 10 (HDR, Dolby Vision, 60 fps) se přehrává přímo hardwarově. Vše
+ostatní – tažení časové osy (náhledový pás), náhledy v mřížce, Cesta a přehrávání na slabších
+PC (perf_profile.proxy_playback) – pracuje s proxy: H.264 8 bit, delší strana ≤ 1920 px,
+≤ 30 fps, HDR převedené na SDR (zscale + tonemap hable), zvuk AAC.
+
+Proxy vytváří démon na pozadí, nikdy během přehrávání: ffmpeg je zaregistrovaný ve strážci
+interakce (governor) a během přehrávání / gest je pozastavený. Změřeno (Ryzen AI 7 350,
+libx264 veryfast): 9,3 s 4K60 HDR Dolby Vision za 12,6 s.
+
+Soubory: PROXY_DIR/<otisk cesty>.mp4 (platný, je-li novější než originál), pro videa, která
+proxy nepotřebují, prázdná značka <otisk>.none (aby se při každém startu znovu nesondovalo).
+Rozpočet na disku: config „proxy_cache_mb“ (LRU podle posledního použití).
+"""
+import hashlib
+import os
+import re
+import subprocess
+import threading
+import time
+
+import paths
+
+PROXY_EDGE = 1920
+PROXY_FPS = 30
+PROXY_CRF = 26
+PROXY_MAXRATE = "6M"
+DEFAULT_BUDGET_MB = 4096
+_STREAM = re.compile(r"Stream #\d+:\d+[^:]*: Video: (?P<codec>\w+)(?P<rest>[^\n]*)")
+_RES = re.compile(r"(\d{3,5})x(\d{3,5})")
+_FPS = re.compile(r"([\d.]+) fps")
+_lock = threading.Lock()
+
+
+def _key(source):
+    return hashlib.sha1(os.path.normcase(os.path.abspath(source)).encode("utf-8")).hexdigest()[:20]
+
+
+def proxy_path(source):
+    return os.path.join(paths.PROXY_DIR, _key(source) + ".mp4")
+
+
+def _marker_path(source):
+    return os.path.join(paths.PROXY_DIR, _key(source) + ".none")
+
+
+def _fresh(path, source):
+    try:
+        return os.path.getsize(path) >= 0 and os.path.getmtime(path) >= os.path.getmtime(source)
+    except OSError:
+        return False
+
+
+def get_proxy(source):
+    """Cesta k platné proxy, nebo None (žádná / zastaralá / video ji nepotřebuje)."""
+    if not source:
+        return None
+    p = proxy_path(source)
+    if _fresh(p, source) and os.path.getsize(p) > 0:
+        return p
+    return None
+
+
+def is_settled(source):
+    """Proxy je hotová, nebo je známo, že ji video nepotřebuje."""
+    return get_proxy(source) is not None or _fresh(_marker_path(source), source)
+
+
+# ── sondování ──
+
+def probe(source, ffmpeg_path=None):
+    """{'width','height','fps','ten_bit','hdr'} z hlavičky (ffmpeg -i), nebo None."""
+    ffmpeg_path = ffmpeg_path or paths.FFMPEG_PATH
+    try:
+        out = subprocess.run([ffmpeg_path, "-hide_banner", "-i", source], capture_output=True,
+                             timeout=30, creationflags=_no_window()).stderr
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = out.decode("utf-8", "replace")
+    m = _STREAM.search(text)
+    if not m:
+        return None
+    rest = m.group("rest")
+    res = _RES.search(rest)
+    fps = _FPS.search(rest)
+    w, h = (int(res.group(1)), int(res.group(2))) if res else (0, 0)
+    return {"width": w, "height": h, "fps": float(fps.group(1)) if fps else 0.0,
+            "ten_bit": bool(re.search(r"p010|10le|10be|Main 10", rest)),
+            "hdr": bool(re.search(r"bt2020|arib-std-b67|smpte2084", rest)) or "DOVI" in text}
+
+
+def needs_proxy(info):
+    """Proxy má smysl pro > 1080p, 10 bit nebo HDR (náročné dekódování / převod barev)."""
+    if not info:
+        return False
+    return max(info["width"], info["height"]) > PROXY_EDGE or info["ten_bit"] or info["hdr"]
+
+
+# ── stavba ──
+
+def ffmpeg_cmd(source, target, info, threads=2, ffmpeg_path=None):
+    edge = PROXY_EDGE
+    vf = [f"scale=w='if(gt(iw,ih),min({edge},iw),-2)':h='if(gt(iw,ih),-2,min({edge},ih))':flags=bilinear"]
+    if info and info.get("fps", 0) > PROXY_FPS + 1:
+        vf.append(f"fps={PROXY_FPS}")
+    if info and info.get("hdr"):
+        # nejdřív zmenšit (čtvrtina pixelů), pak HDR -> SDR: lineární světlo, BT.709, tonemap hable
+        vf.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+                  "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
+    vf.append("format=yuv420p")
+    return [ffmpeg_path or paths.FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-threads", str(threads), "-hwaccel", "d3d11va", "-i", source,
+            "-map", "0:v:0", "-map", "0:a:0?", "-vf", ",".join(vf),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", str(PROXY_CRF),
+            "-maxrate", PROXY_MAXRATE, "-bufsize", "12M", "-threads", str(threads),
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", target]
+
+
+def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=None):
+    """Vytvoří proxy (nebo značku „nepotřebuje“). Vrací cestu k proxy, None, nebo False,
+    když bylo zrušeno. Blokuje – volá se z vlákna na pozadí."""
+    if not source or not os.path.exists(source):
+        return None
+    if is_settled(source):
+        return get_proxy(source)
+    os.makedirs(paths.PROXY_DIR, exist_ok=True)
+    info = probe(source, ffmpeg_path)
+    if not needs_proxy(info):
+        _touch(_marker_path(source))
+        return None
+    target = proxy_path(source)
+    tmp = f"{target}.{threading.get_ident()}.tmp.mp4"
+    cmd = ffmpeg_cmd(source, tmp, info, threads=threads, ffmpeg_path=ffmpeg_path)
+    flags = _no_window() | (0x00004000 if os.name == "nt" else 0)   # BELOW_NORMAL_PRIORITY_CLASS
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=flags)
+    except OSError:
+        return None
+    if governor is not None:
+        governor.register_process(proc.pid)
+    cancelled = False
+    try:
+        while proc.poll() is None:
+            if should_stop is not None and should_stop():
+                cancelled = True
+                proc.kill()
+                break
+            time.sleep(0.2)
+        proc.wait()
+    finally:
+        if governor is not None:
+            governor.unregister_process(proc.pid)
+    if cancelled or proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+        _remove(tmp)
+        if not cancelled:
+            err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip().splitlines()[-1:] if proc.stderr else []
+            print(f"[Proxy] {os.path.basename(source)}: ffmpeg {proc.returncode} {' '.join(err)}")
+            _touch(_marker_path(source))      # nepřevoditelné: nezkoušet při každém startu
+        return False if cancelled else None
+    os.replace(tmp, target)
+    return target
+
+
+def cache_size():
+    try:
+        return sum(e.stat().st_size for e in os.scandir(paths.PROXY_DIR) if e.is_file())
+    except OSError:
+        return 0
+
+
+def enforce_budget(budget_mb=DEFAULT_BUDGET_MB, keep=()):
+    """Smaže nejdéle nepoužité proxy nad rozpočet (keep = cesty, které se mazat nesmí)."""
+    budget = int(float(budget_mb) * 1024 * 1024)
+    keep = {os.path.normcase(p) for p in keep}
+    with _lock:
+        try:
+            entries = [(e.stat().st_mtime, e.stat().st_size, e.path) for e in os.scandir(paths.PROXY_DIR)
+                       if e.is_file() and e.name.endswith(".mp4")]
+        except OSError:
+            return 0
+        total, freed = sum(s for _, s, _ in entries), 0
+        for _, size, path in sorted(entries):
+            if total <= budget:
+                break
+            if os.path.normcase(path) in keep:
+                continue
+            if _remove(path):
+                total -= size
+                freed += size
+        return freed
+
+
+def clear_cache():
+    freed = cache_size()
+    with _lock:
+        try:
+            for e in os.scandir(paths.PROXY_DIR):
+                if e.is_file():
+                    _remove(e.path)
+        except OSError:
+            return 0
+    return freed - cache_size()
+
+
+def touch(path):
+    """LRU: proxy právě použitá (přehrávání / pás) se maže poslední."""
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+
+
+def _touch(path):
+    try:
+        with open(path, "wb"):
+            pass
+    except OSError:
+        pass
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def _no_window():
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0

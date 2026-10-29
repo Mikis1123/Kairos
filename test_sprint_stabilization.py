@@ -54,28 +54,31 @@ class TestSearchRelevance(unittest.TestCase):
     def noise(self, n=400):
         return self.rng.normal(0.20, 0.012, n).astype(np.float32)        # typickĂ© CLIP pĂˇsmo bez shody
 
-    def test_unrelated_library_returns_nothing(self):
-        """â€žpesâ€ś v knihovnÄ› bez psĹŻ: dĹ™Ă­v ~90 % knihovny (0,18 a 75 % nejlepĹˇĂ­), teÄŹ nic."""
-        self.assertEqual(ai_engine.select_relevant(self.noise()), [])
+    @staticmethod
+    def tiers(s):
+        """Pásma pro knihovnu bez banky pojmů: z = z-skóre v knihovně (jako rank_semantic)."""
+        s = np.asarray(s, dtype=np.float32)
+        z = (s - s.mean()) / s.std()
+        return ai_engine.tier_scores(z, z, z, s.size)
 
-    def test_only_true_matches_pass(self):
+    def test_unrelated_library_has_no_confident_match(self):
+        """„pes“ v knihovně bez psů: šum smí nanejvýš do „možných“, nikdy mezi jisté."""
+        confident, possible = self.tiers(self.noise())
+        self.assertEqual(confident, [])
+        self.assertLessEqual(len(possible), ai_engine.SEARCH_POSSIBLE_MAX)
+
+    def test_true_matches_are_confident_and_ranked(self):
         s = self.noise()
         s[[3, 50, 77]] = [0.29, 0.285, 0.27]
-        self.assertEqual(ai_engine.select_relevant(s), [3, 50, 77])
+        confident, _ = self.tiers(s)
+        self.assertEqual(confident, [3, 50, 77])
 
-    def test_weak_but_outstanding_matches_use_fallback(self):
+    def test_weak_but_outstanding_matches_are_not_lost(self):
+        """Mírně vyčnívající shody (dřív pod hranou = nic) jsou aspoň mezi možnými."""
         s = self.noise()
-        s[[10, 11]] = [0.232, 0.229]                                        # pod pĹ™Ă­snĂ˝m minimem, ale vyÄŤnĂ­vajĂ­
-        self.assertEqual(ai_engine.select_relevant(s), [10, 11])
-
-    def test_band_from_top_limits_long_tail(self):
-        s = self.noise()
-        s[:5] = [0.33, 0.32, 0.31, 0.25, 0.245]
-        self.assertEqual(ai_engine.select_relevant(s), [0, 1, 2], "jen pĂˇsmo kolem nejlepĹˇĂ­ shody")
-
-    def test_small_library_uses_absolute_threshold(self):
-        self.assertEqual(ai_engine.select_relevant([0.21, 0.20, 0.22]), [])
-        self.assertEqual(ai_engine.select_relevant([0.30, 0.20, 0.29]), [0, 2])
+        s[[10, 11]] = [0.232, 0.229]
+        confident, possible = self.tiers(s)
+        self.assertTrue({10, 11} <= set(confident + possible))
 
     def test_search_by_text_applies_cutoff_over_whole_library(self):
         dim = ai_engine.EMBED_DIM

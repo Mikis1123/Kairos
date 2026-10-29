@@ -27,6 +27,10 @@ THUMB_DIR = os.path.join(CACHE_ROOT, "thumbnails")
 # a plakáty videí; omezeno velikostí (LRU), znovu se vytvoří z originálů.
 PREVIEW_DIR = os.path.join(CACHE_ROOT, "previews")
 
+# ZAHODITELNÉ: 1080p SDR proxy videí 4K / HDR (tažení časové osy, náhledy, Cesta, přehrávání
+# na slabších PC); vlastní rozpočet (config „proxy_cache_mb“), znovu se vytvoří z originálů.
+PROXY_DIR = os.path.join(CACHE_ROOT, "proxies")
+
 # ZAHODITELNÉ: HTTP cache mapy (vektorové dlaždice, styl, písma) – trvalý profil QtWebEngine.
 WEB_CACHE_DIR = os.path.join(CACHE_ROOT, "web")
 

@@ -241,14 +241,25 @@ class TestSearchRobustness(unittest.TestCase):
         """Nový slovník se stejným počtem embeddingů (jiné fotky) nesmí použít starou matici."""
         import numpy as np
         import ai_engine
-        vec = np.ones(ai_engine.EMBED_DIM, dtype=np.float32)
+        rng = np.random.default_rng(3)
+        q = rng.normal(size=ai_engine.EMBED_DIM).astype(np.float32)
+        q /= np.linalg.norm(q)
+
+        def library(hit_id):
+            emb = {}
+            for i in range(1, 41):
+                v = rng.normal(size=ai_engine.EMBED_DIM).astype(np.float32)
+                v -= v.dot(q) * q
+                v /= np.linalg.norm(v)
+                emb[i] = ai_engine.encode_embedding(0.6 * q + 0.8 * v if i == hit_id else v)
+            return emb
         model = mock.Mock()
-        model.encode.return_value = vec
+        model.encode.return_value = q
         with mock.patch.object(ai_engine, "get_text_model", return_value=model):
-            first = ai_engine.search_by_text("pes", {1: ai_engine.encode_embedding(vec)})
-            second = ai_engine.search_by_text("pes", {2: ai_engine.encode_embedding(vec)})
-        self.assertEqual([m for m, _ in first], [1])
-        self.assertEqual([m for m, _ in second], [2])
+            first = ai_engine.search_by_text("pes", library(7))
+            second = ai_engine.search_by_text("pes", library(9))
+        self.assertEqual(first[0][0], 7)
+        self.assertEqual(second[0][0], 9)
 
     def test_mismatched_or_nan_query_vector(self):
         import numpy as np

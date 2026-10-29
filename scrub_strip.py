@@ -16,6 +16,11 @@ než video.
 
 Formát souboru: b"OPVS" + verze (1 B) + délka hlavičky (uint32 LE) + JSON hlavička
 {"duration_ms", "dense", "frames": [[ms, offset, length], ...]} + JPEG data za sebou.
+
+Fáze 1 (adaptivní video): pás se dekóduje z 1080p proxy, existuje-li (video_proxy) – 4K HDR
+originál nikdo podruhé nedekóduje. Odložený pás (governed) čeká na klid a jeho ffmpeg je
+během přehrávání pozastavený (governor); tažení časové osy ho okamžitě povýší na prioritní.
+Pásy hotových videí připravuje démon předem, takže při prvním tažení už leží na disku.
 """
 import bisect
 import json
@@ -30,8 +35,10 @@ from collections import OrderedDict
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 
+import governor
 import paths
 import preview_cache
+import video_proxy
 
 STRIP_EDGE = 480
 STRIP_QUALITY = 6                # ffmpeg -q:v (2 = nejlepší … 31); 6 ≈ 10–40 kB na snímek
@@ -176,12 +183,12 @@ class ScrubStrip:
         return strip
 
 
-def _ffmpeg_cmd(source, keyframes_only, hw):
+def _ffmpeg_cmd(source, keyframes_only, hw, threads=2):
     edge = STRIP_EDGE
     # delší strana nejvýš STRIP_EDGE, menší videa se nezvětšují
     scale = f"scale='if(gt(iw,ih),min({edge},iw),-2)':'if(gt(iw,ih),-2,min({edge},ih))':flags=fast_bilinear"
     vf = (scale if keyframes_only else f"fps={DENSE_FPS},{scale}") + ",format=yuvj420p,showinfo"
-    cmd = [paths.FFMPEG_PATH, "-hide_banner", "-nostats", "-loglevel", "info", "-threads", "2"]
+    cmd = [paths.FFMPEG_PATH, "-hide_banner", "-nostats", "-loglevel", "info", "-threads", str(threads)]
     if hw:
         cmd += ["-hwaccel", "d3d11va"]
     if keyframes_only:
@@ -198,11 +205,15 @@ class StripBuilder(QThread):
     progress = pyqtSignal(str, int)          # zdroj, počet snímků
     finished_strip = pyqtSignal(str, bool)   # zdroj, úspěch
 
-    def __init__(self, strip, parent=None):
+    def __init__(self, strip, parent=None, governed=False, dense=True, threads=2):
         super().__init__(parent)
         self.strip = strip
         self._proc = None
         self._cancel = False
+        self.governed = governed          # odložený: čeká na klid, při přehrávání pozastavený
+        self.dense = dense                # hustý průchod (výkonnostní profil)
+        self.threads = threads
+        self.should_stop = None           # démon: zrušit při ukončení aplikace
 
     def cancel(self):
         self._cancel = True
@@ -213,11 +224,22 @@ class StripBuilder(QThread):
             except OSError:
                 pass
 
+    def prioritize(self):
+        """Uživatel táhne časovou osu: přestat čekat na klid a pozastavený ffmpeg pustit."""
+        self.governed = False
+        proc = self._proc
+        if proc is not None:
+            governor.get().unregister_process(proc.pid)
+
+    def decode_source(self):
+        """Z čeho dekódovat: 1080p proxy (4K / HDR), jinak originál."""
+        return video_proxy.get_proxy(self.strip.source) or self.strip.source
+
     def run(self):
         ok = False
         try:
             ok = self._pass(keyframes_only=True)
-            if ok and not self._cancel and 0 < self.strip.duration_ms <= DENSE_MAX_S * 1000:
+            if ok and self.dense and not self._cancel and 0 < self.strip.duration_ms <= DENSE_MAX_S * 1000:
                 gap = int(1000 / DENSE_FPS / 2)
                 if self._pass(keyframes_only=False, min_gap_ms=gap):
                     self.strip.dense = True
@@ -245,12 +267,19 @@ class StripBuilder(QThread):
     def _run_ffmpeg(self, keyframes_only, hw, min_gap_ms):
         if not os.path.exists(paths.FFMPEG_PATH):
             return 0
+        gov = governor.get()
+        stop = self.should_stop or (lambda: False)
+        if self.governed and not gov.wait_quiet(lambda: self._cancel or stop() or not self.governed):
+            if self._cancel or stop():
+                return None                           # zrušeno během čekání na klid
         flags = 0
         if os.name == "nt":
             flags = subprocess.CREATE_NO_WINDOW | 0x00004000   # BELOW_NORMAL_PRIORITY_CLASS
-        proc = subprocess.Popen(_ffmpeg_cmd(self.strip.source, keyframes_only, hw), stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, creationflags=flags)
+        proc = subprocess.Popen(_ffmpeg_cmd(self.decode_source(), keyframes_only, hw, self.threads),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
         self._proc = proc
+        if self.governed:
+            gov.register_process(proc.pid)            # přehrávání / gesto = pozastavit
         pts, done_err = [], threading.Event()
 
         def read_err():
@@ -291,9 +320,12 @@ class StripBuilder(QThread):
                 if now - last_emit > 0.15:
                     last_emit = now
                     self.progress.emit(self.strip.source, len(self.strip))
+            if not self._cancel and self.should_stop is not None and self.should_stop():
+                self.cancel()                         # démon končí (zavírání aplikace)
             if self._cancel:
                 break
         proc.wait()
+        gov.unregister_process(proc.pid)
         self._proc = None
         if self._cancel:
             return None
@@ -324,29 +356,36 @@ class StripManager(QObject):
             self._remember(strip)
         return strip
 
-    def request(self, source):
-        """Zajistí pás pro video: z RAM / z disku hned, jinak vytvoření na pozadí."""
+    def request(self, source, priority=True):
+        """Zajistí pás pro video: z RAM / z disku hned, jinak vytvoření na pozadí.
+        priority=False = odložený (prohlížeč hned po spuštění videa): čeká na klid a během
+        přehrávání stojí; priority=True (tažení, náhled v mřížce) běží hned."""
         if not source or not os.path.exists(source):
             return None
         strip = self.get(source)
-        if strip is not None and (strip.complete or self._building(source)):
+        if strip is not None and strip.complete:
             return strip
+        if self._building(source):
+            if priority:
+                self._builder.prioritize()
+            return self._builder.strip
         if self._builder is not None and self._builder.isRunning():
-            if self._building(source):
-                return self._builder.strip
             self._builder.cancel()                    # jiné video – aktuální má přednost
-            self._queue = [s for s in self._queue if s != source]
-            self._queue.insert(0, source)
+            self._queue = [(s, p) for s, p in self._queue if s != source]
+            self._queue.insert(0, (source, priority))
             return strip
-        return self._start(source)
+        return self._start(source, priority)
 
     def _building(self, source):
         return self._builder is not None and self._builder.isRunning() and self._builder.strip.source == source
 
-    def _start(self, source):
+    def _start(self, source, priority=True):
+        import perf_profile
+        prof = perf_profile.current()
         strip = ScrubStrip(source)
         self._remember(strip)
-        builder = StripBuilder(strip, self)
+        builder = StripBuilder(strip, self, governed=not priority, dense=prof.dense_strips,
+                               threads=max(1, prof.bg_threads))
         builder.progress.connect(self.strip_progress)
         builder.finished_strip.connect(self._on_finished)
         self._builder = builder
@@ -366,13 +405,30 @@ class StripManager(QObject):
         if not ok and source in self._strips and not self._strips[source].complete:
             self._strips.pop(source, None)            # rozpracovaný (zrušený) pás nedržet
         if self._queue:
-            self.request(self._queue.pop(0))
+            self.request(*self._queue.pop(0))
 
     def shutdown(self, timeout_ms=3000):
         self._queue.clear()
         if self._builder is not None:
             self._builder.cancel()
             self._builder.wait(timeout_ms)
+
+
+def build_strip_now(source, should_stop=None, dense=True, threads=1):
+    """Pás předem (démon, jeho vlákno): odložený, pozastavený při interakci. True = hotový."""
+    if not source or not os.path.exists(source) or ScrubStrip.load(source) is not None:
+        return False
+    builder = StripBuilder(ScrubStrip(source), governed=True, dense=dense, threads=threads)
+    builder.should_stop = should_stop
+    done = []
+    builder.finished_strip.connect(lambda _s, ok: done.append(ok), type=_direct())
+    builder.run()                                     # synchronně v aktuálním vlákně
+    return bool(done and done[0])
+
+
+def _direct():
+    from PyQt6.QtCore import Qt
+    return Qt.ConnectionType.DirectConnection
 
 
 _manager = None

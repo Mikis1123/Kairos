@@ -55,7 +55,7 @@ from PyQt6.QtWebChannel import QWebChannel
 from web_console import QuietWebPage
 
 from database import (
-    init_db, get_connection, save_image_embedding, get_all_embeddings,
+    init_db, get_connection, save_image_embedding, get_all_embeddings, get_media_needing_embedding,
     get_media_pending_face_scan, save_faces_for_media, relocate_face_paths,
     visible_media_sql, query_geo_bounds, sync_geo_index, trash_media, restore_media,
     dismiss_duplicate_pair, undismiss_duplicate_pair, purge_orphan_test_rows,
@@ -100,6 +100,12 @@ import window_effects
 import moments_view
 from moments_view import MomentsView
 import library_tools
+import frame_meter
+import governor
+import perf_profile
+import scrub_strip
+import search_engine
+import video_proxy
 HOVER_PRELOAD_MS = 350       # setrvání kurzoru nad videem v mřížce před přednačtením
 SMART_IMPORT_DELAY_MS = 4000 # kontrola nových fotek až po usazení startu
 import face_engine
@@ -324,6 +330,10 @@ def shutdown_app(app, window):
         media_engine.shutdown_all()         # vlákna přehrávačů před zánikem QApplication
     except Exception as e:
         print(f"[Shutdown] {e}")
+    if frame_meter.enabled_logging():       # KAIROS_FRAMESTATS=1: statistika snímků do perf_logs/
+        path = frame_meter.write_log(os.path.join(BASE_DIR, "perf_logs"))
+        if path:
+            print(f"[FrameStats] {path}")
     app.processEvents()
 
 
@@ -451,6 +461,7 @@ class ApplePhotoModel(QAbstractListModel):
     def __init__(self, lru_capacity: int = 1200, parent=None):
         super().__init__(parent)
         self.records = []
+        self.possible = set()
         self.id_to_row = {}
         self.ram_cache = LRUCache(lru_capacity)
         self.thread_pool = QThreadPool()
@@ -459,9 +470,11 @@ class ApplePhotoModel(QAbstractListModel):
         self.failed = {}          # item_id -> THUMB_MISSING_FILE | THUMB_UNAVAILABLE
         self._meta = {}           # řádek -> slovník MetaRole (delegát ho čte při každém snímku)
 
-    def set_records(self, db_records):
+    def set_records(self, db_records, possible=()):
+        """possible = id položek z pásma „možné shody“ hledání (kreslí se tlumeně)."""
         self.beginResetModel()
         self.records = list(db_records)
+        self.possible = {int(i) for i in possible}
         self._meta = {}
         self.id_to_row = {int(r[0]): i for i, r in enumerate(self.records)}
         self.loading_ids.clear()
@@ -523,7 +536,8 @@ class ApplePhotoModel(QAbstractListModel):
             if meta is None:
                 name = rec[1] or (os.path.basename(rec[2]) if rec[2] else "")
                 meta = self._meta[row] = {"id": item_id, "name": name, "type": rec[3],
-                                          "date": rec[6], "is_fav": bool(rec[7])}
+                                          "date": rec[6], "is_fav": bool(rec[7]),
+                                          "possible": item_id in self.possible}
             return meta
         return None
 
@@ -620,6 +634,11 @@ class ApplePhotoDelegate(QStyledItemDelegate):
                                        frame.center().y() - size.height() / 2), pm)
             painter.setOpacity(1.0)
         self._paint_badge_shade(painter, frame, meta)
+        if meta.get("possible"):
+            # pásmo „možné shody“: fotka pod závojem barvy pozadí – jisté shody vystoupí
+            veil = theme.qcolor("bg")
+            veil.setAlpha(120)
+            painter.fillRect(frame, veil)
         painter.restore()
 
     @staticmethod
@@ -660,7 +679,8 @@ class ApplePhotoDelegate(QStyledItemDelegate):
     def _tile(self, pixmap, size, radius, meta, dpr):
         """Hotová zaoblená dlaždice velikosti size (logické px) z mezipaměti – i s odznaky,
         takže klidová dlaždice je při posouvání jediné drawPixmap (žádný text ani cesty)."""
-        shade = (meta.get("type") in ("live_photo", "video"), bool(meta.get("is_fav")))
+        shade = (meta.get("type") in ("live_photo", "video"), bool(meta.get("is_fav")),
+                 theme.current() if meta.get("possible") else None)     # závoj má barvu motivu
         key = (pixmap.cacheKey(), size.width(), size.height(), round(radius, 2), shade, dpr,
                meta.get("type"))
         tile = self._tiles.get(key)
@@ -833,6 +853,85 @@ class ApplePhotoDelegate(QStyledItemDelegate):
 GRID_MIN_COLUMNS, GRID_MAX_COLUMNS = 2, 14
 GRID_MIN_CELL, GRID_MAX_CELL = 90, 420
 SCROLL_IDLE_MS = 140               # tak dlouho po posledním posunu se vrací najetí myši
+PINCH_SETTLE_MS = 160              # touchpad (Ctrl + jemné kolečko): po tak dlouhém klidu se dosedne
+FROZEN_MAX_TILES = 600             # pojistka: tolik dlaždic nejvýš v jednom zmrazeném snímku
+
+
+# ── Zoom mřížky bez přepočtu rozvržení (Fáze 1) ──────────────────────────────
+# Dřív každý krok animace zoomu volal setGridSize + layoutChanged + doItemsLayout (rozvržení celé
+# knihovny) a každou viditelnou dlaždici znovu rastroval v nové velikosti (~0,5 ms / dlaždice) –
+# 50+ ms na snímek proti rozpočtu 8,3 ms při 120 Hz, a mezivelikosti navíc vytlačily klidové
+# dlaždice z cache. Teď je rozvržení během gesta „zmrazené“: rozvržení jsou jen funkce
+# index -> obdélník, kreslí se hotové klidové dlaždice škálované do mezilehlých obdélníků
+# a skutečné rozvržení se nastaví JEDNOU, když pohyb doběhne.
+
+class _GridLayout:
+    """Rovnoměrná mřížka QListView (IconMode, spacing 0): aritmetika místo rozvržení."""
+
+    def __init__(self, cell, cols, ox, oy, scroll, count):
+        self.cell, self.cols = float(cell), max(1, int(cols))
+        self.ox, self.oy, self.scroll, self.count = ox, oy, float(scroll), count
+
+    def rect(self, i):
+        r, c = divmod(i, self.cols)
+        return QRectF(self.ox + c * self.cell, self.oy + r * self.cell - self.scroll, self.cell, self.cell)
+
+    def content_height(self):
+        rows = (self.count + self.cols - 1) // self.cols
+        return self.oy + rows * self.cell
+
+    def index_range(self, vp):
+        if not self.count:
+            return 0, -1
+        r0 = int((vp.top() + self.scroll - self.oy) // self.cell)
+        r1 = int((vp.bottom() + self.scroll - self.oy) // self.cell)
+        first = max(0, r0 * self.cols)
+        last = min(self.count - 1, (r1 + 1) * self.cols - 1)
+        return first, last
+
+
+class _ScaledLayout:
+    """Mřížka zvětšená o s kolem kotvy (gesto prstů / touchpad: 1:1 s pohybem)."""
+
+    def __init__(self, base, s, anchor):
+        self.base, self.s, self.anchor = base, float(s), QPointF(anchor)
+        self.count = base.count
+
+    def rect(self, i):
+        r, a, s = self.base.rect(i), self.anchor, self.s
+        return QRectF(a.x() + (r.x() - a.x()) * s, a.y() + (r.y() - a.y()) * s, r.width() * s, r.height() * s)
+
+    def index_range(self, vp):
+        a, s = self.anchor, max(1e-3, self.s)
+        inv = QRectF(a.x() + (vp.left() - a.x()) / s, a.y() + (vp.top() - a.y()) / s,
+                     vp.width() / s, vp.height() / s)
+        return self.base.index_range(inv)
+
+
+class _BlendLayout:
+    """Přechod mezi dvěma rozvrženími (e = 0 … 1)."""
+
+    def __init__(self, a, b, e=0.0):
+        self.a, self.b, self.e = a, b, float(e)
+        self.count = b.count
+
+    def rect(self, i):
+        ra, rb, e = self.a.rect(i), self.b.rect(i), self.e
+        return QRectF(ra.x() + (rb.x() - ra.x()) * e, ra.y() + (rb.y() - ra.y()) * e,
+                      ra.width() + (rb.width() - ra.width()) * e, ra.height() + (rb.height() - ra.height()) * e)
+
+    def index_range(self, vp):
+        a0, a1 = self.a.index_range(vp)
+        b0, b1 = self.b.index_range(vp)
+        if a1 < a0:
+            return b0, b1
+        if b1 < b0:
+            return a0, a1
+        return min(a0, b0), max(a1, b1)
+
+    def frozen(self):
+        """Aktuální stav jako samostatné rozvržení (nový cíl uprostřed animace navazuje odsud)."""
+        return _BlendLayout(self.a, self.b, self.e)
 _SCROLL_SWALLOWED_EVENTS = (QEvent.Type.HoverMove, QEvent.Type.HoverEnter, QEvent.Type.HoverLeave,
                             QEvent.Type.MouseMove)
 
@@ -868,10 +967,19 @@ class AppleGridView(QListView):
         self._hover_in = motion.Tween(0.0, lambda v: self._repaint_row(self._hover_in_row), self)
         self._hover_out = motion.Tween(0.0, lambda v: self._repaint_row(self._hover_out_row), self)
         self.entered.connect(lambda idx: self._set_hover_row(idx.row()))
-        # zoom: velikost dlaždice plynule, kotva = fotka pod kurzorem
-        self._zoom = motion.Tween(float(self.cell_size), self._apply_zoom_step, self)
-        self._zoom.finished.connect(lambda: setattr(self, "_zoom_anchor", None))
-        self._zoom_anchor = None
+        # zoom (Fáze 1): rozvržení zmrazené během pohybu, kotva = fotka pod kurzorem / prsty
+        self._zoom_t = motion.Tween(0.0, self._on_zoom_progress, self)
+        self._zoom_t.finished.connect(self._on_zoom_finished)
+        self._frozen = None                 # zobrazené rozvržení během zoomu (None = QListView)
+        self._zoom_target = None            # cílové _GridLayout běžícího přechodu
+        self._pinch_base = None             # gesto: rozvržení na začátku, měřítko, kotva
+        self._pinch_scale = 1.0
+        self._pinch_anchor = QPointF()
+        self._pinch_settle = QTimer(self)   # touchpad: dosednutí po krátkém klidu
+        self._pinch_settle.setSingleShot(True)
+        self._pinch_settle.setInterval(PINCH_SETTLE_MS)
+        self._pinch_settle.timeout.connect(self._pinch_end)
+        self.photo_model.modelReset.connect(self._finish_zoom)   # nová data = zoom dosedne hned
         self._wheel_accum = 0
         self._cols = None                   # počet sloupců drží šířku: dlaždice vyplní řádek celý
         self.zoom_hint = HintPill(self)
@@ -890,13 +998,12 @@ class AppleGridView(QListView):
     # ── velikost dlaždic ──
     def set_cell_size(self, px: int):
         px = int(max(GRID_MIN_CELL, min(GRID_MAX_CELL, px)))
+        self._finish_zoom()
         self._cols = None                   # sloupce se dopočítají z velikosti při dalším rozvržení
         self.cell_size = px
         self.photo_delegate.set_cell_size(px)
         self.setGridSize(QSize(px, px))
         self.photo_model.layoutChanged.emit()
-        if not self._zoom.is_running():
-            self._zoom.set(float(px))
 
     def columns(self, cell=None):
         if cell is None and self._cols:
@@ -911,43 +1018,37 @@ class AppleGridView(QListView):
     def set_columns(self, cols, animate=True):
         """Pevný počet sloupců (Dny = 4); velikost dlaždic se dopočítá z šířky."""
         self._cols = max(GRID_MIN_COLUMNS, min(GRID_MAX_COLUMNS, int(cols)))
-        target = float(self._cell_for_columns(self._cols))
         if animate:
-            self._zoom.to(target, "emphasized")
+            self._animate_to(self._cols, QPointF(4, 4))
         else:
-            self._zoom.set(target)
+            self._finish_zoom()
+            self._apply_zoom_step(self._cell_for_columns(self._cols))
 
     def resizeEvent(self, event):
+        self._finish_zoom()                  # okno se mění: rozpracovaný zoom dosednout hned
         super().resizeEvent(event)
-        if self.viewport().width() <= 2 or self._zoom.is_running():
+        if self.viewport().width() <= 2:
             return
         if self._cols is None:
             self._cols = max(1, (self.viewport().width() - 2) // max(1, self.cell_size))
         cell = self._cell_for_columns(self._cols)
         if cell != self.cell_size:
             self._apply_zoom_step(cell)
-            self._zoom.set(float(cell))
 
     def zoom_by(self, steps, anchor_pos=None):
         """steps > 0 = přiblížit (méně sloupců). Plynule a s fotkou pod kurzorem na místě."""
-        current = self._cols or self.columns(self._zoom.target)
+        current = self._cols or self.columns()
         cols = max(GRID_MIN_COLUMNS, min(GRID_MAX_COLUMNS, current - steps))
-        target = self._cell_for_columns(cols)
-        if cols == current and target == int(self._zoom.target):
+        if cols == current and (self._zoom_target is None or self._zoom_target.cols == cols):
             return
         self._cols = cols
-        pos = anchor_pos if anchor_pos is not None else self.viewport().rect().center()
-        idx = self.indexAt(pos)
-        if not idx.isValid() and self.photo_model.rowCount():
-            idx = self.indexAt(self.viewport().rect().topLeft() + QPoint(4, 4))
-        if idx.isValid():
-            r = self.visualRect(idx)
-            self._zoom_anchor = (idx.row(), pos, (pos.y() - r.top()) / max(1, r.height()))
-        self._zoom.to(float(target), "emphasized")
+        pos = QPointF(anchor_pos if anchor_pos is not None else self.viewport().rect().center())
+        self._animate_to(cols, pos)
         self.zoom_hint.flash(_czech_columns(cols))
-        self.zoom_changed.emit(target)
+        self.zoom_changed.emit(self._cell_for_columns(cols))
 
     def _apply_zoom_step(self, value):
+        """Okamžité skutečné rozvržení (změna velikosti okna, dosednutí zoomu)."""
         px = int(round(float(value)))
         if px == self.cell_size:
             return
@@ -955,32 +1056,208 @@ class AppleGridView(QListView):
         self.photo_delegate.set_cell_size(px)
         self.setGridSize(QSize(px, px))
         self.photo_model.layoutChanged.emit()
-        if self._zoom_anchor is not None:
-            row, pos, frac = self._zoom_anchor
-            self.doItemsLayout()
-            r = self.visualRect(self.photo_model.index(row, 0))
-            sb = self.verticalScrollBar()
-            sb.setValue(sb.value() + round(r.top() + frac * r.height() - pos.y()))
+
+    # ── zmrazené rozvržení ──
+    def _current_grid(self):
+        """Skutečné rozvržení QListView jako aritmetická mřížka."""
+        n = self.photo_model.rowCount()
+        sb = self.verticalScrollBar().value()
+        ox = oy = 0.0
+        if n:
+            r0 = self.visualRect(self.photo_model.index(0, 0))
+            ox, oy = float(r0.x()), float(r0.y() + sb)
+        cols = max(1, int(self.viewport().width() // max(1, self.cell_size)))
+        return _GridLayout(self.cell_size, cols, ox, oy, sb, n)
+
+    def _shown_layout(self):
+        if isinstance(self._frozen, _BlendLayout):
+            return self._frozen.frozen()
+        return self._frozen if self._frozen is not None else self._current_grid()
+
+    def _index_at(self, layout, pos):
+        first, last = layout.index_range(QRectF(self.viewport().rect()))
+        best, best_d = None, None
+        for i in range(first, min(last, first + FROZEN_MAX_TILES) + 1):
+            r = layout.rect(i)
+            if r.contains(pos):
+                return i
+            d = (r.center() - pos).manhattanLength()
+            if best_d is None or d < best_d:
+                best, best_d = i, d
+        return best
+
+    def _target_grid(self, cols, anchor, start):
+        """Cílová mřížka pro počet sloupců; posun tak, aby fotka pod kotvou zůstala na místě."""
+        base = self._current_grid()
+        cell = float(self._cell_for_columns(cols))
+        target = _GridLayout(cell, cols, base.ox, base.oy, 0.0, base.count)
+        idx = self._index_at(start, anchor) if base.count else None
+        scroll = 0.0
+        if idx is not None:
+            src = start.rect(idx)
+            frac = (anchor.y() - src.top()) / max(1.0, src.height())
+            scroll = target.rect(idx).top() + frac * cell - anchor.y()
+        max_scroll = max(0.0, target.content_height() - self.viewport().height())
+        target.scroll = min(max(0.0, scroll), max_scroll)
+        return target
+
+    def _animate_to(self, cols, anchor, kind="emphasized"):
+        start = self._shown_layout()
+        self._zoom_target = self._target_grid(cols, anchor, start)
+        self._begin_freeze(_BlendLayout(start, self._zoom_target, 0.0))
+        self._zoom_t._anim.stop()
+        self._zoom_t.value = self._zoom_t.target = 0.0
+        self._zoom_t.to(1.0, kind)          # skrytá mřížka / omezený pohyb = dosedne hned
+
+    def _begin_freeze(self, layout):
+        if self._frozen is None:
+            governor.get().hold("gesture")  # práce na pozadí počká, ať zoom má celý snímek
+            self.live_preview.stop()
+            self._drop_hover()
+        self._frozen = layout
+        self.viewport().update()
+
+    def _on_zoom_progress(self, e):
+        if isinstance(self._frozen, _BlendLayout):
+            self._frozen.e = float(e)
+            self.viewport().update()
+
+    def _on_zoom_finished(self):
+        if self._zoom_target is not None and self._pinch_base is None:
+            self._commit_zoom(self._zoom_target)
+
+    def _finish_zoom(self):
+        """Rozpracovaný zoom / gesto dosednout hned (posun, změna velikosti, nová data)."""
+        if self._pinch_base is not None:
+            self._pinch_settle.stop()
+            self._pinch_end(animate=False)
+        elif self._zoom_target is not None:
+            self._zoom_t._anim.stop()
+            self._commit_zoom(self._zoom_target)
+
+    def _commit_zoom(self, target):
+        """Jediné skutečné rozvržení na konci pohybu (a jediné rastrování dlaždic v nové velikosti)."""
+        was_frozen = self._frozen is not None
+        self._zoom_target = None
+        self._frozen = None
+        self._apply_zoom_step(target.cell)
+        self.doItemsLayout()
+        self.verticalScrollBar().setValue(int(round(target.scroll)))
+        if was_frozen:
+            governor.get().release("gesture")
+        self.viewport().update()
+
+    def paintEvent(self, event):
+        if self._frozen is not None:
+            self._paint_frozen()
+        else:
+            super().paintEvent(event)
+        frame_meter.tick("grid")            # Fáze 0: doba snímku mřížky (Ctrl+Shift+F)
+
+    def _paint_frozen(self):
+        """Klidové dlaždice (z cache delegáta) škálované do mezilehlých obdélníků: žádné
+        rozvržení, žádné rastrování – jen kopie pixmap."""
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        vp = QRectF(self.viewport().rect())
+        layout, model, delegate = self._frozen, self.photo_model, self.photo_delegate
+        first, last = layout.index_range(vp)
+        last = min(last, first + FROZEN_MAX_TILES)
+        dpr = self.viewport().devicePixelRatioF()
+        rest = QSize(max(1, self.cell_size - 8), max(1, self.cell_size - 8))
+        radius = max(6.0, min(14.0, rest.width() * 0.07))
+        placeholder = delegate.placeholder_color
+        for i in range(max(0, first), last + 1):
+            r = layout.rect(i).adjusted(4, 4, -4, -4)
+            if r.width() <= 1 or not r.intersects(vp):
+                continue
+            idx = model.index(i, 0)
+            pix = model.data(idx, ApplePhotoModel.ThumbRole)
+            if pix is None or pix.isNull():
+                p.fillRect(r, placeholder)
+                continue
+            tile = delegate._tile(pix, rest, radius, model.data(idx, ApplePhotoModel.MetaRole) or {}, dpr)
+            p.drawPixmap(r, tile, QRectF(tile.rect()))
+        p.end()
+
+    # ── gesto prstů / touchpad: 1:1, pak dosednutí na celé sloupce ──
+    def _pinch_begin(self, anchor):
+        self._zoom_t._anim.stop()
+        self._pinch_base = self._shown_layout()
+        self._pinch_scale = 1.0
+        self._pinch_anchor = QPointF(anchor)
+
+    def _pinch_update(self, scale):
+        base = self._pinch_base
+        if base is None:
+            return
+        base_cell = max(1.0, base.rect(0).width()) if base.count else float(self.cell_size)
+        cell = base_cell * scale
+        # gumové meze: za nejmenší / největší velikostí jen zlomek pohybu
+        if cell > GRID_MAX_CELL:
+            cell = GRID_MAX_CELL + (cell - GRID_MAX_CELL) * 0.3
+        elif cell < GRID_MIN_CELL:
+            cell = GRID_MIN_CELL - (GRID_MIN_CELL - cell) * 0.3
+        self._pinch_scale = cell / base_cell
+        self._begin_freeze(_ScaledLayout(base, self._pinch_scale, self._pinch_anchor))
+
+    def _pinch_end(self, animate=True):
+        base = self._pinch_base
+        if base is None:
+            return
+        base_cell = max(1.0, base.rect(0).width()) if base.count else float(self.cell_size)
+        width = max(1, self.viewport().width() - 2)
+        cols = int(round(width / max(1.0, base_cell * self._pinch_scale)))
+        cols = max(GRID_MIN_COLUMNS, min(GRID_MAX_COLUMNS, cols))
+        shown = _ScaledLayout(base, self._pinch_scale, self._pinch_anchor)
+        self._pinch_base = None
+        self._cols = cols
+        self._zoom_target = self._target_grid(cols, self._pinch_anchor, shown)
+        if animate:
+            self._begin_freeze(_BlendLayout(shown, self._zoom_target, 0.0))
+            self._zoom_t._anim.stop()
+            self._zoom_t.value = self._zoom_t.target = 0.0
+            self._zoom_t.to(1.0, "spring")       # dosednutí s jemným přetočením
+        else:
+            self._commit_zoom(self._zoom_target)
+        self.zoom_hint.flash(_czech_columns(cols))
+        self.zoom_changed.emit(self._cell_for_columns(cols))
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            # Ctrl + kolečko (na touchpadu i sevření prstů) – po celých krocích kolečka
-            self._wheel_accum += event.angleDelta().y()
-            steps = int(self._wheel_accum / 120)
-            if steps:
-                self._wheel_accum -= steps * 120
-                self.zoom_by(steps, event.position().toPoint())
+            dy = event.angleDelta().y()
+            if event.pixelDelta().y() or (dy and dy % 120):
+                # touchpad / sevření prstů (jemné kroky): plynule 1:1, po klidu dosednout
+                if self._pinch_base is None:
+                    self._pinch_begin(event.position())
+                self._pinch_update(self._pinch_scale * math.exp(dy / 600.0))
+                self._pinch_settle.start()
+            else:
+                # kolečko myši – po celých krocích (sloupec za zářez)
+                self._wheel_accum += dy
+                steps = int(self._wheel_accum / 120)
+                if steps:
+                    self._wheel_accum -= steps * 120
+                    self.zoom_by(steps, event.position())
             event.accept()
             return
+        self._finish_zoom()                  # běžný posun: zoom dosedne a mřížka jede dál
         super().wheelEvent(event)
 
     def event(self, e):
         if e.type() == QEvent.Type.Gesture:
             pinch = e.gesture(Qt.GestureType.PinchGesture)
-            if pinch is not None and pinch.state() == Qt.GestureState.GestureFinished:
-                factor = pinch.totalScaleFactor()
-                if abs(factor - 1.0) > 0.12:
-                    self.zoom_by(1 if factor > 1 else -1)
+            if pinch is not None:
+                center = QPointF(self.viewport().mapFromGlobal(pinch.centerPoint().toPoint()))
+                state = pinch.state()
+                if state == Qt.GestureState.GestureStarted:
+                    self._pinch_begin(center)
+                elif state == Qt.GestureState.GestureUpdated:
+                    if self._pinch_base is None:
+                        self._pinch_begin(center)
+                    self._pinch_update(pinch.totalScaleFactor())
+                elif state in (Qt.GestureState.GestureFinished, Qt.GestureState.GestureCanceled):
+                    self._pinch_end()
                 return True
         return super().event(e)
 
@@ -1119,6 +1396,15 @@ def _czech_item_count(n):
     if 2 <= n <= 4:
         return f"{n} položky"
     return f"{n} položek"
+
+
+def _czech_result_count(n):
+    n = int(n or 0)
+    if n == 1:
+        return "1 shoda"
+    if 2 <= n <= 4:
+        return f"{n} shody"
+    return f"{n} shod"
 
 
 def _format_date_range(start, end):
@@ -1651,22 +1937,25 @@ class CircularProgressWidget(QWidget):
 # ── P3.2 AI Search worker ─────────────────────────────────────────────────────
 
 class AISearchWorker(QThread):
-    search_finished = pyqtSignal(list, str)
+    """Hledání 2.0 mimo GUI vlákno: search_engine.run_search (fazety + obraz, dvě pásma)."""
+    search_finished = pyqtSignal(object, str)     # SearchResult, dotaz
 
-    def __init__(self, query_text, embeddings_cache):
+    def __init__(self, query_text, embeddings_cache, universe=None):
         super().__init__()
         self.query_text = query_text
         self.embeddings_cache = embeddings_cache
+        self.universe = universe if universe is not None else list(embeddings_cache or ())
 
     def run(self):
         # Výjimka unikající z QThread.run = qFatal -> pád celé aplikace (PyQt6). Chyba modelu,
         # sítě (HF Hub) nebo dat hledání se projeví jen jako „žádné výsledky“.
+        query = str(self.query_text or "").strip()
         try:
-            results = search_by_text(self.query_text, self.embeddings_cache)
+            result = search_engine.run_search(query, self.universe, self.embeddings_cache)
         except Exception as e:
             print(f"[AI Hledání] {type(e).__name__}: {e}")
-            results = []
-        self.search_finished.emit(results, self.query_text)
+            result = search_engine.SearchResult(query, [], [], [], False)
+        self.search_finished.emit(result, self.query_text)
 
 
 SEARCH_WARMUP_DELAY_MS = 5000   # textový model hledání se načte v klidu po startu, ne při 1. dotazu
@@ -1738,9 +2027,15 @@ class BackgroundAIDaemon(QThread):
         self.face_threshold = face_threshold
         self.merge_threshold = merge_threshold     # None = face_cluster.MERGE_THRESHOLD
         self.preview_budget_mb = preview_cache.DEFAULT_BUDGET_MB
+        self.proxy_budget_mb = video_proxy.DEFAULT_BUDGET_MB
 
     def stop(self):
         self._running = False
+
+    def _yield(self):
+        """should_stop pro každou položku práce: během interakce (video, gesto, Cesta) čeká
+        na klid (governor), na slabším PC dává UI pauzu. True = skončit."""
+        return governor.get().checkpoint(lambda: not self._running)
 
     def _status(self, text, force=False):
         now = time.monotonic()
@@ -1752,27 +2047,98 @@ class BackgroundAIDaemon(QThread):
         try:
             self._repair_thumbnails()
             if self._running:
+                self._migrate_embeddings()
+            if self._running:
+                self._refresh_embeddings()       # hledání: miniatury už jsou, embeddingy hned po nich
+            if self._running:
                 self._repair_face_crops()
             if self._running:
                 self._compute_phashes()
             if self._running:
                 self._build_previews()
             if self._running:
-                self._migrate_embeddings()
-            if self._running:
                 self._analyze_faces()
+            if self._running:
+                self._build_video_derivatives()
             if self._running:
                 self._improve_person_covers()
         except Exception as e:
             print(f"AI Daemon error: {e}")
         self.status_changed.emit("")
 
+    def _refresh_embeddings(self):
+        """Embeddingy hledání pro položky bez platného (chybí / bez podpisu zdroje / změněný
+        soubor). Zdroj = miniatura (už otočená podle EXIF, 360 px – CLIP pracuje s 224 px), jinak
+        originál fotky. Průběžně hlásí embeddings_updated, ať hledání zlepšuje hned."""
+        try:
+            rows = get_media_needing_embedding()
+        except Exception as e:
+            print(f"[Embeddings] {e}")
+            return
+        total, since_emit = len(rows), 0
+        for i, (media_id, file_path, thumb_path, media_type, sig) in enumerate(rows):
+            if self._yield():
+                return
+            self._status(f"Připravuji chytré hledání ({i + 1}/{total})...")
+            src = thumb_path if thumb_path and os.path.exists(thumb_path) else (
+                file_path if media_type != "video" else None)
+            emb = compute_image_embedding(src) if src else None
+            if emb is None:
+                continue
+            try:
+                save_image_embedding(media_id, emb, sig)
+            except Exception as e:
+                print(f"[Embeddings] {media_id}: {e}")
+                continue
+            since_emit += 1
+            if since_emit >= 25:
+                since_emit = 0
+                self.embeddings_updated.emit()
+        if total:
+            self.embeddings_updated.emit()
+
+    def _build_video_derivatives(self):
+        """Videa předem: 1080p SDR proxy pro 4K / HDR (tažení, náhledy, Cesta, slabší PC) a
+        náhledový pás z ní. Nikdy během přehrávání – ffmpeg stojí, dokud je rušno (governor)."""
+        prof = perf_profile.current()
+        try:
+            conn = get_connection()
+            try:
+                videos = [r[0] for r in conn.execute(f"""
+                    SELECT m.file_path FROM media_items m
+                    WHERE m.media_type = 'video' AND {visible_media_sql('m')}
+                    ORDER BY m.date_taken DESC, m.id DESC""")]
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[Proxy] {e}")
+            return
+        total = len(videos)
+        for i, path in enumerate(videos):
+            if self._yield():
+                return
+            if not path or not os.path.exists(path):
+                continue
+            if not video_proxy.is_settled(path):
+                self._status(f"Připravuji videa ({i + 1}/{total})...", force=True)
+                made = video_proxy.build_proxy(path, governor.get(), self._yield, threads=prof.bg_threads)
+                if made is False:
+                    return                                    # zrušeno (konec aplikace)
+                if made:
+                    video_proxy.enforce_budget(self.proxy_budget_mb, keep=[made])
+            if self._yield():
+                return
+            if scrub_strip.ScrubStrip.load(path) is None:
+                self._status(f"Připravuji náhledy videí ({i + 1}/{total})...")
+                scrub_strip.build_strip_now(path, self._yield, dense=prof.dense_strips,
+                                            threads=max(1, prof.bg_threads))
+
     def _build_previews(self):
         """Náhledy 2048 px a plakáty videí na pozadí, v pořadí podle užitku: kandidáti duplicit,
         obálky událostí, pak celá knihovna od nejnovějších. Nakonec LRU úklid na rozpočet."""
         try:
             for path, mtype in preview_build_order():
-                if not self._running:
+                if self._yield():
                     return
                 if preview_cache.get_preview(path, touch=False) is None:
                     self._status("Připravuji náhledy fotek...")
@@ -1789,7 +2155,7 @@ class BackgroundAIDaemon(QThread):
             if pending:
                 face_engine.ensure_ready()
                 self._status(f"Kontroluji obličeje ({pending})...", force=True)
-                face_engine.analyze_face_crops(should_stop=lambda: not self._running)
+                face_engine.analyze_face_crops(should_stop=self._yield)
             # Anatomická brána poslala do karantény obličej, který patří osobě (týl hlavy, kámen)
             # -> přeshlukovat, aby se z nich nestaly „osoby“
             if self._running and count_quarantined_assigned():
@@ -1805,7 +2171,7 @@ class BackgroundAIDaemon(QThread):
         """Jednorázově přeřízne deformované (protažené) ořezy obličejů u okraje fotek."""
         try:
             self._status("Kontroluji ořezy obličejů...", force=True)
-            fixed = face_engine.repair_stretched_face_crops(should_stop=lambda: not self._running)
+            fixed = face_engine.repair_stretched_face_crops(should_stop=self._yield)
             if fixed and self._running:
                 self.face_crops_repaired.emit(fixed)
         except Exception as e:
@@ -1813,7 +2179,7 @@ class BackgroundAIDaemon(QThread):
 
     def _repair_thumbnails(self):
         created = repair_missing_thumbnails(
-            should_stop=lambda: not self._running,
+            should_stop=self._yield,
             progress=lambda i, n: self._status(f"Obnovuji náhledy ({i}/{n})..."),
         )
         if created and self._running:
@@ -1823,7 +2189,7 @@ class BackgroundAIDaemon(QThread):
         """Otisky pro duplicity: nové položky i přepočet zastaralých otisků (PHASH_VERSION)."""
         try:
             refresh_phashes(
-                should_stop=lambda: not self._running,
+                should_stop=self._yield,
                 progress=lambda i, n: self._status(f"Počítám otisky pro duplicity ({i}/{n})..."),
             )
         except Exception as e:
@@ -1846,7 +2212,7 @@ class BackgroundAIDaemon(QThread):
         new_faces_found = False
         total = len(pending)
         for idx, (media_id, file_path) in enumerate(pending):
-            if not self._running:
+            if self._yield():
                 return
             if not file_path or not os.path.exists(file_path):
                 continue
@@ -1856,9 +2222,8 @@ class BackgroundAIDaemon(QThread):
                 save_faces_for_media(media_id, faces)
                 if faces:
                     new_faces_found = True
-                emb = compute_image_embedding(file_path)
-                if emb is not None:
-                    save_image_embedding(media_id, emb)
+                # embedding hledání už nevzniká tady (dřív jen jednou s obličeji a bez podpisu
+                # zdroje – po re-importu pod novým id zůstal u cizí fotky): _refresh_embeddings
             except Exception as e:
                 print(f"[AI] {file_path}: {e}")
         if new_faces_found and self._running:
@@ -1869,7 +2234,6 @@ class BackgroundAIDaemon(QThread):
             except Exception as e:
                 print(f"[Cluster] {e}")
             self.people_updated.emit()
-        self.embeddings_updated.emit()
 
 
 # ── Kontroly (duplicity, hraniční obličeje) jako stránky v okně ───────────────
@@ -2351,6 +2715,56 @@ class BorderlineReviewView(ReviewView):
 BorderlineReviewDialog = BorderlineReviewView  # původní název (testy P3.6)
 
 
+# ── Fáze 0: překryv se statistikou snímků ─────────────────────────────────────
+
+class FrameStatsOverlay(QLabel):
+    """Ctrl+Shift+F: p50 / p95 / p99 a vynechané snímky všech měřáků (mřížka, prohlížeč, video,
+    mapa, Cesta), výkonnostní profil a co právě drží práci na pozadí (governor)."""
+
+    def __init__(self, window):
+        super().__init__(window)
+        self._window = window
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        f = QFont("Consolas")
+        f.setPixelSize(12)
+        self.setFont(f)
+        self.setStyleSheet("QLabel { background: rgba(10, 10, 14, 215); color: #E8E8F0; "
+                           "border-radius: 8px; padding: 8px 10px; }")
+        self._timer = QTimer(self)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._refresh)
+        self.hide()
+
+    def toggle(self):
+        if self.isVisible():
+            self._timer.stop()
+            self.hide()
+        else:
+            self._refresh()
+            self.show()
+            self.raise_()
+            self._timer.start()
+
+    def _refresh(self):
+        view = getattr(self._window, "map_view", None)
+        if view is not None and getattr(self._window, "_map_loaded", False):
+            view.page().runJavaScript("window.getFrameStats ? window.getFrameStats() : null", self._on_map_stats)
+        prof = perf_profile.current()
+        lines = [f"Kairos · {prof.tier} · {prof.refresh_hz:.0f} Hz (rozpočet {prof.frame_budget_ms:.1f} ms)"]
+        lines += [frame_meter.format_stats(s) for s in frame_meter.all_stats()]
+        held = governor.get().reasons()
+        lines.append(f"pozadí: {'pozastaveno (' + ', '.join(held) + ')' if held else ('klid' if not governor.get().busy() else 'čeká na klid')}")
+        self.setText("\n".join(lines))
+        self.adjustSize()
+        self.move(self._window.width() - self.width() - 16, 56)
+
+    @staticmethod
+    def _on_map_stats(stats):
+        for name, s in (stats or {}).items():
+            if isinstance(s, dict):
+                frame_meter.record_external(name, s)
+
+
 # ── MainWindow ────────────────────────────────────────────────────────────────
 
 # Styl hlavního okna se generuje z tokenů pro aktuální režim a zvýraznění (tokens.build_qss).
@@ -2363,6 +2777,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(brand.APP_NAME)
         self.setMinimumSize(1100, 700)
         self.resize(1280, 800)
+        # Adaptivní škálování: profil stroje (strop kvality, zátěž pozadí, meze mapy)
+        self.perf = perf_profile.detect(self.config.get("performance_tier"))
+        governor.get().set_item_pause(self.perf.bg_item_pause_s)
 
         # State
         self._all_records = []
@@ -2381,6 +2798,8 @@ class MainWindow(QMainWindow):
         self._scanner = None
         self._search_workers = set()  # běžící AISearchWorker (nesmí zaniknout dřív než vlákno)
         self._search_warmup = None    # SearchModelWarmup (jednou po startu)
+        self._search_result = None    # search_engine.SearchResult aktuálního dotazu
+        self._search_sort_override = False
         self._person_card_pool = QThreadPool()
         self._person_card_pool.setMaxThreadCount(4)
         self._person_cards = {}  # person_id -> PersonCard
@@ -2412,6 +2831,12 @@ class MainWindow(QMainWindow):
         self._help_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F1), self)
         self._help_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._help_shortcut.activated.connect(lambda: self.open_guide())
+        # Fáze 0: měření doby snímku (Ctrl+Shift+F), rozpočet podle obnovovací frekvence displeje
+        frame_meter.set_refresh(self.perf.refresh_hz)
+        self._frame_stats = FrameStatsOverlay(self)
+        self._frame_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
+        self._frame_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._frame_shortcut.activated.connect(self._frame_stats.toggle)
         self._spotlight = None
         # Polish P3: přetažení složek / fotek kamkoli do okna + sledované složky
         self.drop_router = drop_import.DropRouter(self, self.centralWidget())
@@ -3284,6 +3709,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[Embeddings] {e}")
             self._embeddings_cache = {}
+        # démon opravil / doplnil embeddingy -> běžící hledání se zpřesní samo
+        if self._search_query.strip() and self._search_result is not None:
+            self._search_debounce.start()
 
     def _start_ai_daemon(self):
         if self._ai_daemon and self._ai_daemon.isRunning():
@@ -3292,6 +3720,7 @@ class MainWindow(QMainWindow):
         self._ai_daemon = BackgroundAIDaemon(face_threshold=threshold,
                                              merge_threshold=self.config.get("face_merge_threshold"))
         self._ai_daemon.preview_budget_mb = int(self.config.get("preview_cache_mb", preview_cache.DEFAULT_BUDGET_MB))
+        self._ai_daemon.proxy_budget_mb = int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB))
         self._ai_daemon.people_updated.connect(self._load_people)
         self._ai_daemon.embeddings_updated.connect(self._load_embeddings)
         self._ai_daemon.thumbs_repaired.connect(self._load_photos)
@@ -3309,24 +3738,19 @@ class MainWindow(QMainWindow):
 
     # ── Filter / Sort ─────────────────────────────────────────────────────────
 
-    def _apply_filter_and_sort(self):
+    def _collection_records(self):
+        """Záznamy aktuální kolekce (knihovna / oblíbené / fotky / videa / koš) v pořadí mřížky."""
         f = self._current_filter
         records = list(self._trash_records if f == "trash" else self._all_records)
-
-        # Filter
         if f == "favorites":
             records = [r for r in records if r[7]]
         elif f == "photo":
             records = [r for r in records if r[3] in ("photo", "live_photo")]
         elif f == "video":
             records = [r for r in records if r[3] == "video"]
+        return records
 
-        # Search filter
-        if self._search_query:
-            q = strip_accents(self._search_query)
-            records = [r for r in records if q in strip_accents(r[1] or "")]
-
-        # Sort
+    def _sorted(self, records):
         s = self._current_sort
         if s == "date_asc":
             records.sort(key=lambda r: r[6] or "")
@@ -3336,21 +3760,55 @@ class MainWindow(QMainWindow):
             records.sort(key=lambda r: strip_accents(r[1] or ""))
         elif s == "size":
             records.sort(key=lambda r: r[0], reverse=True)
+        return records
+
+    def _apply_filter_and_sort(self):
+        f = self._current_filter
+        records = self._collection_records()
+        possible = ()
+        if self._search_query.strip():
+            result = self._search_result
+            if result is None or result.query != self._search_query.strip():
+                self._sync_memory_card()   # hledání běží: mřížka drží předchozí stav (žádné
+                return                     # probliknutí), karta Vzpomínek ale hned zmizí
+            # Hledání v AKTUÁLNÍ kolekci, v pořadí relevance: jisté shody, pak možné. Řazení
+            # zvolené během hledání platí uvnitř pásem; jinak relevance.
+            confident = order_records_by_ids(records, result.confident)
+            maybe = order_records_by_ids(records, result.possible)
+            if self._search_sort_override:
+                confident, maybe = self._sorted(confident), self._sorted(maybe)
+            records = confident + maybe
+            possible = {int(r[0]) for r in maybe}
+        else:
+            records = self._sorted(records)
 
         self._filtered_records = records
-        self.grid_view.photo_model.set_records(records)
+        self.grid_view.photo_model.set_records(records, possible)
         self._sync_memory_card()
-        count = len(records)
         if hasattr(self, 'lbl_photo_count'):
-            if f == "trash":
-                text = f"{_czech_item_count(count)} · obnovíte je pravým tlačítkem" if count else ""
-            else:
-                text = _czech_item_count(count)
-            self.lbl_photo_count.setText(text)
+            self.lbl_photo_count.setText(self._count_text(len(records), len(possible)))
+
+    def _count_text(self, count, possible=0):
+        query = self._search_query.strip()
+        if query:
+            if not count:
+                return f"Nic neodpovídá „{query}“"
+            sure = count - possible
+            if not possible:
+                return f"{_czech_result_count(sure)} pro „{query}“"
+            if not sure:
+                return f"Žádná jistá shoda · {possible} možných pro „{query}“"
+            return f"{_czech_result_count(sure)} · {possible} možných pro „{query}“"
+        if self._current_filter == "trash":
+            return f"{_czech_item_count(count)} · obnovíte je pravým tlačítkem" if count else ""
+        return _czech_item_count(count)
 
     def _set_filter(self, key: str):
         self._current_filter = key
         self.lbl_photos_title.setText(self.FILTER_TITLES.get(key, "Fotografie"))
+        if self._search_query.strip():
+            self._search_result = None       # jiná kolekce = jiné prostředí hledání
+            self._run_ai_search()
         self._apply_filter_and_sort()
         if self.stack.currentIndex() == 0:
             self._sync_sidebar()
@@ -3484,6 +3942,8 @@ class MainWindow(QMainWindow):
     def _on_sort_changed(self, idx: int):
         mapping = {0: "date_desc", 1: "date_asc", 2: "name_az", 3: "size"}
         self._current_sort = mapping.get(idx, "date_desc")
+        if self._search_query.strip():
+            self._search_sort_override = True   # zvoleno během hledání: platí uvnitř pásem
         self._apply_filter_and_sort()
 
     def _remember_cell_size(self, px: int):
@@ -3496,15 +3956,17 @@ class MainWindow(QMainWindow):
     def _on_search_changed(self, text: str):
         self.btn_clear_search.setVisible(bool(text))
         self._search_query = text
-        if not text:
+        self._search_sort_override = False       # nový dotaz = zase podle relevance
+        if not text.strip():
+            self._search_result = None
             self._apply_filter_and_sort()
             return
-        # Debounce AI search
         self._search_debounce.start()
 
     def _clear_search(self):
         self.search_bar.clear()
         self._search_query = ""
+        self._search_result = None
         self._apply_filter_and_sort()
 
     def _warm_search_model(self):
@@ -3518,7 +3980,7 @@ class MainWindow(QMainWindow):
 
     def _run_ai_search(self):
         query = self._search_query.strip()
-        if not query or not self._embeddings_cache:
+        if not query:
             self._apply_filter_and_sort()
             return
         status = getattr(self, "lbl_status", None)
@@ -3528,7 +3990,9 @@ class MainWindow(QMainWindow):
                             else "Připravuji chytré hledání…")
         # QThread.quit() vlákno bez event loopu nezastaví a přepsání reference by zničilo
         # běžící QThread (pád). Starší hledání doběhnou samy, jejich výsledky se zahodí.
-        worker = AISearchWorker(query, self._embeddings_cache)
+        # Hledá se v aktuální kolekci (i v koši); fazety (místo, čas, typ) fungují i bez modelu.
+        universe = [int(r[0]) for r in self._collection_records()]
+        worker = AISearchWorker(self._search_query, self._embeddings_cache, universe)
         worker.search_finished.connect(self._on_search_results)
         worker.finished.connect(lambda w=worker: self._release_search_worker(w))
         self._search_workers.add(worker)
@@ -3546,20 +4010,14 @@ class MainWindow(QMainWindow):
         if status is not None and not self._search_workers:
             status.set_task("search", "")
 
-    def _on_search_results(self, results: list, query: str):
+    def _on_search_results(self, result, query: str):
         if query != self._search_query:
             return  # stale result
-        result_ids = parse_search_results(results)
-        if not result_ids:
-            self._filtered_records = []
-            self.grid_view.photo_model.set_records([])
-            # pod prahem relevance nic -> prázdný výsledek, ne seznam náhodných fotek
-            self.lbl_photo_count.setText(f"Nic neodpovídá „{query}“")
-            return
-        ordered = order_records_by_ids(self._all_records, result_ids)
-        self._filtered_records = ordered
-        self.grid_view.photo_model.set_records(ordered)
-        self.lbl_photo_count.setText(f"{len(ordered)} výsledků pro \"{query}\"")
+        if not isinstance(result, search_engine.SearchResult):     # starý tvar [(id, skóre)]
+            result = search_engine.SearchResult(query, parse_search_results(result), [], [], True)
+        self._search_result = result
+        # pod prahem relevance nic -> prázdný výsledek a věta „Nic neodpovídá …“, ne náhodné fotky
+        self._apply_filter_and_sort()
 
     # ── Navigation ────────────────────────────────────────────────────────────
 

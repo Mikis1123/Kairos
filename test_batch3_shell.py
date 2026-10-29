@@ -193,7 +193,8 @@ class TestShellWindow(WindowEnv):
         self.w._set_filter("all")
         self.assertFalse(es.isVisible(), "knihovna má fotky")
         self.w._search_query = "zcela-neexistující"
-        self.w._apply_filter_and_sort()
+        self.w._on_search_results(main.search_engine.SearchResult("zcela-neexistující", [], [], [], True),
+                                  "zcela-neexistující")
         self.assertTrue(es.isVisible())
         self.assertIn("zcela-neexistující", es.title())
         with mock.patch.object(self.w, "_clear_search") as clear:

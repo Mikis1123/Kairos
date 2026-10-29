@@ -239,15 +239,20 @@ class TestViewerCreation(TempEnv):
 # ── C3 – AI hledání ──────────────────────────────────────────────────────────
 
 def _fake_search_window(records, query):
+    """Okno bez Qt widgetů: skutečné metody filtrování/hledání MainWindow nad falešnou mřížkou."""
     shown = []
     fake = types.SimpleNamespace(
-        _search_query=query,
-        _all_records=list(records),
+        _search_query=query, _search_result=None, _search_sort_override=False,
+        _current_filter="all", _current_sort="date_desc",
+        _all_records=list(records), _trash_records=[],
         _filtered_records=list(records),
         grid_view=types.SimpleNamespace(photo_model=types.SimpleNamespace(
-            set_records=lambda recs: shown.append(list(recs)))),
+            set_records=lambda recs, possible=(): shown.append((list(recs), set(possible))))),
         lbl_photo_count=types.SimpleNamespace(setText=lambda t: shown.append(t)),
+        _sync_memory_card=lambda: None,
     )
+    for name in ("_collection_records", "_sorted", "_apply_filter_and_sort", "_count_text"):
+        setattr(fake, name, getattr(MainWindow, name).__get__(fake))
     return fake, shown
 
 
@@ -269,23 +274,47 @@ class TestSearchResults(unittest.TestCase):
         got = main.order_records_by_ids(self.RECORDS, [3, 1, 3])
         self.assertEqual([r[0] for r in got], [3, 1])
 
-    def test_on_search_results_shows_hits(self):
-        """Celý slot: (id, skóre) -> položky v mřížce seřazené podle relevance."""
+    def test_on_search_results_shows_tiers(self):
+        """Celý slot: jisté shody, pak možné – v pořadí relevance, možné označené pro závoj."""
         fake, shown = _fake_search_window(self.RECORDS, "pes")
+        MainWindow._on_search_results(fake, main.search_engine.SearchResult("pes", [4, 2], [1], [], True), "pes")
+        self.assertEqual([r[0] for r in fake._filtered_records], [4, 2, 1])
+        self.assertEqual(shown[0][1], {1})
+        self.assertIn("2 shody · 1 možných", shown[1])
+
+    def test_legacy_tuple_results_still_accepted(self):
+        fake, _ = _fake_search_window(self.RECORDS, "pes")
         MainWindow._on_search_results(fake, [(4, 0.8), (2, 0.6)], "pes")
         self.assertEqual([r[0] for r in fake._filtered_records], [4, 2])
-        self.assertEqual([r[0] for r in shown[0]], [4, 2])
 
     def test_stale_results_ignored(self):
         fake, shown = _fake_search_window(self.RECORDS, "kočka")
-        MainWindow._on_search_results(fake, [(4, 0.8)], "pes")
+        MainWindow._on_search_results(fake, main.search_engine.SearchResult("pes", [4], [], [], True), "pes")
         self.assertEqual(shown, [])
 
     def test_empty_results_clear_filtered_records(self):
         """Prázdný výsledek nesmí nechat staré záznamy (dvojklik by otevřel jinou fotku)."""
-        fake, _ = _fake_search_window(self.RECORDS, "pes")
-        MainWindow._on_search_results(fake, [], "pes")
+        fake, shown = _fake_search_window(self.RECORDS, "pes")
+        MainWindow._on_search_results(fake, main.search_engine.SearchResult("pes", [], [], [], True), "pes")
         self.assertEqual(fake._filtered_records, [])
+        self.assertEqual(shown[-1], "Nic neodpovídá „pes“")
+
+    def test_sort_change_keeps_search_results(self):
+        """Dřív změna řazení během hledání přefiltrovala mřížku podle NÁZVU SOUBORU -> prázdno."""
+        fake, _ = _fake_search_window(self.RECORDS, "pes")
+        MainWindow._on_search_results(fake, main.search_engine.SearchResult("pes", [4, 2], [], [], True), "pes")
+        fake._current_sort = "date_asc"
+        fake._search_sort_override = True
+        fake._apply_filter_and_sort()
+        self.assertEqual(sorted(r[0] for r in fake._filtered_records), [2, 4])
+
+    def test_results_respect_active_collection(self):
+        """Hledání v Oblíbených nesmí ukázat neoblíbené fotky z knihovny."""
+        recs = [r[:7] + ((1,) if r[0] == 2 else (0,)) for r in self.RECORDS]
+        fake, _ = _fake_search_window(recs, "pes")
+        fake._current_filter = "favorites"
+        MainWindow._on_search_results(fake, main.search_engine.SearchResult("pes", [4, 2], [], [], True), "pes")
+        self.assertEqual([r[0] for r in fake._filtered_records], [2])
 
 
 @unittest.skipUnless(HAS_QT, "Qt není dostupné")
@@ -295,8 +324,9 @@ class TestSearchWorkerLifetime(unittest.TestCase):
     def test_overlapping_searches_keep_workers_alive(self):
         fake = types.SimpleNamespace(
             _search_query="les", _search_workers=set(),
-            _embeddings_cache={1: b"neplatny"},     # nevalidní -> search_by_text vrátí [] bez modelu
+            _embeddings_cache={1: b"neplatny"},     # nevalidní -> obraz nic nevrátí, model netřeba
             _apply_filter_and_sort=lambda: None,
+            _collection_records=lambda: [],
         )
         results = []
         fake._on_search_results = lambda res, q: results.append((res, q))
@@ -323,9 +353,12 @@ class TestSearchWorkerLifetime(unittest.TestCase):
         got = []
         w.search_finished.connect(lambda res, q: got.append((res, q)),
                                   Qt.ConnectionType.DirectConnection)
-        with mock.patch.object(main, "search_by_text", side_effect=OSError("HF Hub offline")):
+        with mock.patch.object(main.search_engine, "run_search", side_effect=OSError("HF Hub offline")):
             w.run()                                         # přímo, ať je výjimka vidět v testu
-        self.assertEqual(got, [([], "pes")])
+        self.assertEqual(len(got), 1)
+        result, query = got[0]
+        self.assertEqual(query, "pes")
+        self.assertTrue(result.is_empty())
 
 
 # ── C4 – zrušení importu ─────────────────────────────────────────────────────

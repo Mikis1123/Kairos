@@ -207,62 +207,32 @@ def _rebuild_vector_index(photo_embeddings_dict):
     }
 
 
-# ZÁLOHA (bez banky pojmů – viz select_calibrated níže, který se používá přednostně).
-# Práh relevance CLIP (text multilingual-v1 × obraz ViT-B-32). Kosinová podobnost textu a fotky
-# leží pro celou knihovnu v úzkém pásmu ~0,15–0,32: nesouvisející fotky mají ~0,18–0,22, skutečné
-# shody ~0,25+. Starý práh (0,18 a 75 % nejlepší) proto pouštěl skoro celou knihovnu.
-# Fotka projde, jen když splní VŠECHNY podmínky:
-#   1) absolutní minimum SEARCH_ABS_MIN,
-#   2) vyčnívá z rozložení skóre dotazu v knihovně (průměr + SEARCH_Z_STRICT × směrodatná odchylka),
-#   3) je v pásmu SEARCH_TOP_BAND od nejlepší shody.
-# Adaptivní záloha: když přísné podmínky nesplní nic, ale nejlepší fotky výrazně vyčnívají
-# (z ≥ SEARCH_Z_FALLBACK nad SEARCH_SOFT_MIN), vrátí se těch pár nejlepších. Jinak prázdný výsledek.
-SEARCH_ABS_MIN = 0.235
-SEARCH_SOFT_MIN = 0.215
-SEARCH_Z_STRICT = 1.6
-SEARCH_Z_FALLBACK = 2.6
-SEARCH_TOP_BAND = 0.045
-SEARCH_FALLBACK_MAX = 12
-SEARCH_MIN_STATS = 24          # pod tolik fotkami je rozptyl nespolehlivý -> jen absolutní práh a pásmo
+# ── Hledání 2.0: řazení obrazem ve dvou pásmech (search_engine.run_search) ────────
+# Každá fotka se porovná sama se sebou: z_obraz = jak moc dotaz vyčnívá z podobností fotky k bance
+# běžných pojmů (CONCEPT_BANK) – „hub“ (fotka podobná čemukoli) tak nepřeskočí skutečné shody.
+# z_knihovna = jak moc fotka vyčnívá v rámci celé knihovny. Řadí se podle z_obraz + z_knihovna.
+#
+# Dřívější výběr měl jednu tvrdou hranu („nejlepší pod z 2,7 = nic“) a „voda“ s nejlepším z 2,61
+# vracela nulu. Teď žádná hrana mezi „něco“ a „nic“ není: jisté shody jsou pásmo nad
+# SEARCH_Z_CONFIDENT, možné shody pásmo nad SEARCH_Z_POSSIBLE. Prázdno jen když nic v knihovně
+# nedosáhne SEARCH_Z_SHOW (nic nevyčnívá) – pak to UI řekne rovnou.
+#
+# Prahy laděné proti zlaté sadě eval/search_golden.json (45 dotazů, 152 viditelných položek):
+# R@20 0,85, P@10 0,84 jen obrazem; jisté pásmo bez jediné falešné shody u 8 nepřítomných
+# pojmů; polovina nepřítomných pojmů prázdná. Ověřit znovu: python eval/eval_search.py
+SEARCH_Z_CONFIDENT = 2.6
+SEARCH_Z_LIB_CONFIDENT = 1.0
+SEARCH_Z_POSSIBLE = 1.2
+SEARCH_Z_SHOW = 1.8
+SEARCH_POSSIBLE_MAX = 24
+SEARCH_LIB_WEIGHT = 1.0          # váha z_knihovna v řazení
+SEARCH_FACE_BONUS = 0.5          # „lidi u jezera“: rozpoznaná tvář řadí výš
+SEARCH_MIN_STATS = 24            # pod tolik položkami je rozptyl knihovny nespolehlivý
+# Kalibrováno na ~150–300 položkách. Ve větší knihovně překročí pevný práh náhodou víc fotek
+# (maximum šumu roste s počtem) -> prahy mírně rostou s log10 velikosti (10 000 fotek: +0,38).
+SEARCH_CALIBRATED_N = 300
+SEARCH_Z_PER_DECADE = 0.25
 
-
-def select_relevant(scores, abs_min=SEARCH_ABS_MIN, soft_min=SEARCH_SOFT_MIN, z_strict=SEARCH_Z_STRICT,
-                    z_fallback=SEARCH_Z_FALLBACK, top_band=SEARCH_TOP_BAND, fallback_max=SEARCH_FALLBACK_MAX):
-    """Indexy relevantních skóre od nejlepšího (viz komentář u SEARCH_ABS_MIN)."""
-    scores = np.asarray(scores, dtype=np.float32)
-    if scores.size == 0 or not np.all(np.isfinite(scores)):
-        return []
-    order = np.argsort(-scores, kind="stable")
-    top = float(scores[order[0]])
-    use_stats = scores.size >= SEARCH_MIN_STATS
-    mu = float(scores.mean()) if use_stats else 0.0
-    sd = float(scores.std()) if use_stats else 0.0
-    if use_stats and sd < 1e-6:
-        return []                                   # všechny fotky stejně (ne)podobné = nic nevyčnívá
-    cutoff = max(abs_min, top - top_band)
-    if use_stats:
-        cutoff = max(cutoff, mu + z_strict * sd)
-    hits = [int(i) for i in order if scores[i] >= cutoff]
-    if hits:
-        return hits
-    # záloha jen s důkazem z rozložení – v malé knihovně nejde poznat, zda 0,22 „vyčnívá“
-    if not use_stats or top < soft_min or (top - mu) / sd < z_fallback:
-        return []
-    soft_cut = max(soft_min, top - top_band / 2, mu + z_fallback * sd)
-    return [int(i) for i in order[:fallback_max] if scores[i] >= soft_cut]
-
-
-# ── Kalibrace na obraz (hubness) ──────────────────────────────────────────────
-# Změřeno na skutečné knihovně (277 fotek z výletu): globální práh nemůže fungovat. Některé fotky
-# („huby“ – např. jezero s nebem) mají vysokou podobnost s ČÍMKOLI; „pes“, „letadlo“, „slon“
-# i „les“ končí se skóre 0,24–0,26 a z knihovny vyčnívají stejně (z ≈ 2,3–3,7). Starý výběr
-# proto vracel 5–17 fotek i pro pojmy, které v knihovně vůbec nejsou.
-# Řešení: každou fotku porovnat s ní samotnou. Pro fotku se spočte rozložení podobností k bance
-# běžných pojmů (CONCEPT_BANK); dotaz je shoda, jen když z tohoto rozložení vyčnívá
-# (z_obraz ≥ SEARCH_Z_IMAGE) – hub má vysoké skóre ke všem pojmům, takže ho „pes“ nepřeskočí.
-# Navíc musí být nad průměrem knihovny (SEARCH_Z_LIBRARY) a nejlepší shoda musí být jistá
-# (SEARCH_Z_IMAGE_TOP), jinak je výsledek PRÁZDNÝ. Výsledek se řadí podle z_obraz.
-# Na knihovně: nepřítomné pojmy 19/19 -> 4/19 s výsledkem, přítomné nalezeny 13/16.
 CONCEPT_BANK = (
     "pes kočka kůň kráva pták ryba hmyz auto autobus vlak letadlo loď kolo motorka silnice most "
     "budova dům město ulice kostel hrad zámek věž zeď okno dveře pokoj kuchyně postel stůl židle "
@@ -272,14 +242,6 @@ CONCEPT_BANK = (
     "slunce noc sníh led déšť oheň světlo tma fotbal sport hudba koncert oslava "
     "obraz socha muzeum obchod restaurace kancelář škola nemocnice letiště nádraží stan "
     "dřevo kov sklo plast hračka zbraň peníze text dokument").split() + ["západ slunce", "snímek obrazovky"]
-SEARCH_Z_IMAGE = 2.5
-SEARCH_Z_IMAGE_TOP = 2.7
-SEARCH_Z_LIBRARY = 1.0
-SEARCH_RAW_FLOOR = 0.20
-# Kalibrováno na 277 fotkách. Ve větší knihovně překročí pevný práh náhodou víc fotek
-# (maximum šumu roste s počtem) -> prahy mírně rostou s log10 velikosti (10 000 fotek: +0,38).
-SEARCH_CALIBRATED_N = 300
-SEARCH_Z_PER_DECADE = 0.25
 
 _bank_cache = {"model": None, "vectors": None}
 
@@ -309,38 +271,48 @@ def image_concept_stats(matrix, bank):
     return mu.astype(np.float32), sd.astype(np.float32)
 
 
-def select_calibrated(scores, img_mu, img_sd, z_image=SEARCH_Z_IMAGE, z_top=SEARCH_Z_IMAGE_TOP,
-                      z_library=SEARCH_Z_LIBRARY, raw_floor=SEARCH_RAW_FLOOR):
-    """Indexy shod podle z-skóre vůči vlastní bance pojmů fotky (od nejjistější); prázdný
-    seznam, když ani nejlepší kandidát nedosáhne z_top."""
-    scores = np.asarray(scores, dtype=np.float32)
-    if scores.size == 0 or not np.all(np.isfinite(scores)):
-        return []
-    grow = SEARCH_Z_PER_DECADE * max(0.0, math.log10(scores.size / SEARCH_CALIBRATED_N))
-    z_image, z_top = z_image + grow, z_top + grow
-    zi = (scores - img_mu) / img_sd
-    ok = (zi >= z_image) & (scores >= raw_floor)
-    if scores.size >= SEARCH_MIN_STATS:
-        sd = float(scores.std())
-        if sd < 1e-6:
-            return []
-        ok &= (scores - float(scores.mean())) / sd >= z_library
-    if not ok.any() or float(zi[ok].max()) < z_top:
-        return []                               # žádná jistá shoda = prázdný výsledek, ne šum
-    hits = np.flatnonzero(ok)
-    return [int(i) for i in hits[np.argsort(-zi[hits], kind="stable")]]
+def tier_scores(zi, zl, key, n_library):
+    """Indexy (jisté, možné) od nejlepšího. zi = z vůči bance pojmů fotky, zl = z v knihovně
+    (None u malé knihovny), key = pořadí. Prázdné obojí = nic nevyčnívá (viz SEARCH_Z_SHOW)."""
+    zi = np.asarray(zi, dtype=np.float32)
+    if zi.size == 0 or not np.all(np.isfinite(zi)):
+        return [], []
+    grow = SEARCH_Z_PER_DECADE * max(0.0, math.log10(max(1, n_library) / SEARCH_CALIBRATED_N))
+    if float(zi.max()) < SEARCH_Z_SHOW + grow:
+        return [], []
+    lib_ok = np.ones_like(zi, dtype=bool) if zl is None else zl >= SEARCH_Z_LIB_CONFIDENT
+    possible_ok = np.ones_like(zi, dtype=bool) if zl is None else zl >= 0.0
+    order = np.argsort(-np.asarray(key, dtype=np.float32), kind="stable")
+    confident = [int(i) for i in order if zi[i] >= SEARCH_Z_CONFIDENT + grow and lib_ok[i]]
+    taken = set(confident)
+    possible = [int(i) for i in order
+                if i not in taken and zi[i] >= SEARCH_Z_POSSIBLE + grow and possible_ok[i]]
+    return confident, possible[:SEARCH_POSSIBLE_MAX]
 
 
-def search_by_text(query_text, photo_embeddings_dict, **thresholds):
-    """
-    MODUL 1.2: Sémantické vyhledávání – skalární součin přes celou knihovnu (< 2 ms / 10 000 fotek),
-    výběr podle kalibrace na obraz (select_calibrated); bez použitelné banky pojmů záloha
-    select_relevant. Vrací [(media_id, skóre), ...] od nejlepší.
-    """
-    query_text = str(query_text or "").strip()
-    if not query_text or not photo_embeddings_dict:
-        return []
+def query_vector(text, text_model):
+    """Soubor (ensemble) vektorů dotazu: původní text + anglický protějšek ze slovníku
+    (search_lexicon) – „les“ je pro model i francouzský člen, „forest“ ne. None = vadný výstup."""
+    from search_engine import fold, _same_word
+    from search_lexicon import english_for
+    words = str(text).split()
+    texts = [text]
+    english = english_for(words, fold, _same_word)
+    if english:
+        texts.append(english)
+    vecs = np.asarray(text_model.encode(texts, convert_to_numpy=True, show_progress_bar=False),
+                      dtype=np.float32)
+    if vecs.ndim == 1:                                  # model vrátil jeden vektor (mock)
+        vecs = vecs[None, :]
+    if not np.all(np.isfinite(vecs)):
+        return None
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    vec = (vecs / np.where(norms > 0, norms, 1.0)).mean(axis=0)
+    n = np.linalg.norm(vec)
+    return vec / n if n > 0 else None
 
+
+def _index_for(photo_embeddings_dict):
     with _index_lock:
         # klíč i podle identity slovníku: po načtení embeddingů se stejným počtem (jedna fotka
         # smazaná, jiná přidaná) by jinak hledání vracelo id ze staré matice
@@ -349,30 +321,60 @@ def search_by_text(query_text, photo_embeddings_dict, **thresholds):
                 or _cached_index_state["matrix"] is None):
             _rebuild_vector_index(photo_embeddings_dict)
             _cached_index_state["source"] = photo_embeddings_dict
-        state = dict(_cached_index_state)   # lokální snímek, ať ho jiné vlákno nepřepíše
+        return dict(_cached_index_state)   # lokální snímek, ať ho jiné vlákno nepřepíše
 
-    matrix = state["matrix"]
-    media_ids = state["media_ids"]
-    if matrix is None or len(media_ids) == 0:
-        return []
 
+def rank_semantic(text, pool_ids, photo_embeddings_dict, face_ids=None):
+    """Obrazové řazení dotazu v rámci pool_ids (aktuální kolekce / výsledek fazet).
+    Statistiky (z_knihovna, kalibrace) jsou přes celou knihovnu, výběr jen z poolu.
+    Vrací (jisté, možné) – seznamy media_id od nejlepšího."""
+    text = str(text or "").strip()
+    if not text or not photo_embeddings_dict:
+        return [], []
+    state = _index_for(photo_embeddings_dict)
+    matrix, media_ids = state["matrix"], state["media_ids"]
+    if matrix is None or not media_ids:
+        return [], []
     text_model = get_text_model()
-    q_vec = text_model.encode(query_text, convert_to_numpy=True, show_progress_bar=False)
-    q_vec = np.asarray(q_vec, dtype=np.float32).flatten()
-    if q_vec.size != matrix.shape[1] or not np.all(np.isfinite(q_vec)):
-        return []                       # jiný model / poškozený výstup: žádné NaN skóre ani pád np.dot
-    q_norm = np.linalg.norm(q_vec)
-    if q_norm > 0:
-        q_vec = q_vec / q_norm
+    q_vec = query_vector(text, text_model)
+    if q_vec is None or q_vec.size != matrix.shape[1]:
+        return [], []                   # jiný model / poškozený výstup: žádné NaN skóre ani pád np.dot
 
-    # Skóre celé knihovny (ne jen top-k z FAISS): adaptivní práh potřebuje rozložení všech skóre
-    scores = np.dot(matrix, q_vec)
+    scores = matrix @ q_vec
+    pool = set(pool_ids) if pool_ids is not None else None
+    rows = np.array([i for i, m in enumerate(media_ids) if pool is None or m in pool], dtype=np.int64)
+    if rows.size == 0:
+        return [], []
+    n = len(media_ids)
+    zl_all = None
+    if n >= SEARCH_MIN_STATS:
+        sd = float(scores.std())
+        if sd < 1e-6:
+            return [], []                               # všechny fotky stejně (ne)podobné = nic nevyčnívá
+        zl_all = (scores - float(scores.mean())) / sd
     stats = _image_stats(matrix, text_model)
-    if stats is not None and not thresholds:
-        picked = select_calibrated(scores, *stats)
+    if stats is not None:
+        zi_all = (scores - stats[0]) / stats[1]
+    elif zl_all is not None:
+        zi_all = zl_all                                 # bez banky pojmů (mock model): jen knihovna
     else:
-        picked = select_relevant(scores, **thresholds)
-    return [(media_ids[i], float(scores[i])) for i in picked]
+        return [], []
+    zi, zl = zi_all[rows], (zl_all[rows] if zl_all is not None else None)
+    key = zi + (SEARCH_LIB_WEIGHT * zl if zl is not None else 0.0)
+    if face_ids:
+        key = key + SEARCH_FACE_BONUS * np.array([media_ids[i] in face_ids for i in rows], dtype=np.float32)
+    confident, possible = tier_scores(zi, zl, key, n)
+    return [media_ids[rows[i]] for i in confident], [media_ids[rows[i]] for i in possible]
+
+
+def search_by_text(query_text, photo_embeddings_dict):
+    """Obrazové hledání v celé knihovně: [(media_id, skóre), ...] – jisté shody, pak možné.
+    (Aplikace hledá přes search_engine.run_search; tohle je jednoduché rozhraní pro skripty.)"""
+    query_text = str(query_text or "").strip()
+    if not query_text or not photo_embeddings_dict:
+        return []
+    confident, possible = rank_semantic(query_text, None, photo_embeddings_dict)
+    return [(m, 1.0) for m in confident] + [(m, 0.5) for m in possible]
 
 
 def _image_stats(matrix, text_model):

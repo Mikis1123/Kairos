@@ -14,7 +14,10 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from viewer_hud import (MediaCanvas, GlassPanel, HudIconButton, HudAutoHider, VIDEO_REVEAL_DELAY_MS,
                         load_image_file, ImagePipeline, VideoScrubber, quiet_ffmpeg_logs,
                         quiet_qt_ffmpeg_noise)
+import governor
+import perf_profile
 import scrub_strip
+import video_proxy
 import viewer_motion
 from ui_sheets import InWindowDialog   # Kairos: dotazy jako list v okně
 import tokens
@@ -318,7 +321,7 @@ class MediaViewerWidget(QWidget):
         self._strip_timer = QTimer(self)          # pás až po rozjezdu videa (nebrzdit 1. snímek)
         self._strip_timer.setSingleShot(True)
         self._strip_timer.setInterval(STRIP_START_DELAY_MS)
-        self._strip_timer.timeout.connect(self._request_strip)
+        self._strip_timer.timeout.connect(lambda: self._request_strip(priority=False))
         self._reveal_after_scrub = False
         quiet_ffmpeg_logs()
         quiet_qt_ffmpeg_noise()
@@ -635,6 +638,8 @@ class MediaViewerWidget(QWidget):
 
     def _on_playback_state(self, state):
         self._sync_play_icon()
+        # přehrávání = práce na pozadí stojí (démon, pás, proxy) – video má celé GPU i CPU
+        governor.get().set_active("video", state == QMediaPlayer.PlaybackState.PlayingState)
         # Během přehrávání se nepřednačítá (výměna zdroje stojí ~100 ms+ GUI vlákna = trhnutí).
         # Pauza není ustálení: uživatel často hned pokračuje nebo táhne časovou osu (scrubber sám
         # pozastavuje) – dřív setSource souseda padl 400 ms po pauze přímo doprostřed tažení /
@@ -679,14 +684,15 @@ class MediaViewerWidget(QWidget):
             return True
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             return False
+        source = self._playback_path(path)
         if self.player.source().toLocalFile() and os.path.normcase(
-                self.player.source().toLocalFile()) == os.path.normcase(path):
+                self.player.source().toLocalFile()) == os.path.normcase(source):
             return False                       # už je v aktivním přehrávači
         spare = self._players[1 - self._active]
         self._audios[1 - self._active].setMuted(True)   # zvuk až po prohození
         self._preloaded_path = path
         self._preload_ready = False
-        spare.setSource(QUrl.fromLocalFile(path))
+        spare.setSource(QUrl.fromLocalFile(source))
         spare.pause()
         return True
 
@@ -1023,7 +1029,7 @@ class MediaViewerWidget(QWidget):
             return                                   # mezitím jiná položka
         item = self.media_list[self.current_index]
         if self._is_video:
-            self._strip_timer.start()                # náhledový pás na pozadí (Patch 14)
+            self._strip_timer.start()                # náhledový pás – odložený, viz _request_strip
             self._awaiting_first_video_frame = True
             if self._preloaded_path and os.path.normcase(self._preloaded_path) == os.path.normcase(item[2]):
                 if self._swap_to_preloaded():
@@ -1032,12 +1038,23 @@ class MediaViewerWidget(QWidget):
                     gen = self._media_gen
                     QTimer.singleShot(VIDEO_REVEAL_DELAY_MS, lambda: self._reveal_video(gen))
             else:
-                self.player.setSource(QUrl.fromLocalFile(item[2]))
+                self.player.setSource(QUrl.fromLocalFile(self._playback_path(item[2])))
             self.player.setPlaybackRate(self.playback_speeds[self.current_speed_idx])
             self.player.play()
         elif self._is_live:
             self.player.setSource(QUrl.fromLocalFile(item[4]))
             self.player.setPlaybackRate(1.0)
+
+    @staticmethod
+    def _playback_path(path):
+        """Co přehrát: originál (HW dekódování), na slabším PC (perf_profile.proxy_playback)
+        hotovou 1080p SDR proxy 4K / HDR videa – plynulé přehrávání i bez výkonné grafiky."""
+        if path and perf_profile.current().proxy_playback:
+            proxy = video_proxy.get_proxy(path)
+            if proxy:
+                video_proxy.touch(proxy)
+                return proxy
+        return path
 
     def _display_size(self):
         screen = self.screen() or QApplication.primaryScreen()
@@ -1088,6 +1105,7 @@ class MediaViewerWidget(QWidget):
         self._awaiting_first_video_frame = False
         if self.player:
             self.player.stop()
+        governor.get().set_active("video", False)
         self.canvas.show_video(False)
         self.btn_live.setChecked(False)
 
@@ -1182,10 +1200,13 @@ class MediaViewerWidget(QWidget):
             return self.media_list[self.current_index][2]
         return None
 
-    def _request_strip(self):
+    def _request_strip(self, priority=True):
+        """priority=False (po spuštění videa): pás počká na klid a během přehrávání stojí –
+        dřív tu 0,7 s po startu běželo druhé dekódování téhož 4K HDR videa a video se trhalo.
+        Tažení časové osy žádá s prioritou (a rozpracovaný pás povýší)."""
         path = self._current_video_path()
         if path:
-            self._strips.request(path)
+            self._strips.request(path, priority=priority)
 
     def _show_strip_frame(self, pos):
         """preview_fn scrubberu: True, když pás má pro pozici snímek a ukázal se."""

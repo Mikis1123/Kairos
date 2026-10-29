@@ -59,7 +59,7 @@ class TestGridTileCache(unittest.TestCase):
 
     def test_badge_shade_is_part_of_the_cache_key(self):
         self.paint()
-        shades = {k[4] for k in self.d._tiles}
+        shades = {k[4][:2] for k in self.d._tiles}     # (ztmavení odznaku, oblíbená); [2] = závoj hledání
         self.assertIn((False, False), shades)
         self.assertIn((True, False), shades, "Live Photo: ztmavení pod odznakem")
         self.assertIn((False, True), shades, "oblíbená: ztmavení pod srdcem")

@@ -343,16 +343,22 @@ class TestCalibratedSearch(unittest.TestCase):
         model, dog, imgs = self.library()
         for i, w in ((10, 0.45), (20, 0.6), (30, 0.75)):
             imgs[i] = self._unit(0.25 * self.common + w * dog + 0.7 * imgs[i])
-        hits = self.search(model, imgs, "pes")
-        self.assertEqual(hits, [31, 21, 11], "jen psi, nejjistější první – hub ne")
+        emb = {i + 1: ai_engine.encode_embedding(v) for i, v in enumerate(imgs)}
+        with mock.patch.object(ai_engine, "get_text_model", return_value=model):
+            confident, possible = ai_engine.rank_semantic("pes", None, emb)
+        self.assertEqual(confident, [31, 21], "silní psi jistě, nejjistější první")
+        self.assertEqual((confident + possible)[:3], [31, 21, 11], "slabý pes vede možné shody")
+        self.assertNotIn(1, confident + possible, "hub (podobný všemu) ani mezi možnými")
 
-    def test_top_gate(self):
-        scores = np.array([0.30, 0.21, 0.20], dtype=np.float32)
-        mu = np.array([0.20, 0.20, 0.20], dtype=np.float32)
-        sd = np.array([0.04, 0.02, 0.02], dtype=np.float32)       # z = 2,5 / 0,5 / 0
-        self.assertEqual(ai_engine.select_calibrated(scores, mu, sd), [], "nejlepší pod z_top = nic")
-        sd[0] = 0.03                                                  # z = 3,3
-        self.assertEqual(ai_engine.select_calibrated(scores, mu, sd), [0])
+    def test_no_cliff_between_something_and_nothing(self):
+        """Dřív: nejlepší z 2,61 pod hranou 2,7 = NIC („voda“). Teď pásma: nad SHOW se něco ukáže."""
+        zi = np.array([2.61, 2.0, 0.3], dtype=np.float32)
+        zl = np.array([2.0, 1.5, -0.5], dtype=np.float32)
+        confident, possible = ai_engine.tier_scores(zi, zl, zi + zl, 152)
+        self.assertEqual(confident, [0])
+        self.assertEqual(possible, [1])
+        nothing = ai_engine.tier_scores(np.array([1.5, 1.0], np.float32), None, np.array([1.5, 1.0]), 152)
+        self.assertEqual(nothing, ([], []), "nic nevyčnívá nad SEARCH_Z_SHOW = prázdno")
 
     def test_degenerate_bank_falls_back_to_library_threshold(self):
         self.assertIsNone(ai_engine.image_concept_stats(np.ones((3, 4), np.float32), np.ones((5, 4), np.float32)))

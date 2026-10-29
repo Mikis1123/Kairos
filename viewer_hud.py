@@ -32,6 +32,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 
+import frame_meter
+
 HUD_HIDE_DELAY_MS = 2000
 HUD_FADE_MS = 220
 SLIDE_INTERVAL_MS = 4000
@@ -72,6 +74,11 @@ def _make_quick_video(parent):
         if output is None:
             raise RuntimeError("VideoOutput nenalezen")
         spare = root.findChild(QObject, "video2")
+        # Fáze 0: skutečně vykreslené snímky videa (QQuickWidget kreslí v GUI vlákně)
+        window = surface.quickWindow()
+        if window is not None:
+            window.afterRendering.connect(lambda: frame_meter.tick("video"),
+                                          Qt.ConnectionType.DirectConnection)
         return surface, [output] + ([spare] if spare is not None else [])
     except Exception as e:
         if surface is not None:
@@ -153,6 +160,10 @@ class MediaCanvas(QGraphicsView):
         self._refit_timer.setSingleShot(True)
         self._refit_timer.setInterval(SMOOTH_REFIT_MS)
         self._refit_timer.timeout.connect(self._refit_smooth)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        frame_meter.tick("viewer")              # Fáze 0: doba snímku prohlížeče (Ctrl+Shift+F)
 
     # obraz
     def current_pixmap(self):

@@ -204,6 +204,14 @@ def init_db():
             ("tint_source", "TEXT"),
         ])
 
+        # Původ embeddingu (EMBEDDING_SIG_SQL položky, ze které vznikl). NULL nebo jiný podpis =
+        # embedding nepatří k aktuálnímu souboru -> přepočítá ho démon (refresh_embeddings).
+        # Starší knihovny měly embeddingy fotek posunuté o desítky id (re-import pod novým id)
+        # a hledání tak porovnávalo dotaz s obsahem JINÉ fotky.
+        _ensure_columns(cursor, "image_embeddings", [
+            ("source_sig", "TEXT"),
+        ])
+
         _ensure_columns(cursor, "people", [
             ("key_face_id", "INTEGER"),
             ("is_favorite", "INTEGER DEFAULT 0"),
@@ -466,14 +474,36 @@ def toggle_favorite(media_id):
     return int(row[0]) if row and row[0] else 0
 
 
-def save_image_embedding(media_id, embedding_bytes):
-    """Uloží nebo přepíše embedding v bezpečné transakci."""
+# Podpis souboru, ze kterého embedding vznikl: cesta | velikost | mtime (v sekundách)
+EMBEDDING_SIG_SQL = ("COALESCE(m.file_path, '') || '|' || COALESCE(m.file_size, '') || '|' || "
+                     "COALESCE(CAST(m.file_mtime AS INTEGER), '')")
+
+
+def save_image_embedding(media_id, embedding_bytes, source_sig=None):
+    """Uloží nebo přepíše embedding v bezpečné transakci (s podpisem zdroje, je-li znám)."""
     with db_transaction() as conn:
         c = conn.cursor()
         c.execute("""
-            INSERT OR REPLACE INTO image_embeddings (media_id, embedding)
-            VALUES (?, ?)
-        """, (media_id, embedding_bytes))
+            INSERT OR REPLACE INTO image_embeddings (media_id, embedding, source_sig)
+            VALUES (?, ?, ?)
+        """, (media_id, embedding_bytes, source_sig))
+
+
+def get_media_needing_embedding():
+    """[(id, file_path, thumbnail_path, media_type, podpis)] položek bez platného embeddingu:
+    chybí, nemá podpis (starší verze – může patřit jiné fotce), nebo je ze starší verze souboru.
+    Bez pohybových videí Live Photos (patří k fotce, hledání je nevidí); i koš (hledá se v něm)."""
+    conn = get_connection()
+    try:
+        return conn.execute(f"""
+            SELECT m.id, m.file_path, m.thumbnail_path, m.media_type, {EMBEDDING_SIG_SQL}
+            FROM media_items m LEFT JOIN image_embeddings e ON e.media_id = m.id
+            WHERE NOT EXISTS (SELECT 1 FROM media_items lp WHERE lp.paired_video_path = m.file_path)
+              AND (e.media_id IS NULL OR e.source_sig IS NULL OR e.source_sig != {EMBEDDING_SIG_SQL})
+            ORDER BY m.date_taken DESC, m.id DESC
+        """).fetchall()
+    finally:
+        conn.close()
 
 
 def get_all_embeddings():
