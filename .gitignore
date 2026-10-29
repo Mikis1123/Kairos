@@ -24,3 +24,6 @@ models/
 
 # Diagnostika výkonu (frametime logy)
 perf_logs/
+
+# Denní zálohy knihovny (database.backup_database)
+backups/

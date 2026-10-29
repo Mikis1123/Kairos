@@ -22,6 +22,7 @@ _preview_tmp = tempfile.mkdtemp(prefix="omni_test_previews_")
 paths.PREVIEW_DIR = _preview_tmp
 paths.WEB_CACHE_DIR = os.path.join(_preview_tmp, "web")      # HTTP cache mapy (Patch 11)
 paths.PROXY_DIR = os.path.join(_preview_tmp, "proxies")      # proxy videí (Fáze 1)
+paths.BACKUP_DIR = os.path.join(_preview_tmp, "backups")     # denní zálohy DB (Sprint R)
 atexit.register(shutil.rmtree, _preview_tmp, True)
 
 # Patch 11: ani config.json aplikace – load_config() jinak při chybějícím souboru sáhl na

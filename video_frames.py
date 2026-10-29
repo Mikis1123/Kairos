@@ -14,6 +14,8 @@ pro index obsahu stačí a 4K HEVC se nedekóduje od začátku.
 import io
 import os
 import subprocess
+import threading
+import time
 
 import paths
 import video_proxy
@@ -47,8 +49,54 @@ def _vf(info, from_proxy):
             "zscale=t=bt709:m=bt709:r=tv,format=yuvj420p")
 
 
-def extract_frames(source, should_stop=None):
-    """[(čas ms, PIL.Image RGB), ...] z celého videa; [] když to nejde (žádný ffmpeg, vadný soubor)."""
+FRAME_TIMEOUT_S = 60             # čistý čas práce na jeden snímek (pozastavení se nepočítá)
+POLL_S = 0.05
+
+
+class Cancelled(Exception):
+    """should_stop() během získávání snímků (konec aplikace / restart démona)."""
+
+
+def _run_governed(cmd, flags, governor=None, should_stop=None):
+    """ffmpeg jako u proxy: zaregistrovaný ve strážci (během přehrávání / gest stojí na úrovni
+    systému), zrušitelný a s vyprázdněnými rourami. Dřív subprocess.run blokoval démona až
+    60 s na snímek a o přehrávání nevěděl (Sprint R). Vrací stdout (bytes) nebo None."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            stdin=subprocess.DEVNULL, creationflags=flags)
+    if governor is not None:
+        governor.register_process(proc.pid)
+    else:
+        import governor as _gov
+        _gov.assign_to_job(proc.pid)
+    chunks = []
+    reader = threading.Thread(target=lambda: chunks.append(proc.stdout.read()), daemon=True)
+    reader.start()
+    worked, last = 0.0, time.monotonic()
+    try:
+        while proc.poll() is None:
+            if should_stop is not None and should_stop():
+                proc.kill()
+                proc.wait()
+                raise Cancelled()
+            time.sleep(POLL_S)
+            now = time.monotonic()
+            if governor is None or not governor.busy():
+                worked += now - last
+            last = now
+            if worked > FRAME_TIMEOUT_S:
+                proc.kill()
+                proc.wait()
+                return None
+    finally:
+        if governor is not None:
+            governor.unregister_process(proc.pid)
+    reader.join(5.0)
+    return chunks[0] if chunks else None
+
+
+def extract_frames(source, should_stop=None, governor=None):
+    """[(čas ms, PIL.Image RGB), ...] z celého videa; [] když to nejde (žádný ffmpeg, vadný soubor)
+    nebo když bylo zrušeno (should_stop). governor: ffmpeg se během interakce pozastaví."""
     if not source or not os.path.exists(source) or not os.path.exists(paths.FFMPEG_PATH):
         return []
     from PIL import Image
@@ -66,8 +114,10 @@ def extract_frames(source, should_stop=None):
                "-ss", f"{ms / 1000:.3f}", "-i", src, "-map", "0:v:0", "-frames:v", "1",
                "-vf", _vf(info, bool(proxy)), "-c:v", "mjpeg", "-q:v", "3", "-f", "image2pipe", "-"]
         try:
-            data = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=flags).stdout
-        except (OSError, subprocess.TimeoutExpired):
+            data = _run_governed(cmd, flags, governor, should_stop)
+        except Cancelled:
+            return []
+        except OSError:
             continue
         if not data:
             continue

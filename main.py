@@ -308,12 +308,44 @@ def release_map_profile():
             sip.delete(profile)
 
 
+_parked_threads = []
+PARKED_THREAD_WAIT_MS = 20000
+
+
+def park_thread(thread):
+    """Vlákno, které při zavírání okna nestihlo doběhnout: bez rodiče (smazání okna ho nesmí
+    zrušit) a s odkazem tady, ať ho Python neuvolní. shutdown_app na něj počká."""
+    try:
+        thread.setParent(None)
+    except RuntimeError:
+        return
+    if thread not in _parked_threads:
+        _parked_threads.append(thread)
+
+
+def join_parked_threads(timeout_ms=PARKED_THREAD_WAIT_MS):
+    """Počká na odložená vlákna (sdílený limit). Vrací počet těch, která stále běží."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    alive = []
+    for thread in _parked_threads:
+        left = max(0, int((deadline - time.monotonic()) * 1000))
+        try:
+            if thread.isRunning() and not thread.wait(left):
+                alive.append(thread)
+        except RuntimeError:
+            continue
+    _parked_threads[:] = alive
+    return len(alive)
+
+
 def shutdown_app(app, window):
     """Deterministické pořadí úklidu po app.exec() – bez něj ruší Python obaly Qt objektů při
     ukončení interpretu v náhodném pořadí a asi každé třetí zavření aplikace skončilo pádem
     v sip (0xC0000005, naměřeno). Nejdřív okno (stránka mapy, přehrávače), pak globální
     filtr motivu, profil mapy a generátor náhledových pásů."""
     from PyQt6 import sip
+    if join_parked_threads():
+        print("[Shutdown] vlákno na pozadí nedoběhlo včas")
     if window is not None and not sip.isdeleted(window):
         window.deleteLater()
     # deleteLater se po skončení app.exec() samo neprovede – výslovně jen DeferredDelete
@@ -366,10 +398,28 @@ def map_web_profile():
 
 # ── P3.9 LRU cache ───────────────────────────────────────────────────────────
 
+def pixmap_bytes(pix):
+    """Paměť pixmapy v RAM (šířka × výška × bajty na pixel)."""
+    try:
+        return max(1, pix.width() * pix.height() * max(1, pix.depth() // 8))
+    except (AttributeError, RuntimeError):
+        return 1
+
+
+THUMB_RAM_BUDGET_MB = 384       # strop paměti miniatur v RAM (kromě počtu z Předvoleb)
+
+
 class LRUCache:
-    def __init__(self, capacity: int = 1200):
+    """LRU s limitem počtu a volitelně i bajtů (Sprint R: 1200 miniatur na displeji s DPR 2
+    je přes 1,5 GB – samotný počet paměť nehlídal). sizer(value) -> bajty."""
+
+    def __init__(self, capacity: int = 1200, max_bytes=None, sizer=None):
         self.cache = OrderedDict()
         self.capacity = max(64, int(capacity))
+        self.max_bytes = int(max_bytes) if max_bytes else None
+        self.sizer = sizer
+        self._sizes = {}
+        self.bytes = 0
 
     def get(self, key):
         if key not in self.cache:
@@ -378,18 +428,30 @@ class LRUCache:
         return self.cache[key]
 
     def put(self, key, value):
+        if key in self.cache:
+            self.bytes -= self._sizes.pop(key, 0)
         self.cache[key] = value
         self.cache.move_to_end(key)
-        if len(self.cache) > self.capacity:
-            self.cache.popitem(last=False)
+        if self.sizer is not None:
+            size = int(self.sizer(value))
+            self._sizes[key] = size
+            self.bytes += size
+        self._evict()
+
+    def _evict(self):
+        while len(self.cache) > self.capacity or (
+                self.max_bytes is not None and self.bytes > self.max_bytes and len(self.cache) > 1):
+            key, _ = self.cache.popitem(last=False)
+            self.bytes -= self._sizes.pop(key, 0)
 
     def clear(self):
         self.cache.clear()
+        self._sizes.clear()
+        self.bytes = 0
 
     def resize(self, new_capacity: int):
         self.capacity = max(64, int(new_capacity))
-        while len(self.cache) > self.capacity:
-            self.cache.popitem(last=False)
+        self._evict()
 
 
 # ── Thumbnail worker ──────────────────────────────────────────────────────────
@@ -465,7 +527,7 @@ class ApplePhotoModel(QAbstractListModel):
         self.records = []
         self.possible = set()
         self.id_to_row = {}
-        self.ram_cache = LRUCache(lru_capacity)
+        self.ram_cache = LRUCache(lru_capacity, max_bytes=THUMB_RAM_BUDGET_MB * 1024 * 1024, sizer=pixmap_bytes)
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(4)
         self.loading_ids = set()
@@ -1992,6 +2054,9 @@ class SearchModelWarmup(QThread):
 
 # ── Map bridge ────────────────────────────────────────────────────────────────
 
+MAP_HOLD_TTL_S = 20.0       # nejdelší pohyb kamery mapy bez nového hlášení
+
+
 class MapBridge(QObject):
     def __init__(self, main_window):
         super().__init__()
@@ -2003,9 +2068,17 @@ class MapBridge(QObject):
 
     @pyqtSlot(str, bool)
     def setInteraction(self, reason, active):
-        """Mapa hlásí pohyb kamery / běžící Cestu -> práce na pozadí počká (governor)."""
+        """Mapa hlásí pohyb kamery / běžící Cestu -> práce na pozadí počká (governor).
+        Pohyb kamery má pojistku: bez „konec“ se hold sám uvolní (dřív visel navždy, když
+        moveend přišel během Cesty, a démon pak do restartu stál)."""
         if reason in ("map", "journey"):
-            governor.get().set_active(reason, bool(active))
+            ttl = MAP_HOLD_TTL_S if reason == "map" else None
+            governor.get().set_active(reason, bool(active), ttl_s=ttl)
+
+    def release_all(self):
+        """Stránka mapy zmizela / načetla se znovu: její holdy neplatí."""
+        for reason in ("map", "journey"):
+            governor.get().set_active(reason, False)
 
     @pyqtSlot(str)
     def setMapLayer(self, name):
@@ -2038,10 +2111,12 @@ class MapBridge(QObject):
 # ── Background AI daemon ──────────────────────────────────────────────────────
 
 PROXY_WORK_SHARE = 0.8      # u videa s převodem: podíl práce na proxy (zbytek = náhledový pás)
+_housekeeping_done = False  # záloha + úklid jen při prvním průchodu démona za běh
 
 class BackgroundAIDaemon(QThread):
     people_updated     = pyqtSignal()
-    embeddings_updated = pyqtSignal()
+    embeddings_updated = pyqtSignal()          # vše znovu (migrace starého formátu)
+    embeddings_added   = pyqtSignal(list)      # jen tato id (průběžné doplňování)
     thumbs_repaired    = pyqtSignal()
     face_crops_repaired = pyqtSignal(int)
     status_changed     = pyqtSignal(str)
@@ -2069,8 +2144,26 @@ class BackgroundAIDaemon(QThread):
             self._last_status = now
             self.status_changed.emit(text)
 
+    def _housekeeping(self):
+        """Jednou za běh aplikace: denní záloha knihovny a úklid polotovarů po pádu (Sprint R)."""
+        global _housekeeping_done
+        if _housekeeping_done:
+            return
+        _housekeeping_done = True
+        try:
+            import database as _db
+            import paths as _paths
+            if _db.backup_database(_paths.BACKUP_DIR):
+                print("[Backup] denní záloha knihovny hotová")
+            swept = video_proxy.sweep_temp()
+            if swept:
+                print(f"[Housekeeping] smazáno {swept} rozpracovaných souborů po přerušeném běhu")
+        except Exception as e:
+            print(f"[Housekeeping] {e}")
+
     def run(self):
         try:
+            self._housekeeping()
             self._repair_thumbnails()
             if self._running:
                 self._migrate_embeddings()
@@ -2103,7 +2196,7 @@ class BackgroundAIDaemon(QThread):
         except Exception as e:
             print(f"[Embeddings] {e}")
             return
-        total, since_emit = len(rows), 0
+        total, batch = len(rows), []
         for i, (media_id, file_path, thumb_path, media_type, sig) in enumerate(rows):
             if self._yield():
                 return
@@ -2118,12 +2211,12 @@ class BackgroundAIDaemon(QThread):
             except Exception as e:
                 print(f"[Embeddings] {media_id}: {e}")
                 continue
-            since_emit += 1
-            if since_emit >= 25:
-                since_emit = 0
-                self.embeddings_updated.emit()
-        if total:
-            self.embeddings_updated.emit()
+            batch.append(media_id)
+            if len(batch) >= 25:
+                self.embeddings_added.emit(batch)    # jen tyto položky – ne celá knihovna znovu
+                batch = []
+        if batch:
+            self.embeddings_added.emit(batch)
 
     def _build_video_derivatives(self):
         """Videa předem: 1080p SDR proxy pro 4K / HDR (tažení, náhledy, Cesta, slabší PC) a
@@ -2190,13 +2283,15 @@ class BackgroundAIDaemon(QThread):
         except Exception as e:
             print(f"[VideoFrames] {e}")
             return
-        total, since_emit = len(rows), 0
+        total, batch = len(rows), []
         for i, (media_id, path, sig) in enumerate(rows):
             if self._yield():
                 return
             self._status(f"Připravuji hledání ve videích ({i + 1}/{total})...")
             import ai_engine
-            frames = video_frames.extract_frames(path, should_stop=lambda: not self._running)
+            # ffmpeg ve strážci: během přehrávání / gest stojí (dřív běžel naplno vedle videa)
+            frames = video_frames.extract_frames(path, should_stop=lambda: not self._running,
+                                                 governor=governor.get())
             if not self._running:
                 return
             try:
@@ -2205,12 +2300,12 @@ class BackgroundAIDaemon(QThread):
             except Exception as e:
                 print(f"[VideoFrames] {media_id}: {e}")
                 continue
-            since_emit += 1
-            if since_emit >= 5:
-                since_emit = 0
-                self.embeddings_updated.emit()
-        if total:
-            self.embeddings_updated.emit()
+            batch.append(media_id)
+            if len(batch) >= 5:
+                self.embeddings_added.emit(batch)
+                batch = []
+        if batch:
+            self.embeddings_added.emit(batch)
 
     def _build_previews(self):
         """Náhledy 2048 px a plakáty videí na pozadí, v pořadí podle užitku: kandidáti duplicit,
@@ -3303,6 +3398,7 @@ class MainWindow(QMainWindow):
             self.map_bridge = MapBridge(self)
             self.map_channel.registerObject("bridge", self.map_bridge)
             self.map_view.page().setWebChannel(self.map_channel)
+            self.map_view.loadStarted.connect(self.map_bridge.release_all)   # nová stránka = staré holdy pryč
             self.map_view.loadFinished.connect(self._on_map_loaded)
 
             map_html = os.path.join(RESOURCE_DIR, "map_vault.html")
@@ -3792,8 +3888,31 @@ class MainWindow(QMainWindow):
         if self._search_query.strip() and self._search_result is not None:
             self._search_debounce.start()
 
+    def _merge_embeddings(self, ids):
+        """Démon doplnil vektory těchto položek: jen je přidat do cache. Dřív se každých 25
+        položek načítala celá knihovna v GUI vlákně (desítky MB, sekundové záseky)."""
+        try:
+            fresh = get_search_vectors(ids)
+        except Exception as e:
+            print(f"[Embeddings] {e}")
+            return
+        cache = getattr(self, "_embeddings_cache", None)
+        if cache is None:
+            self._embeddings_cache = cache = {}
+        cache.update(fresh)
+        if self._search_query.strip() and self._search_result is not None:
+            self._search_debounce.start()
+
     def _start_ai_daemon(self):
-        if self._ai_daemon and self._ai_daemon.isRunning():
+        """Spustí průchod démona. Běží-li už, průchod se po doběhnutí zopakuje: seznamy práce
+        (nové importy, změněné prahy z Předvoleb) si démon bere na začátku a nové položky by
+        jinak čekaly do dalšího spuštění aplikace (Sprint R)."""
+        daemon = self._ai_daemon
+        if daemon is not None and daemon.isRunning():
+            self._ai_daemon_rerun = True
+            return
+        self._ai_daemon_rerun = False
+        if getattr(self, "_shutting_down", False):
             return
         threshold = float(self.config.get("face_similarity_threshold", 0.62))
         self._ai_daemon = BackgroundAIDaemon(face_threshold=threshold,
@@ -3802,10 +3921,19 @@ class MainWindow(QMainWindow):
         self._ai_daemon.proxy_budget_mb = int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB))
         self._ai_daemon.people_updated.connect(self._load_people)
         self._ai_daemon.embeddings_updated.connect(self._load_embeddings)
+        self._ai_daemon.embeddings_added.connect(self._merge_embeddings)
         self._ai_daemon.thumbs_repaired.connect(self._load_photos)
         self._ai_daemon.face_crops_repaired.connect(self._on_face_crops_repaired)
         self._ai_daemon.status_changed.connect(self._on_daemon_status)
+        self._ai_daemon.finished.connect(self._on_ai_daemon_finished)
         self._ai_daemon.start()
+
+    def _on_ai_daemon_finished(self):
+        if getattr(self, "_ai_daemon_rerun", False) and not getattr(self, "_shutting_down", False):
+            daemon = self._ai_daemon
+            if daemon is not None:
+                daemon.wait(1000)            # finished přichází těsně před koncem run()
+            QTimer.singleShot(0, self._start_ai_daemon)
 
     def _on_face_crops_repaired(self, count: int):
         # cache avatarů je klíčovaná cestou, ta zůstává stejná -> jinak by visel starý obrázek
@@ -4856,10 +4984,11 @@ class MainWindow(QMainWindow):
         self.folder_watcher.set_roots(self._watched_roots())   # sledování zapnuté / vypnuté u složek
         if self.config.get("show_memories", True) != old_memories:
             self._refresh_memory()             # Vzpomínky zapnuté / vypnuté v Předvolbách
-        # Restart AI daemon with new threshold / rozpočet náhledů (enforce_budget při dalším průchodu)
+        # Restart démona s novým prahem / rozpočtem: zastavit a spustit znovu, až doběhne.
+        # Dřív wait(2000) vypršel (rozdělaná položka), _start_ai_daemon se vrátil hned a démon
+        # zůstal do restartu aplikace mrtvý (Sprint R).
         if self._ai_daemon and self._ai_daemon.isRunning():
             self._ai_daemon.stop()
-            self._ai_daemon.wait(2000)
         # snížený limit kopií videí platí hned (jen mazání nejdéle nepoužitých souborů)
         video_proxy.enforce_budget(int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB)))
         self._start_ai_daemon()
@@ -4948,6 +5077,7 @@ class MainWindow(QMainWindow):
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        self._shutting_down = True           # démon se už znovu nespustí (_start_ai_daemon)
         self.drop_router.detach()            # filtr tažení je na celé aplikaci
         self.folder_watcher.set_roots([])
         self._background_import = []         # rozpracovaný sken doběhne, další se už nespustí
@@ -4966,12 +5096,14 @@ class MainWindow(QMainWindow):
             pipe.pool.clear()
         for pipe in pipelines:
             pipe.pool.waitForDone(3000)
-        if self._ai_daemon and self._ai_daemon.isRunning():
-            self._ai_daemon.stop()
-            self._ai_daemon.wait(3000)
-        if self._scanner and self._scanner.isRunning():
-            self._scanner.stop()
-            self._scanner.wait(3000)
+        # Démon a sken: zastavit a počkat. Kdo do limitu nedoběhne (rozdělaná položka), přejde
+        # do úschovy a shutdown_app na něj počká před zánikem QApplication – dřív se okno
+        # smazalo s běžícím QThread a proces při ukončení padal (Sprint R).
+        for thread in (self._ai_daemon, self._scanner):
+            if thread is not None and thread.isRunning():
+                thread.stop()
+                if not thread.wait(3000):
+                    park_thread(thread)
         for worker in list(self._search_workers):
             worker.wait()   # hledání vždy doběhne; zničení běžícího QThread = pád
         self._search_workers.clear()
@@ -5010,6 +5142,11 @@ def main(app=None, splash=None):
     ret = app.exec()
     shutdown_app(app, window)                # pevné pořadí úklidu (pád v sip při ukončení)
     del window
+    if _parked_threads:
+        # vlákno visí i po limitu: zničení běžícího QThread při ukončení = qFatal (pád).
+        # Data jsou v transakcích SQLite, ffmpeg zabije Job Object -> tvrdý konec je bezpečný.
+        sys.stdout.flush()
+        os._exit(ret)
     sys.exit(ret)
 
 

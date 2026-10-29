@@ -324,6 +324,8 @@ class StripBuilder(QThread):
         self._proc = proc
         if self.governed:
             gov.register_process(proc.pid)            # přehrávání / gesto = pozastavit
+        else:
+            governor.assign_to_job(proc.pid)          # ffmpeg nepřežije aplikaci (Sprint R)
         pts, done_err = [], threading.Event()
 
         def read_err():

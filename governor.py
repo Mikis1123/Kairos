@@ -10,6 +10,12 @@ stav „busy“:
 Nižší výkonnostní profil (perf_profile) navíc dává mezi položkami pauzu, aby i nečinné
 základní PC mělo pro UI vzduch. Modul je bezpečný pro více vláken: hold/release volá GUI
 vlákno, checkpoint pracovní vlákna.
+
+Sprint R:
+  * hold s životností (set_active(..., ttl_s)) – stav hlášený z mapy (JS) nesmí zůstat viset,
+    když „konec pohybu“ nikdy nepřijde (moveend během Cesty, znovu načtená stránka);
+  * každý zaregistrovaný proces jde do Job Objectu „zabít při zavření“ – pád nebo tvrdé
+    ukončení aplikace už nenechá ffmpeg běžet (ani zmrazený NtSuspendProcess) na pozadí.
 """
 import ctypes
 import sys
@@ -20,6 +26,8 @@ from contextlib import contextmanager
 QUIET_S = 2.0
 POLL_S = 0.1
 PROCESS_SUSPEND_RESUME = 0x0800
+PROCESS_SET_QUOTA = 0x0100
+PROCESS_TERMINATE = 0x0001
 
 
 class Governor:
@@ -31,6 +39,7 @@ class Governor:
         self._procs = {}                   # pid -> suspended (bool)
         self._timer = None
         self._item_pause = 0.0
+        self._leases = {}                  # důvod -> threading.Timer (automatické uvolnění)
         self.suspend_count = 0             # statistika (testy / ladění)
 
     # ── interakce (GUI vlákno) ──
@@ -51,10 +60,17 @@ class Governor:
                 self._last_release = time.monotonic()
                 self._schedule_resume()
 
-    def set_active(self, reason, active):
-        """Idempotentní varianta pro stavové zdroje (přehrávání ano/ne)."""
+    def set_active(self, reason, active, ttl_s=None):
+        """Idempotentní varianta pro stavové zdroje (přehrávání ano/ne). ttl_s: hold se sám
+        uvolní, nepřijde-li do té doby nové hlášení (zdroj, který „konec“ nemusí poslat)."""
         with self._lock:
             has = reason in self._holds
+            self._cancel_lease(reason)
+            if active and ttl_s:
+                lease = threading.Timer(float(ttl_s), self._expire, args=(reason,))
+                lease.daemon = True
+                self._leases[reason] = lease
+                lease.start()
         if active and not has:
             self.hold(reason)
         elif not active and has:
@@ -63,6 +79,16 @@ class Governor:
                 if not self._holds:
                     self._last_release = time.monotonic()
                     self._schedule_resume()
+
+    def _expire(self, reason):
+        with self._lock:
+            self._leases.pop(reason, None)
+        self.set_active(reason, False)
+
+    def _cancel_lease(self, reason):
+        lease = self._leases.pop(reason, None)
+        if lease is not None:
+            lease.cancel()
 
     @contextmanager
     def holding(self, reason):
@@ -106,6 +132,7 @@ class Governor:
     # ── procesy (ffmpeg) ──
     def register_process(self, pid):
         """Proces na pozadí: pozastaví se, kdykoli je rušno (i hned, když už rušno je)."""
+        assign_to_job(pid)
         with self._lock:
             self._procs[int(pid)] = False
             if self.busy():
@@ -171,6 +198,78 @@ def _nt_call(pid, fn_name):
 
 def _suspend_pid(pid):
     return _nt_call(pid, "NtSuspendProcess")
+
+
+# ── Job Object: podřízené procesy umřou s aplikací ──
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JOB_EXTENDED_LIMIT_INFORMATION = 9
+_job = None
+_job_lock = threading.Lock()
+
+
+def _job_handle():
+    """Jeden Job Object za běh (handle drží proces; zavře ho až systém při zániku procesu,
+    a tím zabije všechny přiřazené procesy). None mimo Windows / když ho nelze vytvořit."""
+    global _job
+    if sys.platform != "win32":
+        return None
+    with _job_lock:
+        if _job is None:
+            try:
+                from ctypes import wintypes
+
+                class _Basic(ctypes.Structure):
+                    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                                ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                                ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                                ("SchedulingClass", wintypes.DWORD)]
+
+                class _Io(ctypes.Structure):
+                    _fields_ = [(n, ctypes.c_uint64) for n in ("r", "w", "o", "rb", "wb", "ob")]
+
+                class _Extended(ctypes.Structure):
+                    _fields_ = [("BasicLimitInformation", _Basic), ("IoInfo", _Io),
+                                ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                                ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+                kernel32 = ctypes.windll.kernel32
+                kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+                handle = kernel32.CreateJobObjectW(None, None)
+                if not handle:
+                    _job = 0
+                    return None
+                info = _Extended()
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                if not kernel32.SetInformationJobObject(wintypes.HANDLE(handle), _JOB_EXTENDED_LIMIT_INFORMATION,
+                                                        ctypes.byref(info), ctypes.sizeof(info)):
+                    kernel32.CloseHandle(wintypes.HANDLE(handle))
+                    _job = 0
+                    return None
+                _job = handle
+            except Exception:
+                _job = 0
+        return _job or None
+
+
+def assign_to_job(pid):
+    """Přiřadí proces do Job Objectu aplikace. True = povedlo se."""
+    job = _job_handle()
+    if not job:
+        return False
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, int(pid))
+        if not handle:
+            return False
+        try:
+            return bool(kernel32.AssignProcessToJobObject(wintypes.HANDLE(job), wintypes.HANDLE(handle)))
+        finally:
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+    except Exception:
+        return False
 
 
 def _resume_pid(pid):

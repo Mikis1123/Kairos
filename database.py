@@ -66,6 +66,52 @@ def db_transaction():
         conn.close()
 
 
+BACKUP_KEEP = 7                 # denních záloh (nejstarší se mažou)
+BACKUP_PREFIX = "photos-"
+
+
+def backup_database(backup_dir, keep=BACKUP_KEEP, today=None):
+    """Denní záloha knihovny (Sprint R): online backup API SQLite – konzistentní snímek i za
+    běhu zápisů (WAL), do dočasného souboru a teprve pak přejmenovat. Jedna záloha za den,
+    ponechá se `keep` nejnovějších. Vrací cestu k nové záloze, nebo None (dnešní už je /
+    knihovna neexistuje / chyba)."""
+    import datetime as _dt
+    if not os.path.exists(DB_PATH):
+        return None
+    day = (today or _dt.date.today()).isoformat()
+    target = os.path.join(backup_dir, f"{BACKUP_PREFIX}{day}.db")
+    if os.path.exists(target):
+        return None
+    os.makedirs(backup_dir, exist_ok=True)
+    tmp = target + ".tmp"
+    try:
+        src = get_connection()
+        try:
+            dst = sqlite3.connect(tmp)
+            try:
+                src.backup(dst, pages=4096)          # po dávkách: zápisy aplikace nečekají celou dobu
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        os.replace(tmp, target)
+    except (sqlite3.Error, OSError) as e:
+        print(f"[Backup] {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    try:
+        olds = sorted(f for f in os.listdir(backup_dir)
+                      if f.startswith(BACKUP_PREFIX) and f.endswith(".db"))
+        for name in olds[:max(0, len(olds) - int(keep))]:
+            os.remove(os.path.join(backup_dir, name))
+    except OSError as e:
+        print(f"[Backup] rotace: {e}")
+    return target
+
+
 def _ensure_columns(cursor, table, columns):
     """Přidá do tabulky chybějící sloupce. Vrací seznam názvů skutečně přidaných sloupců."""
     cursor.execute(f"PRAGMA table_info({table})")
@@ -561,14 +607,26 @@ def get_videos_needing_frames():
         conn.close()
 
 
-def get_search_vectors():
+def get_search_vectors(ids=None):
     """Vektory pro hledání: {id: bytes} (plakát / fotka), u videí se snímky z celého klipu
-    {id: (plakát, snímek, ...)} – ai_engine.rank_semantic hodnotí video nejlepším z nich."""
-    out = get_all_embeddings()
+    {id: (plakát, snímek, ...)} – ai_engine.rank_semantic hodnotí video nejlepším z nich.
+    ids: jen tyto položky (průběžné doplnění cache bez načtení celé knihovny)."""
+    if ids is None:
+        out = get_all_embeddings()
+        where, params = "", ()
+    else:
+        ids = [int(i) for i in ids]
+        if not ids:
+            return {}
+        where = f" AND media_id IN ({','.join('?' * len(ids))})"
+        params = tuple(ids)
     conn = get_connection()
     try:
+        if ids is not None:
+            out = {r[0]: r[1] for r in conn.execute(
+                f"SELECT media_id, embedding FROM image_embeddings WHERE 1=1{where}", params)}
         rows = conn.execute("SELECT media_id, embedding FROM video_frame_embeddings "
-                            "WHERE frame_ms >= 0 ORDER BY media_id, frame_ms").fetchall()
+                            f"WHERE frame_ms >= 0{where} ORDER BY media_id, frame_ms", params).fetchall()
     finally:
         conn.close()
     frames = {}

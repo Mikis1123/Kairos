@@ -776,9 +776,9 @@
     // oddalování (přelet zpět na zeměkouli): terén vypnout dřív, než se rovina zakřiví
     map.on('zoom', function () { if (!director.directing && map.getTerrain() && !terrainAllowed()) syncTerrain(); });
     map.on('moveend', function () {
+      setInteraction('map', false);     // vždy: pohyb začatý před Cestou jinak držel governor navždy
       if (director.directing) return;   // kamera Cesty jede po trase (jumpTo za snímek)
       terrainHold = false; syncTerrain(); render();
-      setInteraction('map', false);
       restResolution();
     });
     map.on('movestart', function (e) {
@@ -1911,12 +1911,23 @@
     if (!journey.active || pending[d.leg] !== d.seq) return;         // jiná Cesta / zastaralé
     delete pending[d.leg];
     if (!d.path || d.path.length < 2) return;
+    // Sprint R: úsek, po kterém kamera už letí (nebo doletěla), se nemění – pozdní trasa dřív
+    // přehodila dráhu uprostřed letu (skok kamery i čáry). Zůstane hladká křivka.
+    if (legStarted(d.leg)) return;
     (journey.trails || (journey.trails = {}))[d.leg] = d.path;
     if (journey.legs && journey.i < d.leg) journey.legs[d.leg] = null;   // běžící úsek nepřekreslovat
     var all = map && map.getSource('j-all');
     if (all) all.setData(lineFeature(allRouteCoords()));
   }
   window.requestTrail = requestTrail;
+  function legStarted(leg) {          // přesun do zastávky leg už ve filmu začal
+    if (!film) return false;
+    for (var k = 0; k < film.segs.length; k++) {
+      var g = film.segs[k];
+      if ((g.kind === 'glide' || g.kind === 'hop') && g.i === leg) return director.t >= g.t0;
+    }
+    return false;
+  }
 
   function pathAt(pts, f) {           // bod a směr ve zlomku délky křivky
     var cum = pts.__cum;
@@ -2650,6 +2661,7 @@
     buildChapters();
     addRouteLayers();
     filmLook(true);
+    setInteraction('map', false);                  // pohyb kamery řídí od teď Cesta
     setInteraction('journey', true);               // aplikace: práce na pozadí počká do konce Cesty
     journeyMeter = makeMeter();
     lastSky = { el: null, az: null };

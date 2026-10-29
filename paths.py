@@ -37,6 +37,10 @@ WEB_CACHE_DIR = os.path.join(CACHE_ROOT, "web")
 # NEZAHAZOVAT: ořezy obličejů, na které odkazuje databáze (face_instances, people).
 FACE_DIR = os.path.join(CACHE_ROOT, "faces")
 
+# NEZAHAZOVAT: denní zálohy photos.db (rotace, database.backup_database) – mimo .cache,
+# kterou smí uživatel kdykoli vymazat.
+BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+
 
 def resolve_face_path(path, face_dir=None):
     """Vrátí existující cestu k ořezu obličeje, nebo None.

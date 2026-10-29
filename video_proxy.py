@@ -151,8 +151,15 @@ def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=
         return None
     if governor is not None:
         governor.register_process(proc.pid)
-    done_us = [0]
+    else:
+        import governor as _gov
+        _gov.assign_to_job(proc.pid)          # i bez strážce: ffmpeg nepřežije aplikaci
+    done_us, err_tail = [0], []
     threading.Thread(target=_read_progress, args=(proc.stdout, done_us), daemon=True).start()
+    # stderr se čte průběžně: plná roura (≈ 4 KB varování u vadného HDR souboru) zablokovala
+    # ffmpeg navždy – převod „stál“ a démon s ním (Sprint R)
+    err_reader = threading.Thread(target=_drain_tail, args=(proc.stderr, err_tail), daemon=True)
+    err_reader.start()
     total_us = max(0, int(info.get("duration_ms") or 0)) * 1000
     cancelled = False
     try:
@@ -168,10 +175,11 @@ def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=
     finally:
         if governor is not None:
             governor.unregister_process(proc.pid)
+    err_reader.join(2.0)
     if cancelled or proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
         _remove(tmp)
         if not cancelled:
-            err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip().splitlines()[-1:] if proc.stderr else []
+            err = b"".join(err_tail).decode("utf-8", "replace").strip().splitlines()[-1:]
             print(f"[Proxy] {os.path.basename(source)}: ffmpeg {proc.returncode} {' '.join(err)}")
             _touch(_marker_path(source))      # nepřevoditelné: nezkoušet při každém startu
         return False if cancelled else None
@@ -188,6 +196,38 @@ def _read_progress(stream, done_us):
                 done_us[0] = int(m.group(1))
     except (OSError, ValueError):
         pass
+
+
+ERR_TAIL_LINES = 20
+
+
+def _drain_tail(stream, tail):
+    """Vlákno: vyprázdní rouru do konce, ponechá posledních ERR_TAIL_LINES řádků (hlášení chyby)."""
+    try:
+        for line in stream:
+            tail.append(line)
+            if len(tail) > ERR_TAIL_LINES:
+                del tail[0]
+    except (OSError, ValueError):
+        pass
+
+
+def sweep_temp(max_age_s=3600):
+    """Úklid po pádu / tvrdém ukončení: polotovary *.tmp* v mezipaměti starší než max_age_s
+    (běžící převod svůj soubor průběžně zapisuje – mladší se nechávají). Vrací počet smazaných."""
+    removed, now = 0, time.time()
+    for root in (paths.PROXY_DIR, paths.PREVIEW_DIR, paths.THUMB_DIR):
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_file() and ".tmp" in e.name and now - e.stat().st_mtime > max_age_s and _remove(e.path):
+                    removed += 1
+            except OSError:
+                continue
+    return removed
 
 
 class PrepProgress:
