@@ -5,6 +5,7 @@
 Přehraje výlet (místní úseky po trase i dlouhý let) v okně 1600×1000 a vypíše p50 / p95 / p99
 a vynechané snímky z měřáků stránky (getFrameStats: smyčka režiséra a vykreslené snímky mapy).
 Síť je zablokovaná jako v testech: měří se kamera, trasa a kreslení, ne stahování dlaždic.
+Skutečné dlaždice a „díry“ při letu měří eval/bench_journey_live.py (rozhodující měření Cesty).
 """
 import json
 import os
@@ -37,8 +38,7 @@ def main():
         if m.js("styleReady === true"):
             break
         wait(100)
-    m.js(f"setPerfProfile({json.dumps(prof.for_map())}); resetFrameStats(); reduceMotion = false; "
-         "POP_MS = 500; HOLD_MS = 700; DROP_MS = 400; 0")
+    m.js(f"setPerfProfile({json.dumps(prof.for_map())}); resetFrameStats(); reduceMotion = false; 0")
     assert m.js(f"playJourney({json.dumps(TRIP)})")
     t0 = time.time()
     while time.time() - t0 < 40 and not m.js("journeyState().ended"):

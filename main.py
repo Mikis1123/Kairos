@@ -59,6 +59,7 @@ from database import (
     get_media_pending_face_scan, save_faces_for_media, relocate_face_paths,
     visible_media_sql, query_geo_bounds, sync_geo_index, trash_media, restore_media,
     dismiss_duplicate_pair, undismiss_duplicate_pair, purge_orphan_test_rows,
+    get_search_vectors, get_videos_needing_frames, save_video_frame_embeddings,
 )
 from scanner import MediaScannerThread, repair_missing_thumbnails
 from face_cluster import (
@@ -106,7 +107,8 @@ import perf_profile
 import scrub_strip
 import search_engine
 import video_proxy
-HOVER_PRELOAD_MS = 350       # setrvání kurzoru nad videem v mřížce před přednačtením
+import video_frames
+HOVER_PRELOAD_MS = 350      # setrvání kurzoru nad videem v mřížce před přednačtením
 SMART_IMPORT_DELAY_MS = 4000 # kontrola nových fotek až po usazení startu
 import face_engine
 
@@ -617,21 +619,27 @@ class ApplePhotoDelegate(QStyledItemDelegate):
         oříznuté na path."""
         painter.save()
         painter.setClipPath(path)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        # Ve fyzických pixelech: zvednutá (najetá) dlaždice se dřív škálovala na logické pixely
+        # a na HiDPI displeji (DPR 2) se při najetí rozmazala na polovinu rozlišení
+        dpr = painter.device().devicePixelRatioF() if painter.device() else 1.0
         if pixmap and not pixmap.isNull():
             frame_r = frame.toAlignedRect()
-            target = QSize(round(frame_r.width() * zoom), round(frame_r.height() * zoom))
+            target = QSize(round(frame_r.width() * zoom * dpr), round(frame_r.height() * zoom * dpr))
             scaled = pixmap.scaled(target, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                                    Qt.TransformationMode.SmoothTransformation)
-            painter.drawPixmap(QPointF(frame.center().x() - scaled.width() / 2,
-                                       frame.center().y() - scaled.height() / 2), scaled)
+            scaled.setDevicePixelRatio(dpr)
+            size = scaled.deviceIndependentSize()
+            painter.drawPixmap(QPointF(frame.center().x() - size.width() / 2,
+                                       frame.center().y() - size.height() / 2), scaled)
         else:
             self._paint_placeholder(painter, frame.toAlignedRect(), index)
         if live_frame is not None:
             pm, opacity = live_frame
-            size = pm.deviceIndependentSize()
+            size = pm.deviceIndependentSize() * zoom          # stejné zvednutí jako statický snímek
             painter.setOpacity(opacity)
-            painter.drawPixmap(QPointF(frame.center().x() - size.width() / 2,
-                                       frame.center().y() - size.height() / 2), pm)
+            painter.drawPixmap(QRectF(frame.center().x() - size.width() / 2, frame.center().y() - size.height() / 2,
+                                      size.width(), size.height()), pm, QRectF(pm.rect()))
             painter.setOpacity(1.0)
         self._paint_badge_shade(painter, frame, meta)
         if meta.get("possible"):
@@ -850,7 +858,8 @@ class ApplePhotoDelegate(QStyledItemDelegate):
 
 # ── AppleGridView ─────────────────────────────────────────────────────────────
 
-GRID_MIN_COLUMNS, GRID_MAX_COLUMNS = 2, 14
+# Nejméně 3 sloupce: 2 obří dlaždice na širokém displeji působily jako rozbitá mřížka (test v praxi)
+GRID_MIN_COLUMNS, GRID_MAX_COLUMNS = 3, 14
 GRID_MIN_CELL, GRID_MAX_CELL = 90, 420
 SCROLL_IDLE_MS = 140               # tak dlouho po posledním posunu se vrací najetí myši
 PINCH_SETTLE_MS = 160              # touchpad (Ctrl + jemné kolečko): po tak dlouhém klidu se dosedne
@@ -997,9 +1006,13 @@ class AppleGridView(QListView):
 
     # ── velikost dlaždic ──
     def set_cell_size(self, px: int):
-        px = int(max(GRID_MIN_CELL, min(GRID_MAX_CELL, px)))
+        # strop tří sloupců až u rozvržené mřížky: při startu je viewport ~100 px a strop by
+        # zapamatovanou velikost natrvalo zmenšil (sloupce pak hlídá resizeEvent)
+        laid_out = self.isVisible() and self.viewport().width() >= GRID_MIN_COLUMNS * GRID_MIN_CELL
+        top = self._max_cell() if laid_out else GRID_MAX_CELL
+        px = int(max(GRID_MIN_CELL, min(top, px)))
         self._finish_zoom()
-        self._cols = None                   # sloupce se dopočítají z velikosti při dalším rozvržení
+        self._cols = None                  # sloupce se dopočítají z velikosti při dalším rozvržení
         self.cell_size = px
         self.photo_delegate.set_cell_size(px)
         self.setGridSize(QSize(px, px))
@@ -1009,7 +1022,11 @@ class AppleGridView(QListView):
         if cell is None and self._cols:
             return self._cols                # držený počet sloupců (zoom, Dny)
         width = max(1, self.viewport().width())
-        return max(1, width // max(1, int(cell or self.cell_size)))
+        return max(GRID_MIN_COLUMNS, width // max(1, int(cell or self.cell_size)))
+
+    def _max_cell(self):
+        """Největší dlaždice: GRID_MAX_CELL, ale vždy aspoň GRID_MIN_COLUMNS sloupců."""
+        return min(GRID_MAX_CELL, self._cell_for_columns(GRID_MIN_COLUMNS))
 
     def _cell_for_columns(self, cols):
         # o 2 px méně než celá šířka: QListView jinak poslední sloupec zalomí na další řádek
@@ -1030,7 +1047,7 @@ class AppleGridView(QListView):
         if self.viewport().width() <= 2:
             return
         if self._cols is None:
-            self._cols = max(1, (self.viewport().width() - 2) // max(1, self.cell_size))
+            self._cols = max(GRID_MIN_COLUMNS, (self.viewport().width() - 2) // max(1, self.cell_size))
         cell = self._cell_for_columns(self._cols)
         if cell != self.cell_size:
             self._apply_zoom_step(cell)
@@ -1193,9 +1210,10 @@ class AppleGridView(QListView):
             return
         base_cell = max(1.0, base.rect(0).width()) if base.count else float(self.cell_size)
         cell = base_cell * scale
-        # gumové meze: za nejmenší / největší velikostí jen zlomek pohybu
-        if cell > GRID_MAX_CELL:
-            cell = GRID_MAX_CELL + (cell - GRID_MAX_CELL) * 0.3
+        # gumové meze: za nejmenší / největší velikostí (i GRID_MIN_COLUMNS) jen zlomek pohybu
+        top = self._max_cell()
+        if cell > top:
+            cell = top + (cell - top) * 0.3
         elif cell < GRID_MIN_CELL:
             cell = GRID_MIN_CELL - (GRID_MIN_CELL - cell) * 0.3
         self._pinch_scale = cell / base_cell
@@ -2019,6 +2037,8 @@ class MapBridge(QObject):
 
 # ── Background AI daemon ──────────────────────────────────────────────────────
 
+PROXY_WORK_SHARE = 0.8      # u videa s převodem: podíl práce na proxy (zbytek = náhledový pás)
+
 class BackgroundAIDaemon(QThread):
     people_updated     = pyqtSignal()
     embeddings_updated = pyqtSignal()
@@ -2066,6 +2086,8 @@ class BackgroundAIDaemon(QThread):
                 self._analyze_faces()
             if self._running:
                 self._build_video_derivatives()
+            if self._running:
+                self._index_video_frames()           # až po proxy: snímky z rychlé SDR kopie
             if self._running:
                 self._improve_person_covers()
         except Exception as e:
@@ -2119,25 +2141,76 @@ class BackgroundAIDaemon(QThread):
         except Exception as e:
             print(f"[Proxy] {e}")
             return
-        total = len(videos)
-        for i, path in enumerate(videos):
+        # Jen videa, kterým něco chybí – a jejich délky předem: průběh je vážený délkou (dřív
+        # „(i/n)“ přes VŠECHNA videa, kde hotová přeskočila hned a jeden 4K HDR převod pak
+        # minuty stál na stejném čísle bez známky života)
+        pending = [p for p in videos if p and os.path.exists(p)
+                   and not (video_proxy.is_settled(p) and scrub_strip.has_valid_strip(p))]
+        if not pending:
+            return
+        weights = []
+        for p in pending:
+            if not self._running:
+                return
+            weights.append(scrub_strip.probe_duration_ms(p))
+        prep = video_proxy.PrepProgress(weights)
+        gov = governor.get()
+
+        def report(k, frac):
+            self._status(prep.update(k, frac, paused=gov.busy()))
+
+        for k, path in enumerate(pending):
+            report(k, 0.0)
             if self._yield():
                 return
-            if not path or not os.path.exists(path):
-                continue
-            if not video_proxy.is_settled(path):
-                self._status(f"Připravuji videa ({i + 1}/{total})...", force=True)
-                made = video_proxy.build_proxy(path, governor.get(), self._yield, threads=prof.bg_threads)
+            needs_proxy = not video_proxy.is_settled(path)
+            share = PROXY_WORK_SHARE if needs_proxy else 0.0      # převod je většina práce
+            if needs_proxy:
+                made = video_proxy.build_proxy(path, gov, self._yield, threads=prof.bg_threads,
+                                               progress=lambda f, k=k: report(k, share * f))
                 if made is False:
                     return                                    # zrušeno (konec aplikace)
                 if made:
                     video_proxy.enforce_budget(self.proxy_budget_mb, keep=[made])
             if self._yield():
                 return
-            if scrub_strip.ScrubStrip.load(path) is None:
-                self._status(f"Připravuji náhledy videí ({i + 1}/{total})...")
+            if not scrub_strip.has_valid_strip(path):
                 scrub_strip.build_strip_now(path, self._yield, dense=prof.dense_strips,
-                                            threads=max(1, prof.bg_threads))
+                                            threads=max(1, prof.bg_threads),
+                                            progress=lambda f, k=k: report(k, share + (1 - share) * f))
+            report(k, 1.0)
+        self._status("", force=True)
+
+    def _index_video_frames(self):
+        """Hledání ve videích podle celého klipu: FRAMES_MAX snímků -> CLIP vektory
+        (video_frame_embeddings). Plakát ukazuje jen začátek – vodopád v polovině klipu
+        dřív hledání nenašlo."""
+        try:
+            rows = get_videos_needing_frames()
+        except Exception as e:
+            print(f"[VideoFrames] {e}")
+            return
+        total, since_emit = len(rows), 0
+        for i, (media_id, path, sig) in enumerate(rows):
+            if self._yield():
+                return
+            self._status(f"Připravuji hledání ve videích ({i + 1}/{total})...")
+            import ai_engine
+            frames = video_frames.extract_frames(path, should_stop=lambda: not self._running)
+            if not self._running:
+                return
+            try:
+                vecs = ai_engine.embed_pil([img for _ms, img in frames]) if frames else []
+                save_video_frame_embeddings(media_id, list(zip([ms for ms, _ in frames], vecs)), sig)
+            except Exception as e:
+                print(f"[VideoFrames] {media_id}: {e}")
+                continue
+            since_emit += 1
+            if since_emit >= 5:
+                since_emit = 0
+                self.embeddings_updated.emit()
+        if total:
+            self.embeddings_updated.emit()
 
     def _build_previews(self):
         """Náhledy 2048 px a plakáty videí na pozadí, v pořadí podle užitku: kandidáti duplicit,
@@ -3711,7 +3784,7 @@ class MainWindow(QMainWindow):
 
     def _load_embeddings(self):
         try:
-            self._embeddings_cache = get_all_embeddings()
+            self._embeddings_cache = get_search_vectors()       # videa: plakát + snímky celého klipu
         except Exception as e:
             print(f"[Embeddings] {e}")
             self._embeddings_cache = {}

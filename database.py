@@ -147,6 +147,19 @@ def init_db():
         );
         """)
 
+        # Vícesnímkový index videí (video_frames): CLIP vektory snímků z celého klipu, plakát
+        # zůstává v image_embeddings. source_sig = EMBEDDING_SIG_SQL videa, ze kterého vznikly.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS video_frame_embeddings (
+            media_id INTEGER NOT NULL,
+            frame_ms INTEGER NOT NULL,
+            embedding BLOB NOT NULL,
+            source_sig TEXT,
+            PRIMARY KEY (media_id, frame_ms),
+            FOREIGN KEY (media_id) REFERENCES media_items (id) ON DELETE CASCADE
+        );
+        """)
+
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS people (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -516,6 +529,55 @@ def get_all_embeddings():
         return {r[0]: r[1] for r in rows}
     finally:
         conn.close()
+
+
+VIDEO_FRAME_MARKER_MS = -1      # řádek „snímky nejdou získat“ (bez vektoru): nezkoušet při každém startu
+
+
+def save_video_frame_embeddings(media_id, frames, source_sig):
+    """Nahradí snímky videa: frames = [(čas ms, bytes embeddingu), ...]. Prázdný seznam =
+    značka, že z videa snímky nejdou (rozbitý soubor) – další spuštění ho přeskočí."""
+    with db_transaction() as conn:
+        conn.execute("DELETE FROM video_frame_embeddings WHERE media_id = ?", (media_id,))
+        rows = [(media_id, int(ms), emb, source_sig) for ms, emb in frames] or \
+               [(media_id, VIDEO_FRAME_MARKER_MS, b"", source_sig)]
+        conn.executemany("INSERT INTO video_frame_embeddings (media_id, frame_ms, embedding, source_sig) "
+                         "VALUES (?, ?, ?, ?)", rows)
+
+
+def get_videos_needing_frames():
+    """[(id, file_path, podpis)] viditelných videí bez snímků z aktuální verze souboru."""
+    conn = get_connection()
+    try:
+        return conn.execute(f"""
+            SELECT m.id, m.file_path, {EMBEDDING_SIG_SQL}
+            FROM media_items m
+            WHERE m.media_type = 'video' AND {visible_media_sql('m')}
+              AND NOT EXISTS (SELECT 1 FROM video_frame_embeddings v
+                              WHERE v.media_id = m.id AND v.source_sig = {EMBEDDING_SIG_SQL})
+            ORDER BY m.date_taken DESC, m.id DESC
+        """).fetchall()
+    finally:
+        conn.close()
+
+
+def get_search_vectors():
+    """Vektory pro hledání: {id: bytes} (plakát / fotka), u videí se snímky z celého klipu
+    {id: (plakát, snímek, ...)} – ai_engine.rank_semantic hodnotí video nejlepším z nich."""
+    out = get_all_embeddings()
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT media_id, embedding FROM video_frame_embeddings "
+                            "WHERE frame_ms >= 0 ORDER BY media_id, frame_ms").fetchall()
+    finally:
+        conn.close()
+    frames = {}
+    for mid, emb in rows:
+        frames.setdefault(mid, []).append(emb)
+    for mid, vecs in frames.items():
+        poster = out.get(mid)
+        out[mid] = tuple(([poster] if poster is not None else []) + vecs)
+    return out
 
 
 # ==============================================================================

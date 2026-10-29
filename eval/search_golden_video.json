@@ -1,0 +1,20 @@
+{
+  "about": "Videa: obsah celého klipu (ne jen plakátu). Ručně z kontaktních archů 6 snímků na video (video_frames.frame_times), 2026-10-29. Měří se pořadí videí v kolekci Videa (vesmír = jen videa) a zda se relevantní video objeví ve výsledcích celé knihovny. Spouští eval/eval_search.py --videos.",
+  "queries": [
+    {"q": "jezero", "videos": [2523], "note": "plakát dlažba, jezero až na konci"},
+    {"q": "auto", "videos": [2293], "note": "plakát prázdná silnice, auta s otevřeným kufrem uprostřed"},
+    {"q": "kuchyně", "videos": [2304], "note": "plakát televize, kuchyň na konci"},
+    {"q": "les", "videos": [2290, 2326, 2445, 2523, 2524]},
+    {"q": "kašna", "videos": [2383]},
+    {"q": "ping pong", "videos": [2384, 2390, 2564, 2565, 2566]},
+    {"q": "jídlo", "videos": [2389, 2563]},
+    {"q": "noc", "videos": [2563]},
+    {"q": "turisté", "videos": [2326, 2524]},
+    {"q": "výhled", "videos": [2445, 2446]},
+    {"q": "televize", "videos": [2304]},
+    {"q": "okno", "videos": [2311]},
+    {"q": "telefon", "videos": [2557, 2304]},
+    {"q": "selfie", "videos": [2434, 2389, 2523]},
+    {"q": "voda", "videos": [2383, 2523]}
+  ]
+}

@@ -42,6 +42,13 @@ import video_proxy
 
 STRIP_EDGE = 480
 STRIP_QUALITY = 6                # ffmpeg -q:v (2 = nejlepší … 31); 6 ≈ 10–40 kB na snímek
+# Krátké klipy (Live Photo, ~3 s) hraje živý náhled v mřížce přes celou dlaždici: na HiDPI je
+# dlaždice při 3 sloupcích ~900 px – pás 480 px byl roztažený 2–2,5× a rozmazaný. Krátké klipy
+# proto ostřeji: delší strana SHORT_EDGE, zmenšení „area“ (bez aliasů) a lepší JPEG. Celý pás
+# klipu do SHORT_MAX_MS má pak ~36 snímků po ~60–120 kB.
+SHORT_MAX_MS = 10000
+SHORT_EDGE = 1080
+SHORT_QUALITY = 3
 DENSE_MAX_S = 90                 # hustý průchod jen pro krátká videa (4K dekód ~0,45 s / s videa)
 DENSE_FPS = 12
 STRIP_MAGIC = b"OPVS"
@@ -57,6 +64,28 @@ def strip_path(source):
     return base + ".scrub"
 
 
+def edge_for(duration_ms):
+    """Delší strana snímků pásu podle délky videa (0 = neznámá -> běžný pás)."""
+    return SHORT_EDGE if 0 < int(duration_ms or 0) <= SHORT_MAX_MS else STRIP_EDGE
+
+
+def probe_duration_ms(source):
+    """Délka videa z hlavičky (ffmpeg -i), 0 = nezjištěno."""
+    if not os.path.exists(paths.FFMPEG_PATH):
+        return 0
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        err = subprocess.run([paths.FFMPEG_PATH, "-hide_banner", "-i", source], capture_output=True,
+                             timeout=20, creationflags=flags).stderr.decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    d = _DURATION.search(err)
+    if not d:
+        return 0
+    h, mi, s = d.groups()
+    return int((int(h) * 3600 + int(mi) * 60 + float(s)) * 1000)
+
+
 class ScrubStrip:
     """Seřazené snímky pásu; přidávají se z vlákna generátoru, čtou z GUI vlákna."""
 
@@ -67,6 +96,7 @@ class ScrubStrip:
         self._blobs = []
         self.dense = False
         self.complete = False
+        self.edge = edge_for(self.duration_ms)   # delší strana snímků (StripBuilder ji určí po sondě)
         self._lock = threading.Lock()
         self._decoded = OrderedDict()
 
@@ -144,7 +174,7 @@ class ScrubStrip:
                 frames.append([t, offset, len(b)])
                 blobs.append(b)
                 offset += len(b)
-            header = json.dumps({"duration_ms": self.duration_ms, "dense": self.dense,
+            header = json.dumps({"duration_ms": self.duration_ms, "dense": self.dense, "edge": self.edge,
                                  "frames": frames}).encode("utf-8")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{threading.get_ident()}.tmp"
@@ -173,8 +203,13 @@ class ScrubStrip:
             header = json.loads(data[9:9 + hlen].decode("utf-8"))
         except ValueError:
             return None
+        # pás krátkého klipu z doby před SHORT_EDGE (480 px) se přestaví ostřejší
+        edge = int(header.get("edge") or STRIP_EDGE)
+        if edge < edge_for(header.get("duration_ms", 0)):
+            return None
         base = 9 + hlen
         strip = cls(source, header.get("duration_ms", 0))
+        strip.edge = edge
         for t, off, n in header.get("frames", []):
             strip.times.append(int(t))
             strip._blobs.append(data[base + off: base + off + n])
@@ -183,10 +218,11 @@ class ScrubStrip:
         return strip
 
 
-def _ffmpeg_cmd(source, keyframes_only, hw, threads=2):
-    edge = STRIP_EDGE
-    # delší strana nejvýš STRIP_EDGE, menší videa se nezvětšují
-    scale = f"scale='if(gt(iw,ih),min({edge},iw),-2)':'if(gt(iw,ih),-2,min({edge},ih))':flags=fast_bilinear"
+def _ffmpeg_cmd(source, keyframes_only, hw, threads=2, edge=STRIP_EDGE):
+    sharp = edge > STRIP_EDGE
+    # delší strana nejvýš edge, menší videa se nezvětšují
+    scale = (f"scale='if(gt(iw,ih),min({edge},iw),-2)':'if(gt(iw,ih),-2,min({edge},ih))'"
+             f":flags={'area' if sharp else 'fast_bilinear'}")
     vf = (scale if keyframes_only else f"fps={DENSE_FPS},{scale}") + ",format=yuvj420p,showinfo"
     cmd = [paths.FFMPEG_PATH, "-hide_banner", "-nostats", "-loglevel", "info", "-threads", str(threads)]
     if hw:
@@ -196,7 +232,7 @@ def _ffmpeg_cmd(source, keyframes_only, hw, threads=2):
     cmd += ["-i", source, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf]
     if keyframes_only:
         cmd += ["-fps_mode", "passthrough"]
-    cmd += ["-c:v", "mjpeg", "-q:v", str(STRIP_QUALITY), "-f", "image2pipe", "-"]
+    cmd += ["-c:v", "mjpeg", "-q:v", str(SHORT_QUALITY if sharp else STRIP_QUALITY), "-f", "image2pipe", "-"]
     return cmd
 
 
@@ -214,6 +250,8 @@ class StripBuilder(QThread):
         self.dense = dense                # hustý průchod (výkonnostní profil)
         self.threads = threads
         self.should_stop = None           # démon: zrušit při ukončení aplikace
+        self.on_fraction = None           # démon: průběh 0–1 přes oba průchody (stavový řádek)
+        self._passes = (0, 1)             # (hotové průchody, průchodů celkem)
 
     def cancel(self):
         self._cancel = True
@@ -238,8 +276,14 @@ class StripBuilder(QThread):
     def run(self):
         ok = False
         try:
+            if not self.strip.duration_ms:          # rozlišení pásu závisí na délce (edge_for)
+                self.strip.duration_ms = probe_duration_ms(self.strip.source)
+            self.strip.edge = edge_for(self.strip.duration_ms)
+            dense = self.dense and 0 < self.strip.duration_ms <= DENSE_MAX_S * 1000
+            self._passes = (0, 2 if dense else 1)
             ok = self._pass(keyframes_only=True)
-            if ok and self.dense and not self._cancel and 0 < self.strip.duration_ms <= DENSE_MAX_S * 1000:
+            if ok and dense and not self._cancel:
+                self._passes = (1, 2)
                 gap = int(1000 / DENSE_FPS / 2)
                 if self._pass(keyframes_only=False, min_gap_ms=gap):
                     self.strip.dense = True
@@ -275,7 +319,7 @@ class StripBuilder(QThread):
         flags = 0
         if os.name == "nt":
             flags = subprocess.CREATE_NO_WINDOW | 0x00004000   # BELOW_NORMAL_PRIORITY_CLASS
-        proc = subprocess.Popen(_ffmpeg_cmd(self.decode_source(), keyframes_only, hw, self.threads),
+        proc = subprocess.Popen(_ffmpeg_cmd(self.decode_source(), keyframes_only, hw, self.threads, self.strip.edge),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
         self._proc = proc
         if self.governed:
@@ -320,6 +364,10 @@ class StripBuilder(QThread):
                 if now - last_emit > 0.15:
                     last_emit = now
                     self.progress.emit(self.strip.source, len(self.strip))
+                    if self.on_fraction is not None and self.strip.duration_ms and pts:
+                        done, total = self._passes
+                        part = min(1.0, pts[-1] * 1000.0 / self.strip.duration_ms)
+                        self.on_fraction((done + part) / total)
             if not self._cancel and self.should_stop is not None and self.should_stop():
                 self.cancel()                         # démon končí (zavírání aplikace)
             if self._cancel:
@@ -414,16 +462,36 @@ class StripManager(QObject):
             self._builder.wait(timeout_ms)
 
 
-def build_strip_now(source, should_stop=None, dense=True, threads=1):
-    """Pás předem (démon, jeho vlákno): odložený, pozastavený při interakci. True = hotový."""
-    if not source or not os.path.exists(source) or ScrubStrip.load(source) is not None:
+def build_strip_now(source, should_stop=None, dense=True, threads=1, progress=None):
+    """Pás předem (démon, jeho vlákno): odložený, pozastavený při interakci. True = hotový.
+    progress(podíl 0–1) průběžně z obou průchodů."""
+    if not source or not os.path.exists(source) or has_valid_strip(source):
         return False
     builder = StripBuilder(ScrubStrip(source), governed=True, dense=dense, threads=threads)
     builder.should_stop = should_stop
+    builder.on_fraction = progress
     done = []
     builder.finished_strip.connect(lambda _s, ok: done.append(ok), type=_direct())
     builder.run()                                     # synchronně v aktuálním vlákně
     return bool(done and done[0])
+
+
+def has_valid_strip(source, path=None):
+    """Totéž rozhodnutí jako ScrubStrip.load, ale čte jen hlavičku (démon prochází celou knihovnu
+    videí při každém spuštění – načítat kvůli tomu megabajty JPEG by bylo zbytečné)."""
+    path = path or strip_path(source)
+    try:
+        if os.path.getmtime(path) < os.path.getmtime(source):
+            return False
+        with open(path, "rb") as f:
+            head = f.read(9)
+            if len(head) < 9 or head[:4] != STRIP_MAGIC or head[4] != STRIP_VERSION:
+                return False
+            (hlen,) = struct.unpack("<I", head[5:9])
+            header = json.loads(f.read(hlen).decode("utf-8"))
+    except (OSError, ValueError):
+        return False
+    return int(header.get("edge") or STRIP_EDGE) >= edge_for(header.get("duration_ms", 0))
 
 
 def _direct():

@@ -366,7 +366,9 @@ class TestLiveHover(unittest.TestCase):
         self.assertEqual(self.live.frame_for(0)[1], 1.0)
         self.assertIsNone(self.live.frame_for(1))
         cell = self.grid.visualRect(self.grid.photo_model.index(0, 0))
-        color = self.grid.viewport().grab().toImage().pixelColor(cell.center())
+        im = self.grid.viewport().grab().toImage()
+        dpr = im.devicePixelRatio()                          # snímek je ve fyzických pixelech
+        color = im.pixelColor(round(cell.center().x() * dpr), round(cell.center().y() * dpr))
         self.assertGreater(color.red(), 150, "snímek Live Photo v dlaždici")
         self.assertLess(color.blue(), 90)
         self.grid.verticalScrollBar().valueChanged.emit(10)  # posun mřížky

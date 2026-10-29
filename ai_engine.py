@@ -160,30 +160,49 @@ def compute_image_embedding(image_path):
     if not image_path or not os.path.exists(image_path):
         return None
     try:
-        img_model = get_image_model()
         with Image.open(image_path) as img:
-            img_rgb = img.convert("RGB")
-            embedding = img_model.encode(img_rgb, convert_to_numpy=True, show_progress_bar=False)
-            return encode_embedding(embedding)
+            return embed_pil(img.convert("RGB"))
     except Exception as e:
         print(f"[AI Chyba] Selhal výpočet vektoru pro {image_path}: {e}")
         return None
 
 
+def embed_pil(images):
+    """PIL obrázek (nebo seznam) -> bytes embeddingu (nebo seznam). Snímky videa jdou jednou dávkou."""
+    single = not isinstance(images, (list, tuple))
+    batch = [images] if single else list(images)
+    if not batch:
+        return []
+    vecs = get_image_model().encode(batch, convert_to_numpy=True, show_progress_bar=False)
+    vecs = np.asarray(vecs, dtype=np.float32).reshape(len(batch), -1)
+    out = [encode_embedding(v) for v in vecs]
+    return out[0] if single else out
+
+
 def _rebuild_vector_index(photo_embeddings_dict):
-    """Sestaví normalizovanou matici (a FAISS IndexFlatIP, pokud je dostupný) v RAM."""
+    """Sestaví normalizovanou matici (a FAISS IndexFlatIP, pokud je dostupný) v RAM.
+
+    Hodnota slovníku je bytes (jeden vektor) nebo n-tice bytes (video: plakát + snímky z celého
+    klipu, video_frames). Řádky jedné položky leží v matici za sebou; starts[k] = první řádek
+    položky media_ids[k] (pro np.maximum.reduceat v rank_semantic)."""
     global _cached_index_state
     media_ids = []
     vectors = []
+    starts = []
 
-    for m_id, raw_bytes in photo_embeddings_dict.items():
-        vec = decode_embedding(raw_bytes)
-        if vec is None:
-            continue
-        norm = np.linalg.norm(vec)
-        if norm > 0:
+    for m_id, raw in photo_embeddings_dict.items():
+        rows = []
+        for raw_bytes in (raw if isinstance(raw, (tuple, list)) else (raw,)):
+            vec = decode_embedding(raw_bytes)
+            if vec is None:
+                continue
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                rows.append(vec / norm)
+        if rows:
             media_ids.append(int(m_id))
-            vectors.append(vec / norm)
+            starts.append(len(vectors))
+            vectors.extend(rows)
 
     if not vectors:
         _cached_index_state = {"count": 0, "media_ids": [], "matrix": None, "faiss_index": None}
@@ -199,11 +218,16 @@ def _rebuild_vector_index(photo_embeddings_dict):
         except Exception:
             faiss_idx = None
 
+    multi = len(vectors) > len(media_ids)
+    starts = np.asarray(starts, dtype=np.int64)
     _cached_index_state = {
         "count": len(photo_embeddings_dict),
         "media_ids": media_ids,
         "matrix": matrix,
-        "faiss_index": faiss_idx
+        "faiss_index": faiss_idx,
+        # vícesnímková videa: začátky řádků položek a počet řádků (None = řádek = položka)
+        "starts": starts if multi else None,
+        "rows_per_item": np.diff(np.append(starts, len(vectors))) if multi else None,
     }
 
 
@@ -232,6 +256,9 @@ SEARCH_MIN_STATS = 24            # pod tolik položkami je rozptyl knihovny nesp
 # (maximum šumu roste s počtem) -> prahy mírně rostou s log10 velikosti (10 000 fotek: +0,38).
 SEARCH_CALIBRATED_N = 300
 SEARCH_Z_PER_DECADE = 0.25
+# z za zdvojnásobení počtu vektorů videa (frame_penalty). Kalibrace eval/eval_search.py --frames --videos:
+# 0 = 2 nepřítomné pojmy s jistou shodou; 0,25 = žádná, videa R@3 0,40 -> 0,79, MRR 0,48 -> 0,87
+SEARCH_FRAME_Z_PENALTY = 0.25
 
 CONCEPT_BANK = (
     "pes kočka kůň kráva pták ryba hmyz auto autobus vlak letadlo loď kolo motorka silnice most "
@@ -340,7 +367,10 @@ def rank_semantic(text, pool_ids, photo_embeddings_dict, face_ids=None):
     if q_vec is None or q_vec.size != matrix.shape[1]:
         return [], []                   # jiný model / poškozený výstup: žádné NaN skóre ani pád np.dot
 
-    scores = matrix @ q_vec
+    row_scores = matrix @ q_vec
+    starts = state.get("starts")
+    # Video s víc vektory (plakát + snímky celého klipu): hodnotí se nejlepším snímkem
+    scores = np.maximum.reduceat(row_scores, starts) if starts is not None else row_scores
     pool = set(pool_ids) if pool_ids is not None else None
     rows = np.array([i for i, m in enumerate(media_ids) if pool is None or m in pool], dtype=np.int64)
     if rows.size == 0:
@@ -354,7 +384,9 @@ def rank_semantic(text, pool_ids, photo_embeddings_dict, face_ids=None):
         zl_all = (scores - float(scores.mean())) / sd
     stats = _image_stats(matrix, text_model)
     if stats is not None:
-        zi_all = (scores - stats[0]) / stats[1]
+        zi_all = (row_scores - stats[0]) / stats[1]     # každý snímek vůči své bance pojmů
+        if starts is not None:
+            zi_all = np.maximum.reduceat(zi_all, starts) - frame_penalty(state["rows_per_item"])
     elif zl_all is not None:
         zi_all = zl_all                                 # bez banky pojmů (mock model): jen knihovna
     else:
@@ -365,6 +397,13 @@ def rank_semantic(text, pool_ids, photo_embeddings_dict, face_ids=None):
         key = key + SEARCH_FACE_BONUS * np.array([media_ids[i] in face_ids for i in rows], dtype=np.float32)
     confident, possible = tier_scores(zi, zl, key, n)
     return [media_ids[rows[i]] for i in confident], [media_ids[rows[i]] for i in possible]
+
+
+def frame_penalty(rows_per_item):
+    """Maximum z k snímků vyčnívá náhodou víc než jeden vektor (víc pokusů). Srážka z podle
+    počtu vektorů položky drží falešné shody videí na úrovni fotek (eval: nepřítomné pojmy)."""
+    k = np.maximum(1, np.asarray(rows_per_item, dtype=np.float32))
+    return (SEARCH_FRAME_Z_PENALTY * np.log2(k)).astype(np.float32)
 
 
 def search_by_text(query_text, photo_embeddings_dict):

@@ -30,6 +30,8 @@ DEFAULT_BUDGET_MB = 4096
 _STREAM = re.compile(r"Stream #\d+:\d+[^:]*: Video: (?P<codec>\w+)(?P<rest>[^\n]*)")
 _RES = re.compile(r"(\d{3,5})x(\d{3,5})")
 _FPS = re.compile(r"([\d.]+) fps")
+_DURATION = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+_OUT_TIME = re.compile(rb"out_time_(?:us|ms)=(\d+)")      # obojí jsou mikrosekundy (ffmpeg)
 _lock = threading.Lock()
 
 
@@ -85,7 +87,9 @@ def probe(source, ffmpeg_path=None):
     res = _RES.search(rest)
     fps = _FPS.search(rest)
     w, h = (int(res.group(1)), int(res.group(2))) if res else (0, 0)
-    return {"width": w, "height": h, "fps": float(fps.group(1)) if fps else 0.0,
+    d = _DURATION.search(text)
+    duration_ms = int((int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3))) * 1000) if d else 0
+    return {"width": w, "height": h, "fps": float(fps.group(1)) if fps else 0.0, "duration_ms": duration_ms,
             "ten_bit": bool(re.search(r"p010|10le|10be|Main 10", rest)),
             "hdr": bool(re.search(r"bt2020|arib-std-b67|smpte2084", rest)) or "DOVI" in text,
             "transfer": "smpte2084" if "smpte2084" in rest else "arib-std-b67"}   # PQ (HDR10) / HLG (iPhone)
@@ -123,9 +127,10 @@ def ffmpeg_cmd(source, target, info, threads=2, ffmpeg_path=None):
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", target]
 
 
-def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=None):
+def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=None, progress=None):
     """Vytvoří proxy (nebo značku „nepotřebuje“). Vrací cestu k proxy, None, nebo False,
-    když bylo zrušeno. Blokuje – volá se z vlákna na pozadí."""
+    když bylo zrušeno. Blokuje – volá se z vlákna na pozadí. progress(podíl 0–1) průběžně
+    z ffmpeg -progress (převod 4K HDR trvá minuty – uživatel má vidět, že se něco děje)."""
     if not source or not os.path.exists(source):
         return None
     if is_settled(source):
@@ -138,13 +143,17 @@ def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=
     target = proxy_path(source)
     tmp = f"{target}.{threading.get_ident()}.tmp.mp4"
     cmd = ffmpeg_cmd(source, tmp, info, threads=threads, ffmpeg_path=ffmpeg_path)
+    cmd[1:1] = ["-progress", "pipe:1", "-nostats"]
     flags = _no_window() | (0x00004000 if os.name == "nt" else 0)   # BELOW_NORMAL_PRIORITY_CLASS
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=flags)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
     except OSError:
         return None
     if governor is not None:
         governor.register_process(proc.pid)
+    done_us = [0]
+    threading.Thread(target=_read_progress, args=(proc.stdout, done_us), daemon=True).start()
+    total_us = max(0, int(info.get("duration_ms") or 0)) * 1000
     cancelled = False
     try:
         while proc.poll() is None:
@@ -152,6 +161,8 @@ def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=
                 cancelled = True
                 proc.kill()
                 break
+            if progress is not None and total_us:
+                progress(min(1.0, done_us[0] / total_us))
             time.sleep(0.2)
         proc.wait()
     finally:
@@ -166,6 +177,73 @@ def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=
         return False if cancelled else None
     os.replace(tmp, target)
     return target
+
+
+def _read_progress(stream, done_us):
+    """Vlákno: čte ffmpeg -progress (klíč=hodnota po řádcích), drží zpracovaný čas (µs)."""
+    try:
+        for line in stream:
+            m = _OUT_TIME.match(line)
+            if m:
+                done_us[0] = int(m.group(1))
+    except (OSError, ValueError):
+        pass
+
+
+class PrepProgress:
+    """Celkový průběh přípravy videí pro stavový řádek: vážený délkou videí (16min video není
+    totéž co 3s klip), odhad zbývajícího času jen z času skutečné práce (pozastavení během
+    přehrávání / gest se nepočítá) a jasné „čeká“, když je ffmpeg pozastavený.
+
+    weights = délky čekajících videí (ms; 0 = neznámá -> průměr ostatních)."""
+    MIN_ETA_S = 8.0                      # dřív je odhad jen šum
+    MIN_ETA_FRAC = 0.03
+
+    def __init__(self, weights, clock=time.monotonic):
+        known = [w for w in weights if w > 0]
+        mean = sum(known) / len(known) if known else 1.0
+        self.weights = [w if w > 0 else mean for w in weights]
+        self.total = sum(self.weights) or 1.0
+        self._before = [sum(self.weights[:i]) for i in range(len(self.weights))]
+        self._clock = clock
+        self._last = None
+        self.active_s = 0.0
+        self.fraction = 0.0
+
+    def update(self, index, item_fraction, paused=False):
+        """Položka index je hotová z item_fraction (0–1). Vrací text stavového řádku."""
+        now = self._clock()
+        if self._last is not None and not paused:
+            self.active_s += max(0.0, now - self._last)
+        self._last = now
+        index = max(0, min(len(self.weights) - 1, index)) if self.weights else 0
+        done = (self._before[index] + self.weights[index] * max(0.0, min(1.0, item_fraction))) if self.weights else 0
+        self.fraction = max(self.fraction, min(1.0, done / self.total))   # nikdy necouvá
+        return self.text(index, paused)
+
+    def eta_s(self):
+        if self.active_s < self.MIN_ETA_S or self.fraction < self.MIN_ETA_FRAC:
+            return None
+        return self.active_s * (1.0 - self.fraction) / self.fraction
+
+    def text(self, index, paused=False):
+        n = len(self.weights)
+        pct = int(self.fraction * 100)
+        head = "Příprava videí pozastavena, dokud pracujete" if paused else "Připravuji videa"
+        parts = [head, f"{index + 1} z {n}", f"{pct} %"]
+        eta = None if paused else self.eta_s()
+        if eta is not None:
+            parts.append(_eta_text(eta))
+        return " · ".join(parts)
+
+
+def _eta_text(seconds):
+    if seconds < 60:
+        return "zbývá méně než minuta"
+    minutes = int(round(seconds / 60.0))
+    if minutes < 60:
+        return f"zbývá asi {minutes} min"
+    return f"zbývá asi {minutes // 60} h {minutes % 60:02d} min"
 
 
 def cache_size():

@@ -529,14 +529,14 @@ class TestMapEngine(unittest.TestCase):
         self.js("window.endJourney(true); 0")
 
     def test_stop_shows_single_best_shot(self):
-        self.js("POP_MS = 120; HOLD_MS = 2000; 0")
         self.assertTrue(self.js(f"playJourney({json.dumps(TRAIL_TRIP)})"))
         self.js("reduceMotion = true; journeySkip(1); 0")         # zastávka 0
-        self.js("reduceMotion = true; journeySkip(1); 0")         # zastávka 1 (3 fotky, best = 3)
+        self.js("journeySkip(1); 0")                              # zastávka 1 (3 fotky, best = 3)
         self.assertTrue(self.until("journeyState().polaroids === 1"))
-        self.assertEqual(self.js("document.querySelector('#jpol .polaroid').dataset.id"), "3")
-        self.assertTrue(self.js("document.querySelector('#jpol .polaroid').classList.contains('hero')"))
-        self.js("HOLD_MS = 1700; POP_MS = 700; window.endJourney(true); 0")
+        # okamžik ukáže nejdřív nejlepší snímek (best), další fotka zastávky je až druhá
+        self.assertEqual(self.js("document.querySelector('#jmoment .moment.show .ph.on').dataset.id"), "3")
+        self.assertEqual(self.js("document.querySelector('#jmoment .moment.show').dataset.stop"), "1")
+        self.js("reduceMotion = false; window.endJourney(true); 0")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

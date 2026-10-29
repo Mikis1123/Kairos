@@ -455,10 +455,10 @@ class TestMapPage(unittest.TestCase):
         self.assertGreater(len(flight), 3)
         self.assertGreater(abs(mid[1] - chord[1]), 0.005, "dlouhĂ˝ let po hlavnĂ­ kruĹľnici (oblouk)")
         self.assertLess(self.js("hopZoom(300)"), self.js("hopZoom(30)"), "dĂˇl = vĂ˝Ĺˇ")
-        # Fáze 1: koridor prvních úseků se přednačítá už při startu Cesty -> cíl zastávky 2 je
-        # ve frontě dřív, než se k ní dojede (prefetchStop už nic nového nepřidá)
-        self.assertGreater(self.js("Object.keys(prefetchSeen).length"), 0, "dlaždice koridoru ve frontě")
-        self.assertEqual(self.js("prefetchStop(2)"), 0, "cíl zastávky 2 už přednačten z koridoru")
+        # Cesta 2.0: přednačítá se podle plánu kamery na PREFETCH_AHEAD_S dopředu už při startu ->
+        # cíl první zastávky je ve frontě dřív, než se k ní doletí (prefetchStop nic nového nepřidá)
+        self.assertGreater(self.js("Object.keys(prefetchSeen).length"), 0, "dlaždice dráhy kamery ve frontě")
+        self.assertEqual(self.js("prefetchStop(0)"), 0, "cíl první zastávky už přednačten z plánu")
         self.js("window.endJourney(true); 0")
 
 

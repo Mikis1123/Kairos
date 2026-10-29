@@ -10,16 +10,78 @@ Metriky (jen viditelné položky mřížky; „ignore“ se nepočítá):
   facet = výsledek přesně odpovídá SQL podmínce (místo, čas, typ, příznak)
   negative = pojem v knihovně není: kolik dotazů má jistou shodu (má být 0) a kolik je prázdných
 Cíl Fáze 1: R@20 ≥ 0,80, P@10 ≥ 0,70, žádná jistá shoda u nepřítomných pojmů.
+
+Videa (vícesnímkový index, video_frames):
+    python eval/eval_search.py --frames            # + snímky celých videí (v paměti, cache v %TEMP%)
+    python eval/eval_search.py --frames --videos   # + zlatá sada videí (search_golden_video.json)
+    python eval/eval_search.py --videos            # totéž jen s plakáty (srovnání)
+  video R@3 = relevantní videa mezi prvními 3 v kolekci Videa (vesmír = jen videa), MRR = průměr
+  1/pořadí prvního relevantního, „v knihovně“ = relevantní video je ve výsledku hledání celé knihovny.
 """
 import argparse
 import json
 import os
+import pickle
 import sqlite3
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+FRAME_CACHE = os.path.join(tempfile.gettempdir(), "kairos_eval_frames.pkl")
+
+
+def frame_vectors(conn, ids):
+    """{id videa: [bytes, ...]} snímků celého klipu; spočítané jednou, pak z FRAME_CACHE."""
+    import ai_engine
+    import video_frames
+    try:
+        with open(FRAME_CACHE, "rb") as f:
+            cache = pickle.load(f)
+    except (OSError, pickle.UnpicklingError, EOFError):
+        cache = {}
+    changed = False
+    for mid, path in conn.execute("SELECT id, file_path FROM media_items WHERE media_type = 'video'"):
+        if mid not in ids:
+            continue
+        key = f"{mid}|{path}|{video_frames.FRAMES_MAX}|{video_frames.EDGE_TRIM}"
+        if key not in cache:
+            frames = video_frames.extract_frames(path)
+            cache[key] = ai_engine.embed_pil([img for _ms, img in frames]) if frames else []
+            changed = True
+    if changed:
+        with open(FRAME_CACHE, "wb") as f:
+            pickle.dump(cache, f)
+    out = {}
+    for key, vecs in cache.items():
+        mid = int(key.split("|", 1)[0])
+        if mid in ids and vecs:
+            out[mid] = vecs
+    return out
+
+
+def eval_videos(conn, universe, emb, vocab):
+    import search_engine
+    gold = json.load(open(os.path.join(HERE, "search_golden_video.json"), encoding="utf-8"))["queries"]
+    vids = [r[0] for r in conn.execute("SELECT id FROM media_items WHERE media_type = 'video'") if r[0] in set(universe)]
+    vids = [m for m in universe if m in set(vids)]          # pořadí kolekce
+    r3, mrr, in_lib, n_rel = [], [], 0, 0
+    for g in gold:
+        rel = set(g["videos"]) & set(vids)
+        if not rel:
+            continue
+        res = search_engine.run_search(g["q"], vids, emb, vocab=vocab)
+        got = res.ids
+        k = min(3, len(rel))
+        r3.append(len(set(got[:3]) & rel) / k)
+        first = next((i for i, m in enumerate(got) if m in rel), None)
+        mrr.append(0.0 if first is None else 1.0 / (first + 1))
+        lib = set(search_engine.run_search(g["q"], universe, emb, vocab=vocab).ids)
+        in_lib += len(rel & lib)
+        n_rel += len(rel)
+    print(f"Videa ({len(r3)} dotazů): R@3 {sum(r3) / len(r3):.3f}   MRR {sum(mrr) / len(mrr):.3f}   "
+          f"v knihovně {in_lib}/{n_rel}")
 
 
 def expand(spec):
@@ -35,6 +97,9 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="embeddingy z miniatur (v paměti)")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--db", default=os.path.join(ROOT, "photos.db"))
+    ap.add_argument("--frames", action="store_true", help="videa i se snímky celého klipu")
+    ap.add_argument("--videos", action="store_true", help="i zlatá sada videí")
+    ap.add_argument("--penalty", type=float, help="SEARCH_FRAME_Z_PENALTY (kalibrace)")
     args = ap.parse_args()
 
     import ai_engine
@@ -53,6 +118,11 @@ def main():
                     emb[mid] = v
     else:
         emb = {r[0]: r[1] for r in conn.execute("SELECT media_id, embedding FROM image_embeddings")}
+    if args.penalty is not None:
+        ai_engine.SEARCH_FRAME_Z_PENALTY = args.penalty
+    if args.frames:
+        for mid, vecs in frame_vectors(conn, set(universe)).items():
+            emb[mid] = tuple([emb[mid]] if mid in emb else []) + tuple(vecs)
     vocab = search_engine.load_vocab(conn)
     gold = json.load(open(os.path.join(HERE, "search_golden.json"), encoding="utf-8"))["queries"]
     uni = set(universe)
@@ -92,6 +162,8 @@ def main():
     print(f"Obraz ({n} dotazů): R@20 {sum(rec) / n:.3f}   P@10 {sum(prec) / n:.3f}")
     print(f"Fazety: {facet_ok}/{facet_n} přesně")
     print(f"Nepřítomné pojmy ({neg_n}): s jistou shodou {neg_conf}, prázdné {neg_empty}")
+    if args.videos:
+        eval_videos(conn, universe, emb, vocab)
     target = sum(rec) / n >= 0.80 and sum(prec) / n >= 0.70 and neg_conf == 0 and facet_ok == facet_n
     print("CÍL SPLNĚN" if target else "CÍL NESPLNĚN")
     return 0 if target else 1

@@ -366,13 +366,13 @@ class TestGlobePage(unittest.TestCase):
         self.js("setAccent('#8B7CF6'); 0")
 
     def test_journey_playback(self):
-        """Celé přehrání se zkrácenými časy: kapsle -> zastávky -> polaroidy -> pás -> konec."""
+        """Celý film zrychleně: titulek -> okamžiky zastávek -> kapitoly -> konec (Cesta 2.0)."""
         trip = json.loads(json.dumps(TRIP))
         url = QUrl.fromLocalFile(self.thumb).toString()
         for s in trip["stops"]:
             for p in s["photos"]:
                 p["thumb"] = url
-        self.js("POP_MS = 120; HOLD_MS = 150; DROP_MS = 150; ORBIT_MS = 100; 0")
+        self.js("FILM_SPEED = 12; 0")
         markers = [{"id": 1, "lat": 49.2, "lon": 13.4, "name": "a", "city": "", "date": "", "thumb": ""}]
         self.js(f"setMarkers({json.dumps(markers)})")
         self.assertTrue(self.js(f"playJourney({json.dumps(trip)})"))
@@ -384,67 +384,86 @@ class TestGlobePage(unittest.TestCase):
         self.assertTrue(self.js("document.getElementById('jcap').classList.contains('show')"))
         self.assertIn("2 zastávky", self.js("document.getElementById('jmeta').textContent"))
         self.assertFalse(self.js("getPinState().visible"), "piny se během Cesty schovají")
-        self.js("reduceMotion = true; journeySkip(1); 0")         # rovnou na první zastávku, bez letu
-        self.assertEqual(self.js("journeyState().index"), 0)
+        self.assertEqual(self.js("journeyState().frames"), 2, "kapitola za každou zastávku hned od začátku")
+        self.js("journeySkip(1); 0")                              # střih rovnou na okamžik první zastávky
+        st = self.js("journeyState()")
+        self.assertEqual(st["index"], 0)
+        self.assertEqual(st["segment"], "dwell")
         self.assertFalse(self.js("document.getElementById('jcap').classList.contains('show')"))
-        self.assertEqual(self.js("journeyState().place"), "Kolinec")
-        self.assertEqual(self.js("journeyState().sky"), "#6FA6EE", "poledne = denní obloha")
+        self.assertEqual(st["place"], "Kolinec")
+        self.assertEqual(st["sky"], "#6FA6EE", "poledne = denní obloha")
         self.assertIn("Den", self.js("document.getElementById('jwhen').textContent"))
-        for _ in range(40):
-            if self.js("journeyState().polaroids") == 1:
+        # okamžik zastávky: jediný nejlepší snímek (best, jinak první fotka) ve velké kartě
+        self.assertEqual(st["polaroids"], 1, "okamžik zastávky je vidět")
+        self.assertIn(os.path.basename(self.thumb),
+                      self.js("document.querySelector('#jmoment .moment.show .ph').style.backgroundImage"))
+        self.assertIn("Kolinec", self.js("document.querySelector('#jmoment .moment.show .place').textContent"))
+        self.assertTrue(self.js("document.querySelector('#jstrip .chap').classList.contains('now')"))
+        self.m.fake.opened.clear()
+        self.js("document.querySelector('#jmoment .moment.show .shot').click(); 0")
+        for _ in range(30):                                       # QWebChannel je asynchronní
+            if self.m.fake.opened:
                 break
             wait(50)
-        # Refaktor Cesty: zastávka ukáže jediný nejlepší snímek (best, jinak první fotka)
-        self.assertEqual(self.js("journeyState().polaroids"), 1, "nejlepší snímek zastávky vyskočí")
-        self.assertIn(os.path.basename(self.thumb),
-                      self.js("document.querySelector('.polaroid .ph').style.backgroundImage"))
-        for _ in range(60):
+        self.assertEqual(self.m.fake.opened, [11], "snímek okamžiku otevře fotku")
+        self.assertTrue(self.js("journeyState().paused"), "otevření fotky film pozastaví")
+        self.js("journeyPause(); 0")
+        for _ in range(80):
             if self.js("journeyState().index") == 1:
                 break
             wait(50)
         st = self.js("journeyState()")
-        self.assertEqual(st["index"], 1, "po polaroidech další zastávka")
-        self.assertEqual(st["frames"], 1, "snímek první zastávky je ve filmovém pásu")
+        self.assertEqual(st["index"], 1, "po okamžiku přesun k další zastávce")
         self.assertEqual(st["place"], "Kašperské Hory")
+        for _ in range(80):
+            if self.js("journeyState().segment") == "dwell":
+                break
+            wait(50)
         self.assertEqual(self.js("Math.round(skyNow.el) < -10"), True, "23:30 = noc")
         self.assertGreater(self.js("+document.getElementById('tint').style.opacity"), 0.5, "noční tónování")
-        for _ in range(60):
-            if self.js("journeyState().ended"):
+        for _ in range(120):
+            if self.js("journeyState().ended && journeyState().t >= journeyState().total"):
                 break
             wait(50)
         st = self.js("journeyState()")
         self.assertTrue(st["ended"])
-        self.assertEqual(st["frames"], 2, "jedno políčko za zastávku")
-        self.assertEqual(self.js("document.querySelectorAll('#jstrip .divider').length"), 1, "oddělovač zastávek")
-        self.m.fake.opened.clear()
-        self.js("document.querySelector('#jstrip .frame').click(); 0")
-        for _ in range(30):
-            if self.m.fake.opened:
-                break
-            wait(50)
-        self.assertEqual(self.m.fake.opened, [11], "políčko pásu otevře fotku")
+        self.assertTrue(self.js("document.getElementById('jcap').classList.contains('end')"), "závěrečná karta")
+        self.assertEqual(self.js("document.querySelectorAll('#jstrip .chap.seen').length"), 2, "vše viděno")
+        self.js("document.querySelectorAll('#jstrip .chap')[1].click(); 0")
+        st = self.js("journeyState()")
+        self.assertEqual((st["index"], st["segment"], st["ended"]), (1, "dwell", False), "kapitola = skok na zastávku")
         self.assertTrue(self.js("window.endJourney()"))
         st = self.js("journeyState()")
         self.assertFalse(st["active"])
         self.assertFalse(st["route"], "trasa z mapy pryč")
         self.assertTrue(self.js("getPinState().visible"), "piny zpět po konci Cesty")
+        for _ in range(60):                                       # obloha se vrací plynule (1,5 s)
+            if self.js("+document.getElementById('tint').style.opacity") == 0:
+                break
+            wait(50)
         self.assertEqual(self.js("+document.getElementById('tint').style.opacity"), 0, "zpět den")
 
     def test_journey_pause_and_keyboard(self):
-        self.js("POP_MS = 120; HOLD_MS = 3000; reduceMotion = true; 0")
+        self.js("reduceMotion = true; 0")
         self.assertTrue(self.js(f"playJourney({json.dumps(TRIP)})"))
         self.js("journeySkip(1); 0")
         self.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: ' '})); 0")
         self.assertTrue(self.js("journeyState().paused"))
+        self.assertTrue(self.js("document.body.classList.contains('paused')"), "pauza zastaví i Ken Burns")
         self.assertEqual(self.js("document.getElementById('jplay').getAttribute('aria-label')"), "Přehrát")
+        t = self.js("journeyState().t")
+        wait(200)
+        self.assertEqual(self.js("journeyState().t"), t, "čas filmu v pauze stojí")
         self.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight'})); 0")
         st = self.js("journeyState()")
         self.assertEqual(st["index"], 1)
         self.assertFalse(st["paused"])
-        self.assertEqual(st["frames"], 1, "přeskočený snímek zastávky rovnou do pásu")
+        self.assertEqual(st["polaroids"], 1, "přeskočená zastávka rovnou ukáže svůj okamžik")
+        self.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowLeft'})); 0")
+        self.assertEqual(self.js("journeyState().index"), 0)
         self.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'})); 0")
         self.assertFalse(self.js("journeyState().active"))
-        self.js("HOLD_MS = 1700; POP_MS = 700; 0")
+        self.js("reduceMotion = false; 0")
 
     def test_hidden_tab_pauses_journey(self):
         self.js("reduceMotion = true; 0")
