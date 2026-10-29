@@ -746,16 +746,31 @@
       if (!map.hasImage(e.id)) map.addImage(e.id, BLANK_ICON);
     });
     map.on('style.load', onStyleLoad);
-    map.on('zoomend', function () { syncTerrain(); render(); });
+    // Režisér Cesty volá jumpTo za snímek a jumpTo synchronně vysílá zoomend / moveend – bez téhle
+    // pojistky se za KAŽDÝ snímek Cesty přepočítávaly shluky pinů a terén (piny jsou přitom skryté)
+    map.on('zoomend', function () { if (director.directing) return; syncTerrain(); render(); });
     // oddalování (přelet zpět na zeměkouli): terén vypnout dřív, než se rovina zakřiví
-    map.on('zoom', function () { if (map.getTerrain() && !terrainAllowed()) syncTerrain(); });
+    map.on('zoom', function () { if (!director.directing && map.getTerrain() && !terrainAllowed()) syncTerrain(); });
     map.on('moveend', function () {
-      if (journey.tracing) return;      // kamera Cesty jede po trase (jumpTo za snímek)
+      if (director.directing) return;   // kamera Cesty jede po trase (jumpTo za snímek)
       terrainHold = false; syncTerrain(); render();
+      setInteraction('map', false);
+      restResolution();
     });
-    map.on('movestart', function (e) { hidePinCard(); if (e.originalEvent) userActed(); });
+    map.on('movestart', function (e) {
+      hidePinCard();
+      if (e.originalEvent) userActed();
+      if (!director.directing) setInteraction('map', true);
+    });
     ['mousedown', 'touchstart', 'wheel'].forEach(function (t) { map.on(t, userActed); });
-    map.on('render', function () { renderFrames++; });
+    map.on('render', function () {
+      renderFrames++;
+      if (map.isMoving() || director.directing) {
+        var now = performance.now();
+        meterTick(mapMeter, now);
+        adaptResolution(now);
+      }
+    });
     map.on('mousemove', 'pins', onPinMove);
     map.on('mouseleave', 'pins', function () { setPinHover(null); });
     map.on('click', 'pins', onPinClick);
@@ -772,6 +787,7 @@
     mapImages = {};                     // setStyle zahodí obrázky mapy – piny se přidají znovu
     tileSourceIds = Object.keys((map.getStyle() || {}).sources || {});
     applyTileLod();
+    if (PERF.map_hillshade === false && map.getLayer('relief')) map.setLayoutProperty('relief', 'visibility', 'none');
     applySky(skyNow.sky ? skyNow : DAY_SKY);
     syncTerrain();
     addPinLayers();
@@ -868,6 +884,94 @@
   window.renderStats = function () { return { frames: renderFrames, moving: !!(map && map.isMoving()),
                                               spinning: spinning, globe: globeRendering() }; };
   window.isTerrainOn = function () { return !!(map && map.getTerrain()); };
+
+  // ── Adaptivní škálování (Fáze 1) ────────────────────────────────────────────
+  // Profil stroje z aplikace (perf_profile.py) dává meze; uvnitř nich se rozlišení plátna řídí
+  // skutečnou dobou snímku: při pohybu kamery nad rozpočtem se sníží (méně pixelů na integrované
+  // grafice), v klidu se vrátí na plnou ostrost. LOD dlaždic a terén podle úrovně stroje.
+  var PERF = { tier: 'high', refresh_hz: 60, map_pixel_ratio_max: 0, map_pixel_ratio_min: 1.25,
+               map_lod_levels: TILE_LOD_ZOOM_LEVELS, map_lod_ratio: TILE_LOD_RATIO, map_terrain: true,
+               map_terrain_exaggeration: TERRAIN_EXAGGERATION, map_hillshade: true };
+  var RES_STEP = 0.25, RES_SLOW = 1.35, RES_FAST = 0.9, RES_HOLD_MS = 900, RES_REST_MS = 450;
+  var res = { ratio: 0, ema: 0, lastFrame: 0, slowSince: 0, fastSince: 0, changedAt: 0, restTimer: 0 };
+  function nativeRatio() { return window.devicePixelRatio || 1; }
+  function maxRatio() {
+    return PERF.map_pixel_ratio_max > 0 ? Math.min(nativeRatio(), PERF.map_pixel_ratio_max) : nativeRatio();
+  }
+  function minRatio() { return Math.min(maxRatio(), PERF.map_pixel_ratio_min || 1); }
+  function setRatio(r) {
+    r = Math.max(minRatio(), Math.min(maxRatio(), r));
+    if (!map || Math.abs(r - (res.ratio || map.getPixelRatio())) < 0.01) return;
+    res.ratio = r;
+    res.changedAt = performance.now();
+    try { map.setPixelRatio(r); } catch (e) { /* starší MapLibre */ }
+  }
+  function frameBudgetMs() { return 1000 / Math.max(30, PERF.refresh_hz || 60); }
+  function adaptResolution(now) {     // volá se z 'render' během pohybu kamery
+    var dt = res.lastFrame ? now - res.lastFrame : 0;
+    res.lastFrame = now;
+    if (!dt || dt > 250) return;      // první snímek pohybu / mezera = klid, ne pomalý snímek
+    res.ema = res.ema ? res.ema * 0.85 + dt * 0.15 : dt;
+    var budget = frameBudgetMs(), cur = res.ratio || (map ? map.getPixelRatio() : 1);
+    if (res.ema > budget * RES_SLOW) {
+      res.fastSince = 0;
+      if (!res.slowSince) res.slowSince = now;
+      if (now - res.slowSince > 350 && now - res.changedAt > RES_HOLD_MS && cur > minRatio() + 0.01) setRatio(cur - RES_STEP);
+    } else if (res.ema < budget * RES_FAST) {
+      res.slowSince = 0;
+      if (!res.fastSince) res.fastSince = now;
+      if (now - res.fastSince > 1500 && now - res.changedAt > RES_HOLD_MS && cur < maxRatio() - 0.01) setRatio(cur + RES_STEP);
+    }
+  }
+  function restResolution() {         // klid: plná ostrost (statický snímek se kreslí jen jednou)
+    clearTimeout(res.restTimer);
+    res.restTimer = setTimeout(function () {
+      res.lastFrame = 0; res.ema = 0; res.slowSince = res.fastSince = 0;
+      if (map && !map.isMoving() && !director.directing) setRatio(maxRatio());
+    }, RES_REST_MS);
+  }
+  window.setPerfProfile = function (p) {
+    if (!p || typeof p !== 'object') return PERF.tier;
+    Object.keys(PERF).forEach(function (k) { if (p[k] !== undefined) PERF[k] = p[k]; });
+    TERRAIN_EXAGGERATION = +PERF.map_terrain_exaggeration || TERRAIN_EXAGGERATION;
+    TILE_LOD_ZOOM_LEVELS = +PERF.map_lod_levels || TILE_LOD_ZOOM_LEVELS;
+    TILE_LOD_RATIO = +PERF.map_lod_ratio || TILE_LOD_RATIO;
+    applyTileLod();
+    if (map) setRatio(maxRatio());
+    return PERF.tier;
+  };
+  window.getPerfState = function () {
+    return { tier: PERF.tier, ratio: map ? map.getPixelRatio() : 0, max: maxRatio(), min: minRatio(), lod: tileLod };
+  };
+
+  // ── Měření doby snímku (Fáze 0) – čte ho aplikace (Ctrl+Shift+F) ──────────────
+  function makeMeter() { return { last: 0, d: [] }; }
+  var mapMeter = makeMeter(), journeyMeter = makeMeter();
+  function meterTick(m, now) {
+    if (m.last) {
+      var dt = now - m.last;
+      if (dt > 0 && dt <= 250) { m.d.push(dt); if (m.d.length > 1200) m.d.shift(); }
+    }
+    m.last = now;
+  }
+  function meterStats(m) {
+    var d = m.d.slice().sort(function (a, b) { return a - b; }), n = d.length;
+    if (!n) return { frames: 0 };
+    var pct = function (p) { return d[Math.min(n - 1, Math.round(p / 100 * (n - 1)))]; };
+    var budget = frameBudgetMs();
+    return { frames: n, p50: pct(50), p95: pct(95), p99: pct(99),
+             dropped: d.filter(function (x) { return x > 1.5 * budget; }).length };
+  }
+  window.getFrameStats = function () { return { map: meterStats(mapMeter), journey: meterStats(journeyMeter) }; };
+  window.resetFrameStats = function () { mapMeter = makeMeter(); journeyMeter = makeMeter(); return true; };
+
+  // Pohyb kamery mimo Cestu -> práce aplikace na pozadí počká (governor)
+  var interaction = { map: false, journey: false };
+  function setInteraction(reason, on) {
+    if (interaction[reason] === on) return;
+    interaction[reason] = on;
+    if (bridge && bridge.setInteraction) bridge.setInteraction(reason, on);
+  }
 
   window.setBaseLayer = function (name, notify) {
     name = LEGACY_LAYERS[name] || name;
@@ -1637,7 +1741,8 @@
     if (!src || !map.getSource(src)) return [];
     try { return map.querySourceFeatures(src, { sourceLayer: 'transportation' }); } catch (e) { return []; }
   }
-  function trailLeg(i, features) {
+  // Body úseku i (střed -> odjezd -> příjezd -> střed) a ceny podle způsobu dopravy, nebo null
+  function trailWaypoints(i) {
     var st = journey.data.stops, A = st[i - 1], B = st[i];
     if (!A || !B) return null;
     var a = stopLL(A), b = stopLL(B), km = haversineKm(a, b);
@@ -1647,13 +1752,24 @@
       if (p && haversineKm(p, wps[wps.length - 1]) > 0.03 && haversineKm(p, b) > 0.03) wps.push(p);
     });
     wps.push(b);
+    return { wps: wps, km: km, costs: ROAD_COST[travelMode(A, B, km)] };
+  }
+  function trailLeg(i, features) {
+    var w = trailWaypoints(i);
+    if (!w) return null;
     features = features || roadFeatures();
     if (!features.length) return null;
+    return trailLegCore(w.wps, features, w.costs, w.km);
+  }
+  // Čistá funkce (bez mapy a stavu Cesty): běží i ve Web Workeru (requestTrail), takže graf
+  // cest a A* nikdy nebrzdí snímek, ve kterém se kamera rozjíždí.
+  function trailLegCore(wps, features, costs, km) {
+    var a = wps[0], b = wps[wps.length - 1];
     var pad = Math.max(0.5, 0.3 * km) / 111, lons = wps.map(function (p) { return p[0]; }),
         lats = wps.map(function (p) { return p[1]; }), kx = Math.cos(a[1] * Math.PI / 180) || 1;
     var bbox = [Math.min.apply(null, lons) - pad / kx, Math.min.apply(null, lats) - pad,
                 Math.max.apply(null, lons) + pad / kx, Math.max.apply(null, lats) + pad];
-    var graph = buildRoadGraph(features, bbox, ROAD_COST[travelMode(A, B, km)]);
+    var graph = buildRoadGraph(features, bbox, costs);
     if (graph.count < 2) return null;
     var snapped = wps.map(function (p) { return nearestNode(graph, p); });
     if (snapped.some(function (n) { return !n; })) return null;
@@ -1691,6 +1807,68 @@
     var st = journey.data && journey.data.stops;
     return st && st[i] && st[i - 1] ? travelMode(st[i - 1], st[i], haversineKm(stopLL(st[i - 1]), stopLL(st[i]))) : null;
   };
+  // ── Trasa po cestách mimo hlavní vlákno (Fáze 1) ────────────────────────────
+  // Dřív se graf a A* počítaly synchronně v goStop – přesně ve snímku, kdy se kamera rozjíždí.
+  // Teď se úsek i+1 vyžádá už během zastávky i (kamera stojí, fotka je přes mapu) a spočte ho
+  // Web Worker; goStop vezme hotovou trasu, jinak hladkou křivku (žádné čekání).
+  var trailWorker = null, trailWorkerFailed = false, trailSeq = 0;
+  function getTrailWorker() {
+    if (trailWorker || trailWorkerFailed || !window.Worker || !window.Blob) return trailWorker;
+    try {
+      var consts = 'var TRAIL_SNAP_KM=' + TRAIL_SNAP_KM + ',TRAIL_DETOUR=' + TRAIL_DETOUR + ',TRAIL_DETOUR_KM=' + TRAIL_DETOUR_KM
+                 + ',TRAIL_MAX_POINTS=' + TRAIL_MAX_POINTS + ',TRAIL_SIMPLIFY_KM=' + TRAIL_SIMPLIFY_KM + ';\n';
+      var src = consts + [haversineKm, buildRoadGraph, nearestNode, heapPush, heapPop, aStar, simplifyLine, pathKm,
+                          trailLegCore].map(String).join('\n')
+              + '\nonmessage = function (e) { var d = e.data, path = null;'
+              + ' try { path = trailLegCore(d.wps, d.features, d.costs, d.km); } catch (err) { path = null; }'
+              + ' postMessage({ seq: d.seq, leg: d.leg, path: path }); };';
+      trailWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'application/javascript' })));
+      trailWorker.onmessage = onTrailComputed;
+      trailWorker.onerror = function () { trailWorkerFailed = true; trailWorker = null; };
+    } catch (e) { trailWorkerFailed = true; trailWorker = null; }
+    return trailWorker;
+  }
+  function plainRoads(features) {     // jen geometrie a třída – přenos do Workeru bez objektů MapLibre
+    var out = [];
+    for (var k = 0; k < features.length; k++) {
+      var f = features[k], g = f && f.geometry;
+      if (!g || (g.type !== 'LineString' && g.type !== 'MultiLineString')) continue;
+      out.push({ geometry: { type: g.type, coordinates: g.coordinates },
+                 properties: { 'class': f.properties ? f.properties['class'] : null } });
+    }
+    return out;
+  }
+  function requestTrail(i) {
+    if (!journey.data || i < 1 || i >= journey.data.stops.length) return false;
+    var trails = journey.trails || (journey.trails = {}), pending = journey.trailPending || (journey.trailPending = {});
+    if (trails[i] || pending[i]) return false;
+    var w = trailWaypoints(i);
+    if (!w) return false;
+    var features = roadFeatures();
+    if (!features.length) return false;
+    var worker = getTrailWorker(), seq = ++trailSeq, data = journey.data;
+    pending[i] = seq;
+    if (worker) {
+      worker.postMessage({ seq: seq, leg: i, wps: w.wps, features: plainRoads(features), costs: w.costs, km: w.km });
+    } else {
+      setTimeout(function () {                         // bez Workeru: aspoň mimo snímek rozjezdu
+        if (journey.data === data) onTrailComputed({ data: { seq: seq, leg: i, path: trailLeg(i, features) } });
+      }, 0);
+    }
+    return true;
+  }
+  function onTrailComputed(e) {
+    var d = e.data, pending = journey.trailPending || {};
+    if (!journey.active || pending[d.leg] !== d.seq) return;         // jiná Cesta / zastaralé
+    delete pending[d.leg];
+    if (!d.path || d.path.length < 2) return;
+    (journey.trails || (journey.trails = {}))[d.leg] = d.path;
+    if (journey.legs && journey.i < d.leg) journey.legs[d.leg] = null;   // běžící úsek nepřekreslovat
+    var all = map && map.getSource('j-all');
+    if (all) all.setData(lineFeature(allRouteCoords()));
+  }
+  window.requestTrail = requestTrail;
+
   function trailZoom(km) {            // krátký úsek blíž (stezka je vidět), delší výš
     return Math.max(12.6, Math.min(15.4, 15.6 - 1.25 * Math.log2(Math.max(0.3, km) / 0.3)));
   }
@@ -1763,16 +1941,26 @@
 
   function addRouteLayers() {
     if (!map || !journey.data || !styleReady || map.getSource('j-all')) return;
+    var cur = Math.max(0, journey.i);
     map.addSource('j-all', { type: 'geojson', data: lineFeature(allRouteCoords()) });
-    map.addSource('j-done', { type: 'geojson', data: lineFeature(routeCoords(Math.max(0, journey.i), 1)) });
+    map.addSource('j-done', { type: 'geojson', data: lineFeature(routeCoords(cur - 1, 1)) });
+    // Projížděný úsek: vlastní zdroj s délkou čáry (lineMetrics) – projetá část je přechod barvy
+    // na line-progress, posouvaný za snímek přes setPaintProperty (žádné setData za snímek)
+    map.addSource('j-cur', { type: 'geojson', lineMetrics: true, data: curLegFeature(cur) });
     map.addSource('j-stops', { type: 'geojson', data: stopsFeatures(journey.i) });
-    var a = accent();
-    map.addLayer({ id: 'j-all', type: 'line', source: 'j-all', layout: { 'line-cap': 'round', 'line-join': 'round' },
+    var a = accent(), cap = { 'line-cap': 'round', 'line-join': 'round' };
+    journey.curLeg = cur;
+    journey.curFrac = -1;
+    map.addLayer({ id: 'j-all', type: 'line', source: 'j-all', layout: cap,
                    paint: { 'line-color': a, 'line-opacity': 0.5, 'line-width': 2.4, 'line-dasharray': [1.2, 1.6] } });
-    map.addLayer({ id: 'j-glow', type: 'line', source: 'j-done', layout: { 'line-cap': 'round', 'line-join': 'round' },
+    map.addLayer({ id: 'j-glow', type: 'line', source: 'j-done', layout: cap,
                    paint: { 'line-color': a, 'line-opacity': 0.35, 'line-width': 12, 'line-blur': 8 } });
-    map.addLayer({ id: 'j-done', type: 'line', source: 'j-done', layout: { 'line-cap': 'round', 'line-join': 'round' },
+    map.addLayer({ id: 'j-done', type: 'line', source: 'j-done', layout: cap,
                    paint: { 'line-color': a, 'line-width': 4 } });
+    map.addLayer({ id: 'j-cur-glow', type: 'line', source: 'j-cur', layout: cap,
+                   paint: { 'line-width': 12, 'line-blur': 8, 'line-gradient': progressGradient(hexA(a, 0.35), 0) } });
+    map.addLayer({ id: 'j-cur', type: 'line', source: 'j-cur', layout: cap,
+                   paint: { 'line-width': 4, 'line-gradient': progressGradient(a, 0) } });
     map.addLayer({ id: 'j-stops', type: 'circle', source: 'j-stops',
                    paint: { 'circle-radius': ['case', ['==', ['get', 'current'], 1], 8, 5.5],
                             'circle-color': ['case', ['==', ['get', 'visited'], 1], '#FFFFFF', 'rgba(255,255,255,0.45)'],
@@ -1782,37 +1970,260 @@
   }
   function removeRouteLayers() {
     if (!map) return;
-    ['j-stops', 'j-done', 'j-glow', 'j-all'].forEach(function (id) { if (map.getLayer(id)) map.removeLayer(id); });
-    ['j-stops', 'j-done', 'j-all'].forEach(function (id) { if (map.getSource(id)) map.removeSource(id); });
+    ['j-stops', 'j-cur', 'j-cur-glow', 'j-done', 'j-glow', 'j-all'].forEach(function (id) { if (map.getLayer(id)) map.removeLayer(id); });
+    ['j-stops', 'j-cur', 'j-done', 'j-all'].forEach(function (id) { if (map.getSource(id)) map.removeSource(id); });
   }
-  function setRoute(upTo, frac) {
-    if (!map) return;
-    var d = map.getSource('j-done'), s = map.getSource('j-stops');
-    if (d) d.setData(lineFeature(routeCoords(upTo, frac)));
-    if (s && frac >= 1) s.setData(stopsFeatures(upTo));
+  function hexA(hex, a) {
+    var c = hexRgb(validHex(hex) ? hex : '#8B7CF6');
+    return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')';
   }
-  // Projetá trasa se kreslí souběžně s letem kamery. follow = krátký místní přesun: kamera
-  // jede po křivce trasy v krajině (žádný výskok nad mapu), natáčí se plynule po směru cesty.
-  function animateLeg(i, ms, follow) {
-    cancelAnimationFrame(journey.raf);
-    if (reduceMotion || !ms || i < 1) { setRoute(i, 1); return; }
-    var t0 = performance.now(), pts = follow ? legPath(i) : null, heading = follow ? map.getBearing() : 0;
-    var z0 = follow ? map.getZoom() : 0;
-    journey.tracing = !!follow;
-    (function frame(now) {
-      var t = Math.min(1, (now - t0) / ms), e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-      setRoute(i, e);
-      if (follow && map) {
-        var here = pathAt(pts, e), ahead = pathAt(pts, Math.min(1, e + 0.12));
-        var want = bearingDeg(here.ll, ahead.ll), turn = ((want - heading + 540) % 360) - 180;
-        if (Math.hypot(ahead.ll[0] - here.ll[0], ahead.ll[1] - here.ll[1]) > 1e-7) heading += turn * 0.06;
-        var zt = Math.min(1, t / 0.35), zoom = z0 + (follow.zoom - z0) * zt * zt * (3 - 2 * zt);  // bez skoku
-        map.jumpTo({ center: here.ll, bearing: heading, zoom: zoom, pitch: follow.pitch });
+  function progressGradient(color, frac) {
+    return ['step', ['line-progress'], color, Math.min(1, Math.max(1e-4, frac)), 'rgba(0,0,0,0)'];
+  }
+  function curLegFeature(i) {          // jeden LineString (line-progress běží po celé čáře)
+    if (!journey.data || i < 1) return lineFeature([stopLL(journey.data.stops[0]), stopLL(journey.data.stops[0])]);
+    var pts = legPath(i);
+    if (pts.length > LINE_CHUNK) {
+      var step = pts.length / LINE_CHUNK, out = [];
+      for (var k = 0; k < LINE_CHUNK - 1; k++) out.push(pts[Math.floor(k * step)]);
+      out.push(pts[pts.length - 1]);
+      pts = out;
+    }
+    return { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: pts } };
+  }
+  // Trasa na stejných hodinách jako kamera: hotové úseky se zapíšou jednou za úsek, aktuální
+  // úsek jen posune přechod barvy (frac = podíl délky, kde právě je kamera)
+  function setRouteLeg(i, frac) {
+    if (!map || !journey.data) return;
+    var d = map.getSource('j-done'), c = map.getSource('j-cur'), s = map.getSource('j-stops');
+    if (journey.curLeg !== i) {
+      journey.curLeg = i;
+      journey.curFrac = -1;
+      journey.stopsShown = -2;
+      if (d) d.setData(lineFeature(routeCoords(i - 1, 1)));
+      if (c) c.setData(curLegFeature(i));
+    }
+    frac = Math.max(0, Math.min(1, frac));
+    if (map.getLayer('j-cur') && Math.abs(frac - journey.curFrac) > 0.002) {
+      journey.curFrac = frac;
+      var a = journey.tint || accent();
+      map.setPaintProperty('j-cur', 'line-gradient', progressGradient(a, frac));
+      map.setPaintProperty('j-cur-glow', 'line-gradient', progressGradient(hexA(a, 0.35), frac));
+    }
+    var shown = frac >= 1 ? i : i - 1;
+    if (s && shown !== journey.stopsShown) {
+      journey.stopsShown = shown;
+      s.setData(stopsFeatures(shown));
+    }
+  }
+  function setRoute(upTo, frac) { setRouteLeg(upTo, frac); }
+  // ── Režisér Cesty (Fáze 1) ──────────────────────────────────────────────────
+  // Dřív řetěz flyTo (dobrzdí na nulu) -> lineární easeTo oblet (hned plnou rychlostí) -> stání ->
+  // další flyTo z nuly, časovaný setTimeout(ms + 120) bez vazby na kameru i dlaždice; čára trasy
+  // měla vlastní křivku jiných hodin a natáčení „heading += turn × 0,06“ za SNÍMEK (při 120 Hz
+  // dvakrát rychlejší než při 60 Hz). Teď jedny hodiny:
+  //  * jediná smyčka requestAnimationFrame, skutečné dt (s), pozastavitelná – pauza zastaví čas,
+  //    ne časovače; události zastávky (polaroid, pás, další úsek) běží na stejných hodinách,
+  //  * úsek = segment s průběhem u (0–1) a hladkým rozjezdem i dojezdem (smootherstep, spojitá
+  //    rychlost i zrychlení), oblet zastávky stejně – na švech nikdy skok rychlosti,
+  //  * dlouhý přesun (> LOCAL_KM): optimální oblouk zoom + posun (van Wijk & Nuij), kamera jede
+  //    po vykreslené trase; krátký: po stezce / křivce v krajině,
+  //  * natáčení a terén podle dt (exponenciální přiblížení) – stejné při 60 i 120 Hz,
+  //  * čára trasy = podíl délky pod kamerou (setRouteLeg).
+  var BEARING_TAU_S = 0.55;           // časová konstanta natáčení kamery (s)
+  var VW_RHO = 1.42;                  // van Wijk & Nuij: poměr výšky a posunu (≈ √2)
+  var ORBIT_DEG = 14;                 // pomalý oblet zastávky během fotky
+  var TERRAIN_OFF_BELOW = 8.6, TERRAIN_FADE_FROM = 9.2, TERRAIN_FADE_TO = 11.5;
+  var TILE_WAIT_MS = 1200;            // nejdéle čekat na dlaždice cíle, než vyskočí fotka
+  var director = { raf: 0, watchdog: 0, last: 0, t: 0, seg: null, events: [], heading: 0, directing: false };
+
+  function smootherstep(u) { u = Math.max(0, Math.min(1, u)); return u * u * u * (u * (6 * u - 15) + 10); }
+  function smoothstep(u) { u = Math.max(0, Math.min(1, u)); return u * u * (3 - 2 * u); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function angleTo(from, to) { return ((to - from + 540) % 360) - 180; }
+
+  function directorStart() {
+    director.directing = true;
+    if (!director.raf) {
+      director.last = performance.now();
+      director.raf = requestAnimationFrame(directorTick);
+    }
+    // pojistka: skrytá / nekreslená stránka nedává requestAnimationFrame – hodiny jdou dál
+    if (!director.watchdog) {
+      director.watchdog = setInterval(function () {
+        if (performance.now() - director.last > 120) directorTick(performance.now(), true);
+      }, 60);
+    }
+  }
+  function directorStop() {
+    if (director.raf) cancelAnimationFrame(director.raf);
+    if (director.watchdog) clearInterval(director.watchdog);
+    director.raf = director.watchdog = 0;
+    director.seg = null;
+    director.events = [];
+    director.directing = false;
+  }
+  function directorTick(now, fromWatchdog) {
+    var dt = Math.max(0, Math.min(0.1, (now - director.last) / 1000));
+    director.last = now;
+    if (!fromWatchdog) meterTick(journeyMeter, now);
+    if (journey.active && !journey.paused) {
+      director.t += dt;
+      var due = director.events.filter(function (e) { return e.t <= director.t; });
+      director.events = director.events.filter(function (e) { return e.t > director.t; });
+      due.forEach(function (e) { e.fn(); });
+      var seg = director.seg;
+      if (seg && !seg.done) {
+        var u = seg.dur > 0 ? Math.min(1, (director.t - seg.t0) / seg.dur) : 1;
+        if (seg.apply) seg.apply(u, dt);
+        if (u >= 1 && seg === director.seg && !seg.done) { seg.done = true; if (seg.onEnd) seg.onEnd(); }
       }
-      if (t < 1) journey.raf = requestAnimationFrame(frame);
-      else { setRoute(i, 1); journey.tracing = false; }
-    })(t0);
+    }
+    if (!fromWatchdog) director.raf = journey.active ? requestAnimationFrame(directorTick) : 0;
   }
+  function beginSegment(seg) {
+    seg.t0 = director.t;
+    seg.done = false;
+    director.seg = seg;
+    directorStart();
+  }
+
+  // ── kamera ──
+  function cameraNow() {
+    if (!map) return { center: [0, 0], zoom: GLOBE_ZOOM, bearing: 0, pitch: 0 };
+    var c = map.getCenter();
+    return { center: [c.lng, c.lat], zoom: map.getZoom(), bearing: map.getBearing(), pitch: map.getPitch() };
+  }
+  function mercX(lon) { return (lon + 180) / 360; }
+  function mercY(lat) {
+    var r = Math.max(-85.05, Math.min(85.05, lat)) * Math.PI / 180;
+    return (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2;
+  }
+  function viewWidthPx() { return Math.max(1, mapEl.clientWidth || 1); }
+  function worldW(zoom) { return viewWidthPx() / (TILE_PX * Math.pow(2, zoom)); }
+  function zoomOfW(w) { return Math.log(viewWidthPx() / (TILE_PX * Math.max(1e-12, w))) / Math.LN2; }
+  // van Wijk & Nuij (2003), „Smooth and efficient zooming and panning“ – jako d3.interpolateZoom.
+  // Vrací {S, at(s)} kde at(s) = [podíl cesty 0–1, šířka pohledu ve světových jednotkách].
+  function vanWijk(a, b, w0, w1, rho) {
+    var dx = mercX(b[0]) - mercX(a[0]), dy = mercY(b[1]) - mercY(a[1]), d2 = dx * dx + dy * dy;
+    var rho2 = rho * rho, rho4 = rho2 * rho2;
+    if (d2 < 1e-18) {
+      var Sz = Math.abs(Math.log(w1 / w0)) / rho || 0, sgn = w1 > w0 ? 1 : -1;
+      return { S: Sz, at: function (s) { return [1, w0 * Math.exp(sgn * rho * s)]; } };
+    }
+    var d1 = Math.sqrt(d2);
+    var b0 = (w1 * w1 - w0 * w0 + rho4 * d2) / (2 * w0 * rho2 * d1);
+    var b1 = (w1 * w1 - w0 * w0 - rho4 * d2) / (2 * w1 * rho2 * d1);
+    var r0 = Math.log(Math.sqrt(b0 * b0 + 1) - b0), r1 = Math.log(Math.sqrt(b1 * b1 + 1) - b1);
+    var S = (r1 - r0) / rho;
+    return { S: S, at: function (s) {
+      var u = w0 / (rho2 * d1) * (Math.cosh(r0) * Math.tanh(rho * s + r0) - Math.sinh(r0));
+      return [Math.max(0, Math.min(1, u)), w0 * Math.cosh(r0) / Math.cosh(rho * s + r0)];
+    } };
+  }
+  function pitchForZoom(z, target) {  // vysoko = pohled shora, u země = naklonění krajiny
+    return lerp(16, target, smoothstep((z - 6) / Math.max(0.5, STOP_ZOOM - 6)));
+  }
+  function steer(want, dt) {          // natočení k cíli podle času, ne podle počtu snímků
+    director.heading += angleTo(director.heading, want) * (1 - Math.exp(-dt / BEARING_TAU_S));
+    return director.heading;
+  }
+  // Terén během přesunu: pod TERRAIN_OFF_BELOW vypnutý (zeměkoule), od TERRAIN_FADE_FROM zapnutý
+  // s převýšením rostoucím ke TERRAIN_FADE_TO – krajina „vyroste“ při sestupu, ne skokem v cíli
+  function directorTerrain(z) {
+    if (!map || !styleReady || !map.getSource('dem') || PERF.map_terrain === false) return;
+    var on = !!map.getTerrain();
+    if (on && z < TERRAIN_OFF_BELOW) {
+      try { map.setTerrain(null); } catch (e) { /* styl se mění */ }
+      return;
+    }
+    if (!on && z >= TERRAIN_FADE_FROM && !globeRendering()) {
+      try { map.setTerrain({ source: 'dem', exaggeration: 0.01 }); on = true; } catch (e) { return; }
+    }
+    if (on) setExaggeration(TERRAIN_EXAGGERATION * smoothstep((z - TERRAIN_FADE_FROM) / (TERRAIN_FADE_TO - TERRAIN_FADE_FROM)));
+  }
+  function setExaggeration(x) {
+    try {
+      var t = map.terrain;
+      x = Math.max(0.01, x);
+      if (t && Math.abs(t.exaggeration - x) > 0.004) { t.exaggeration = x; map.triggerRepaint(); }
+    } catch (e) { /* vnitřní API MapLibre – bez něj zůstane terén v plné výšce */ }
+  }
+
+  // Plán úseku do zastávky i: druh, dráha, délka a cílová kamera
+  function planLeg(i) {
+    var st = journey.data.stops, s = st[i], prev = i > 0 ? st[i - 1] : null;
+    var from = cameraNow(), to = stopLL(s);
+    var km = prev ? haversineKm(stopLL(prev), to) : haversineKm(from.center, to);
+    var zoom = map ? Math.min(STOP_ZOOM, map.getMaxZoom()) : STOP_ZOOM;
+    var bearing = prev ? bearingDeg(stopLL(prev), to) : from.bearing;
+    var plan = { i: i, from: from, km: km, zoom: zoom, pitch: FLY_PITCH + 6, bearing: bearing };
+    if (!map || reduceMotion || !hasSize()) { plan.kind = 'jump'; plan.dur = 0; return plan; }
+    if (prev && km <= LOCAL_KM && map.getZoom() >= TERRAIN_MIN_ZOOM) {
+      var routed = !!(journey.trails && journey.trails[i]);
+      plan.kind = 'local';
+      plan.path = legPath(i);
+      var pk = pathKm(plan.path);
+      if (routed) plan.zoom = Math.min(trailZoom(pk), map.getMaxZoom());
+      plan.dur = flightMs(routed ? pk : km) / 1000;
+      return plan;
+    }
+    plan.kind = 'hop';
+    plan.path = prev ? legPath(i) : [from.center, to];
+    plan.vw = vanWijk(from.center, to, worldW(from.zoom), worldW(zoom), VW_RHO);
+    plan.dur = (i === 0 ? Math.min(flightMs(km), 3600) : flightMs(km)) / 1000;
+    return plan;
+  }
+  // Kamera a čára trasy v průběhu u úseku. Vrací podíl délky trasy pod kamerou.
+  function applyLeg(plan, u, dt) {
+    if (!map) return 1;
+    var f = plan.from, e = smootherstep(u), frac, cam;
+    if (plan.kind === 'jump') {
+      director.heading = plan.bearing;
+      map.jumpTo({ center: stopLL(journey.data.stops[plan.i]), zoom: plan.zoom, pitch: plan.pitch, bearing: plan.bearing });
+      directorTerrain(plan.zoom);
+      return 1;
+    }
+    if (plan.kind === 'local') {
+      var here = pathAt(plan.path, e), ahead = pathAt(plan.path, Math.min(1, e + 0.08));
+      var moving = Math.hypot(ahead.ll[0] - here.ll[0], ahead.ll[1] - here.ll[1]) > 1e-7;
+      var zt = smoothstep(u / 0.35);
+      cam = { center: here.ll, zoom: lerp(f.zoom, plan.zoom, zt), pitch: lerp(f.pitch, plan.pitch, zt),
+              bearing: moving ? steer(bearingDeg(here.ll, ahead.ll), dt) : director.heading };
+      frac = e;
+    } else {
+      var p = plan.vw.at(e * plan.vw.S), z = zoomOfW(p[1]);
+      var at = pathAt(plan.path, p[0]), ahead2 = pathAt(plan.path, Math.min(1, p[0] + 0.05));
+      var course = Math.hypot(ahead2.ll[0] - at.ll[0], ahead2.ll[1] - at.ll[1]) > 1e-9 ? bearingDeg(at.ll, ahead2.ll) : plan.bearing;
+      // vysoko po směru letu, při sestupu natočit na příjezdový směr; náklon podle výšky
+      var want = lerp(0, 1, smoothstep((u - 0.55) / 0.4)) > 0.5 ? plan.bearing : course;
+      cam = { center: at.ll, zoom: z, bearing: steer(want, dt),
+              pitch: lerp(lerp(f.pitch, pitchForZoom(z, plan.pitch), smoothstep(u / 0.25)), plan.pitch, smoothstep((u - 0.8) / 0.2)) };
+      frac = p[0];
+      directorTerrain(z);
+    }
+    map.jumpTo(cam);
+    return frac;
+  }
+  // Libovolný přesun kamery (úvod nad první zastávku, závěrečný přehled) na hodinách režiséra
+  function directCamera(target, ms, onEnd) {
+    if (!map || reduceMotion || !hasSize() || !ms) {
+      if (map) map.jumpTo(target);
+      if (map) directorTerrain(target.zoom);
+      beginSegment({ dur: 0, onEnd: onEnd });
+      return;
+    }
+    var from = cameraNow();
+    var vw = vanWijk(from.center, target.center, worldW(from.zoom), worldW(target.zoom), VW_RHO);
+    var path = [from.center, target.center];
+    beginSegment({ dur: ms / 1000, onEnd: onEnd, apply: function (u) {
+      var e = smootherstep(u), p = vw.at(e * vw.S), z = zoomOfW(p[1]), at = pathAt(path, p[0]);
+      director.heading = lerp(from.bearing, from.bearing + angleTo(from.bearing, target.bearing || 0), e);
+      map.jumpTo({ center: at.ll, zoom: z, bearing: director.heading, pitch: lerp(from.pitch, target.pitch || 0, e) });
+      directorTerrain(z);
+    } });
+  }
+  window.vanWijk = vanWijk;
 
   // ── Přednačtení dlaždic na trase ────────────────────────────────────────────
   // Během zastávky (polaroidy ~3 s) se stáhnou dlaždice cíle dalšího letu (a středu dlouhého
@@ -1870,12 +2281,34 @@
     return n;
   }
   window.prefetchStop = prefetchStop;
+  // Koridor: dlaždice úseků from … from+count-1 podél dráhy kamery a ve výškách, kudy poletí
+  // (krátký úsek: body po trase v krajině; let: čtvrtiny oblouku ve střední výšce). Volá se
+  // klouzavě – na startu pro první úseky, na každé zastávce pro další, ne pro celou cestu naráz.
+  function prefetchCorridor(from, count) {
+    if (!journey.active || !journey.data || !map) return 0;
+    var st = journey.data.stops, n = 0;
+    for (var i = Math.max(0, from); i < Math.min(st.length, from + count); i++) {
+      n += prefetchStop(i);
+      if (i < 1) continue;
+      var km = haversineKm(stopLL(st[i - 1]), stopLL(st[i])), pts = legPath(i);
+      var fracs = km <= LOCAL_KM ? [0.25, 0.5, 0.75] : [0.25, 0.75];
+      var zoom = km <= LOCAL_KM ? STOP_ZOOM - 0.5 : lerp(hopZoom(km), STOP_ZOOM, 0.5);
+      fracs.forEach(function (f) { n += prefetchArea(pathAt(pts, f).ll, zoom, 1); });
+    }
+    return n;
+  }
+  window.prefetchCorridor = prefetchCorridor;
 
-  function later(fn, ms) { journey.timers.push(setTimeout(fn, ms)); }
+  // Události Cesty běží na hodinách režiséra: pauza je zastaví, přeskočení je zahodí
+  function later(fn, ms) {
+    director.events.push({ t: director.t + Math.max(0, ms || 0) / 1000, fn: fn });
+    directorStart();
+  }
   function clearTimers() {
-    journey.timers.forEach(clearTimeout);
+    (journey.timers || []).forEach(clearTimeout);
     journey.timers = [];
-    cancelAnimationFrame(journey.raf);
+    director.events = [];
+    director.seg = null;
     journey.tracing = false;
   }
 
@@ -1909,15 +2342,21 @@
     cap.classList.add('show');
     document.getElementById('jcaption').classList.remove('show');
     addRouteLayers();
-    // kamera: z výšky nad první zastávkou (zeměkoule), pak dolů
+    setInteraction('journey', true);               // aplikace: práce na pozadí počká do konce Cesty
+    journeyMeter = makeMeter();
+    director.t = 0;
+    director.events = [];
+    director.seg = null;
+    // kamera: z výšky nad první zastávkou (zeměkoule), pak dolů – na hodinách režiséra
     var first = data.stops[0];
     if (map) {
       map.stop();
+      director.heading = map.getBearing();
       var start = { center: [first.lon, Math.max(-50, Math.min(55, first.lat))], zoom: Math.min(map.getZoom(), 3.2),
                     pitch: 0, bearing: 0 };
-      if (reduceMotion || !hasSize()) map.jumpTo(start);
-      else map.flyTo(Object.assign(start, { duration: 2200, curve: 1.4, essential: true }));
+      directCamera(start, reduceMotion ? 0 : 2200);
     }
+    prefetchCorridor(0, 3);                        // dlaždice prvních úseků během úvodní kapsle
     later(function () { cap.classList.remove('show'); goStop(0); }, reduceMotion ? 1200 : 2800);
     return true;
   };
@@ -1954,45 +2393,49 @@
     document.getElementById('jphase').style.background = sky.glow;
     document.getElementById('jcaption').classList.add('show');
     document.getElementById('jprogress').style.width = ((i + 1) / st.length * 100) + '%';
-    var zoom = map ? Math.min(STOP_ZOOM, map.getMaxZoom()) : STOP_ZOOM;
-    var local = !!(prev && ms && map && km <= LOCAL_KM && map.getZoom() >= TERRAIN_MIN_ZOOM);
-    // Krátký úsek: po skutečné stezce / silnici (je-li v načtených dlaždicích), blíž a tempem
-    // podle délky trasy – ne pravítkem přes terén. Dlouhá mezera bez fotek = let s výskokem.
-    if (local && routeTrail(i)) {
-      var routeKm = pathKm(legPath(i));
-      zoom = Math.min(trailZoom(routeKm), map.getMaxZoom());
-      ms = flightMs(routeKm);
-    }
-    animateLeg(i, ms, local ? { zoom: zoom, pitch: FLY_PITCH + 6 } : null);
-    if (map && !local) {
-      var bearing = prev ? bearingDeg(stopLL(prev), stopLL(s)) : map.getBearing();
-      var cam = { center: stopLL(s), zoom: zoom, pitch: FLY_PITCH + 6, bearing: bearing };
-      if (!ms) map.jumpTo(cam);
-      else {
-        // Let: terén až v cíli (přes oddálení by se kreslil se zeměkoulí) a výskok do výšky
-        // úměrné vzdálenosti – nad hory a hranice, ne podél nich
-        holdTerrain();
-        var fly = { duration: ms, curve: km > FLIGHT_KM ? 1.8 : 1.35, essential: true };
-        if (prev) fly.minZoom = hopZoom(km);           // klíč bez hodnoty by MapLibre vzal jako NaN
-        map.flyTo(Object.assign(cam, fly));
-      }
-    }
-    prefetchStop(i);                    // cíl tohoto letu (už je-li v cache, nic se nestahuje)
-    later(function () { arrive(i); }, ms + 120);
+    // Krátký úsek: po skutečné stezce / silnici (spočtené na pozadí během minulé zastávky),
+    // blíž a tempem podle délky trasy. Dlouhý (> LOCAL_KM): oblouk zoom + posun (van Wijk).
+    var plan = planLeg(i);
+    journey.tracing = true;
+    setRouteLeg(i, plan.dur ? 0 : 1);
+    prefetchStop(i);                    // cíl tohoto úseku (už je-li v cache, nic se nestahuje)
+    beginSegment({ dur: plan.dur, onEnd: function () { setRouteLeg(i, 1); arrive(i); },
+                   apply: function (u, dt) { setRouteLeg(i, applyLeg(plan, u, dt)); } });
+    if (!plan.dur) applyLeg(plan, 1, 0);
   }
 
-  function arrive(i) {
+  // Příjezd: počkat na dlaždice cíle (nejdéle TILE_WAIT_MS – žádná prázdná krajina pod fotkou),
+  // pak zastávka na hodinách režiséra – pomalý oblet s hladkým rozjezdem i dojezdem a fotky.
+  function arrive(i, waited) {
     if (!journey.active || journey.i !== i) return;
-    if (map && !reduceMotion && hasSize()) {   // pomalý oblet místa, zatímco se ukazují fotky
-      map.easeTo({ bearing: map.getBearing() + 14, duration: ORBIT_MS + POP_MS + HOLD_MS, easing: function (t) { return t; } });
+    waited = waited || 0;
+    if (map && !reduceMotion && waited < TILE_WAIT_MS && !tilesReady()) {
+      beginSegment({ dur: 0.1, onEnd: function () { arrive(i, waited + 100); } });
+      return;
     }
-    prefetchStop(i + 1);                // další let: dlaždice se stáhnou, zatímco se ukazují fotky
+    prefetchCorridor(i + 1, 3);         // další úseky: dlaždice se stáhnou, zatímco se ukazují fotky
+    requestTrail(i + 1);                // trasa dalšího úseku po cestách – na pozadí (Web Worker)
+    var s = journey.data.stops[i];
     var shown = journey.stripped[i] ? 0 : popPolaroids(i);
-    var wait = shown ? POP_MS + 140 * (shown - 1) + HOLD_MS : 600;
-    later(function () {
-      dropToStrip(i);
-      later(function () { next(); }, shown ? DROP_MS + 90 * shown + 250 : 200);
-    }, wait);
+    var hold = HOLD_MS * dwellWeight(s);
+    var wait = shown ? POP_MS + 140 * (shown - 1) + hold : 600;
+    var total = wait + (shown ? DROP_MS + 90 * shown + 250 : 200);
+    var b0 = map ? map.getBearing() : 0;
+    director.heading = b0;
+    beginSegment({ dur: total / 1000, onEnd: function () { next(); }, apply: function (u) {
+      if (!map || reduceMotion) return;
+      director.heading = b0 + ORBIT_DEG * smootherstep(u);
+      map.jumpTo({ bearing: director.heading });
+    } });
+    later(function () { dropToStrip(i); }, wait);
+  }
+  // Tempo: zastávka s mnoha fotkami (fotograf se zdržel) chvíli déle, letmá kratší
+  function dwellWeight(s) {
+    var n = Math.max(1, (s && s.count) || 1);
+    return Math.max(0.8, Math.min(1.6, 0.8 + 0.18 * Math.log(n) / Math.LN2));
+  }
+  function tilesReady() {
+    try { return !map || map.areTilesLoaded(); } catch (e) { return true; }
   }
 
   function next() {
@@ -2018,7 +2461,7 @@
       el.className = 'polaroid hero';
       el.dataset.id = p.id;
       el.innerHTML = '<div class="ph"></div><div class="cap"></div>';
-      setBg(el.firstChild, p.thumb);
+      setBg(el.firstChild, p.image || p.thumb);      // ostrý náhled 2048 px, jinak miniatura
       el.lastChild.textContent = fmtTime(p.date) || fmtDate(p.date);
       var x = Math.max(16, Math.min(w - HERO_W - 16, anchor.x - HERO_W / 2));
       var y = Math.max(16, Math.min(h - HERO_H - 150, anchor.y - HERO_H - 30));
@@ -2101,9 +2544,13 @@
       var cam = map.cameraForBounds([[Math.min.apply(null, lons), Math.min.apply(null, lats)],
                                      [Math.max.apply(null, lons), Math.max.apply(null, lats)]],
                                     { padding: { top: 120, bottom: 200, left: 80, right: 80 }, maxZoom: 12 });
-      var end = { center: cam ? cam.center : stopLL(st[0]), zoom: cam ? cam.zoom : 6, pitch: 0, bearing: 0 };
-      if (reduceMotion || !hasSize()) map.jumpTo(end);
-      else map.flyTo(Object.assign(end, { duration: 3200, curve: 1.5, essential: true }));
+      var end = { center: cam ? [cam.center.lng, cam.center.lat] : stopLL(st[0]), zoom: cam ? cam.zoom : 6,
+                  pitch: 0, bearing: 0 };
+      directCamera(end, reduceMotion ? 0 : 3200, function () {
+        journey.tracing = false;
+        director.directing = false;     // přehled stojí: mapa zase sama řídí terén a piny
+        restResolution();
+      });
     }
     var cap = document.getElementById('jcap');
     document.getElementById('jago').textContent = 'Konec cesty';
@@ -2115,9 +2562,15 @@
   function stopJourney(silent) {
     if (!journey.active) return false;
     clearTimers();
+    directorStop();
+    if (journey.trailPending) journey.trailPending = {};
     if (map) map.stop();
     removeRouteLayers();
     journey.active = false;
+    setInteraction('journey', false);
+    restResolution();
+    if (map) { terrainHold = false; syncTerrain(); }   // mapa zase řídí terén sama (plné převýšení)
+    setExaggeration(TERRAIN_EXAGGERATION);
     if (journey.tint) { journey.tint = null; applyAccent(baseAccent); }
     document.body.classList.remove('journey');
     setPinsVisible(true);
@@ -2138,13 +2591,17 @@
   function togglePause() {
     if (!journey.active) return;
     if (journey.ended) { replay(); return; }
+    // Pauza zastaví hodiny režiséra: kamera, čára trasy i události zastávky stojí přesně tam,
+    // kde byly, a pokračování naváže (dřív se úsek po pauze spouštěl znovu od začátku)
     if (!journey.paused) {
-      clearTimers();
-      if (map) map.stop();
       journey.paused = true;
+      if (map) map.stop();
       setPlayIcon(true);
     } else {
-      goStop(journey.i);                       // znovu k aktuální zastávce, fotky už v pásu nevyskočí
+      journey.paused = false;
+      director.last = performance.now();       // žádný skok o dobu pauzy
+      directorStart();
+      setPlayIcon(false);
     }
   }
   function skip(delta) {

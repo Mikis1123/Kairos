@@ -1983,6 +1983,12 @@ class MapBridge(QObject):
     def openPhotoFromMap(self, item_id):
         QTimer.singleShot(30, lambda: self.main_window.open_viewer_by_id(int(item_id)))
 
+    @pyqtSlot(str, bool)
+    def setInteraction(self, reason, active):
+        """Mapa hlásí pohyb kamery / běžící Cestu -> práce na pozadí počká (governor)."""
+        if reason in ("map", "journey"):
+            governor.get().set_active(reason, bool(active))
+
     @pyqtSlot(str)
     def setMapLayer(self, name):
         """Přepínač podkladů v mapě -> zapamatovat volbu (config.json)."""
@@ -4043,6 +4049,8 @@ class MainWindow(QMainWindow):
         if layer not in MAP_LAYERS:
             layer = DEFAULT_MAP_LAYER
         page = self.map_view.page()
+        # adaptivní škálování mapy: meze rozlišení, LOD dlaždic a terénu podle profilu stroje
+        page.runJavaScript(f"window.setPerfProfile && window.setPerfProfile({json.dumps(self.perf.for_map())});")
         page.runJavaScript(f"window.setBaseLayer && window.setBaseLayer({json.dumps(layer)});")
         self._sync_accent()
         self._sync_map_active()
@@ -4083,7 +4091,9 @@ class MainWindow(QMainWindow):
         try:
             conn = get_connection()
             try:
-                data = journey.build_journey(conn, event_id, get_local_thumb_url)
+                data = journey.build_journey(
+                    conn, event_id, get_local_thumb_url,
+                    image_url=lambda p: get_local_thumb_url(preview_cache.get_preview(p, touch=False)))
                 row = conn.execute("SELECT tint FROM events WHERE id = ?", (int(event_id),)).fetchone()
             finally:
                 conn.close()

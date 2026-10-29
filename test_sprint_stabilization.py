@@ -437,6 +437,7 @@ class TestMapPage(unittest.TestCase):
         self.js("lastAct = Date.now(); 0")
 
     def test_route_is_smooth_through_real_entry_and_exit(self):
+        self.assertTrue(self.until("styleReady && tileSourceIds.length > 0"), "styl mapy načten (zdroje dlaždic)")
         self.js("reduceMotion = true; 0")
         res = self.js(f"(function () {{ try {{ return playJourney({json.dumps(TRIP)}); }} "
                       f"catch (e) {{ return String(e && e.stack || e); }} }})()")
@@ -454,7 +455,10 @@ class TestMapPage(unittest.TestCase):
         self.assertGreater(len(flight), 3)
         self.assertGreater(abs(mid[1] - chord[1]), 0.005, "dlouhĂ˝ let po hlavnĂ­ kruĹľnici (oblouk)")
         self.assertLess(self.js("hopZoom(300)"), self.js("hopZoom(30)"), "dĂˇl = vĂ˝Ĺˇ")
-        self.assertGreater(self.js("prefetchStop(2)"), 0, "dlaĹľdice cĂ­le ve frontÄ› pĹ™ednaÄŤtenĂ­")
+        # Fáze 1: koridor prvních úseků se přednačítá už při startu Cesty -> cíl zastávky 2 je
+        # ve frontě dřív, než se k ní dojede (prefetchStop už nic nového nepřidá)
+        self.assertGreater(self.js("Object.keys(prefetchSeen).length"), 0, "dlaždice koridoru ve frontě")
+        self.assertEqual(self.js("prefetchStop(2)"), 0, "cíl zastávky 2 už přednačten z koridoru")
         self.js("window.endJourney(true); 0")
 
 

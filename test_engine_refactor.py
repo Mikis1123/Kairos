@@ -396,7 +396,8 @@ class TestJourneyCuration(unittest.TestCase):
         stops = journey.build_stops(hike)
         self.assertEqual(len(stops), 8, "túra: zastávka u každé vyhlídky (0,4 km)")
         self.assertTrue(all("best" in s and s["best"]["thumb"] for s in stops))
-        self.assertEqual(set(stops[0]["best"]), {"id", "thumb", "date"}, "do JS jen veřejná pole")
+        self.assertEqual(set(stops[0]["best"]), {"id", "thumb", "date", "image"}, "do JS jen veřejná pole")
+        self.assertEqual(stops[0]["best"]["image"], stops[0]["best"]["thumb"], "bez náhledu = miniatura")
         json.dumps(stops)
 
 

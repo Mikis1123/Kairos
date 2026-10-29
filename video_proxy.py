@@ -87,7 +87,8 @@ def probe(source, ffmpeg_path=None):
     w, h = (int(res.group(1)), int(res.group(2))) if res else (0, 0)
     return {"width": w, "height": h, "fps": float(fps.group(1)) if fps else 0.0,
             "ten_bit": bool(re.search(r"p010|10le|10be|Main 10", rest)),
-            "hdr": bool(re.search(r"bt2020|arib-std-b67|smpte2084", rest)) or "DOVI" in text}
+            "hdr": bool(re.search(r"bt2020|arib-std-b67|smpte2084", rest)) or "DOVI" in text,
+            "transfer": "smpte2084" if "smpte2084" in rest else "arib-std-b67"}   # PQ (HDR10) / HLG (iPhone)
 
 
 def needs_proxy(info):
@@ -105,9 +106,14 @@ def ffmpeg_cmd(source, target, info, threads=2, ffmpeg_path=None):
     if info and info.get("fps", 0) > PROXY_FPS + 1:
         vf.append(f"fps={PROXY_FPS}")
     if info and info.get("hdr"):
-        # nejdřív zmenšit (čtvrtina pixelů), pak HDR -> SDR: lineární světlo, BT.709, tonemap hable
-        vf.append("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
-                  "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
+        # nejdřív zmenšit (čtvrtina pixelů), pak HDR -> SDR: lineární světlo, BT.709, tonemap hable.
+        # Barevné vlastnosti SNÍMKŮ výslovně (BT.2020, HLG / PQ): zscale bere vlastnosti snímku
+        # přednostně před svými volbami (tin=…), a u souborů se skromnějšími metadaty než iPhone
+        # končil „no path between colorspaces“. Ověřeno na iPhonu i na syntetickém HLG klipu.
+        trc = info.get("transfer") or "arib-std-b67"
+        vf.append(f"setparams=color_primaries=bt2020:color_trc={trc}:colorspace=bt2020nc:range=tv,"
+                  "zscale=t=linear:npl=100,format=gbrpf32le,"
+                  "zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
     vf.append("format=yuv420p")
     return [ffmpeg_path or paths.FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
             "-threads", str(threads), "-hwaccel", "d3d11va", "-i", source,

@@ -105,6 +105,14 @@ def _public(p):
     return {"id": p["id"], "thumb": p["thumb"], "date": p["date"]}
 
 
+def _hero(p):
+    """Nejlepší snímek zastávky: i ostrý obraz (náhled 2048 px), je-li hotový – miniatura
+    360 px roztažená na kartu polaroidu byla rozmazaná."""
+    out = _public(p)
+    out["image"] = p.get("image") or p["thumb"]
+    return out
+
+
 def build_stops(photos):
     """Fotky s polohou (seřazené podle času) -> zastávky; nejmenší poloměr, který dá ≤ MAX_STOPS."""
     groups = []
@@ -127,7 +135,7 @@ def build_stops(photos):
             "entry": {"lat": round(g[0]["lat"], 6), "lon": round(g[0]["lon"], 6)},
             "exit": {"lat": round(g[-1]["lat"], 6), "lon": round(g[-1]["lon"], 6)},
             "photos": [_public(p) for p in pick_spread(g, POLAROIDS_PER_STOP)],
-            "best": _public(best_shot(g)),
+            "best": _hero(best_shot(g)),
         })
     return stops
 
@@ -138,22 +146,23 @@ def iso_minute(value):
     return s.replace(":", "-", 2) if s[4:5] == ":" else s
 
 
-def _geo_photos(conn, event_id, thumb_url):
+def _geo_photos(conn, event_id, thumb_url, image_url=None):
     rows = conn.execute(f"""
         SELECT m.id, m.latitude, m.longitude, m.place_city, m.date_taken, m.thumbnail_path,
-               m.phash, m.sharpness_score, m.is_favorite, m.media_type
+               m.phash, m.sharpness_score, m.is_favorite, m.media_type, m.file_path
         FROM media_items m
         WHERE m.event_id = ? AND m.latitude IS NOT NULL AND m.date_taken IS NOT NULL
           AND {visible_media_sql('m')}
         LIMIT {MAX_JOURNEY_ROWS}
     """, (event_id,)).fetchall()
     photos = []
-    for mid, lat, lon, city, date, thumb, phash, sharp, fav, mtype in rows:
+    for mid, lat, lon, city, date, thumb, phash, sharp, fav, mtype, path in rows:
         ll = _valid(lat, lon)
         if ll is None:
             continue
         photos.append({"id": int(mid), "lat": ll[0], "lon": ll[1], "city": city or "",
                        "date": iso_minute(date), "thumb": thumb_url(thumb),
+                       "image": image_url(path) if image_url else "",
                        "phash": phash, "sharpness": sharp or 0.0, "fav": bool(fav), "type": mtype})
     # řadit až po převodu: EXIF „2023:07:06“ by v SQL skončilo za ISO „2023-07-06“
     photos.sort(key=lambda p: (p["date"], p["id"]))
@@ -182,13 +191,14 @@ def list_journeys(conn):
     return out
 
 
-def build_journey(conn, event_id, thumb_url=lambda p: ""):
-    """Data pro window.playJourney(), nebo None, když událost nemá aspoň dvě místa."""
+def build_journey(conn, event_id, thumb_url=lambda p: "", image_url=None):
+    """Data pro window.playJourney(), nebo None, když událost nemá aspoň dvě místa.
+    image_url(cesta originálu) -> URL ostrého náhledu pro nejlepší snímek zastávky ('' = není)."""
     ev = conn.execute("SELECT id, title, location_name, start_date, end_date FROM events WHERE id = ?",
                       (int(event_id),)).fetchone()
     if ev is None:
         return None
-    stops = build_stops(_geo_photos(conn, ev[0], thumb_url))
+    stops = build_stops(_geo_photos(conn, ev[0], thumb_url, image_url))
     if len(stops) < MIN_STOPS:
         return None
     location = ev[2] or next((s["city"] for s in stops if s["city"]), "")
