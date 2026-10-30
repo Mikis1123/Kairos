@@ -23,6 +23,8 @@ paths.PREVIEW_DIR = _preview_tmp
 paths.WEB_CACHE_DIR = os.path.join(_preview_tmp, "web")      # HTTP cache mapy (Patch 11)
 paths.PROXY_DIR = os.path.join(_preview_tmp, "proxies")      # proxy videí (Fáze 1)
 paths.BACKUP_DIR = os.path.join(_preview_tmp, "backups")     # denní zálohy DB (Sprint R)
+paths.TILE_STORE_PATH = os.path.join(_preview_tmp, "tiles.sqlite")   # úložiště dlaždic (C7e)
+paths.HIGHLIGHT_DIR = os.path.join(_preview_tmp, "highlights")       # klipy karet Cesty
 atexit.register(shutil.rmtree, _preview_tmp, True)
 
 # Patch 11: ani config.json aplikace – load_config() jinak při chybějícím souboru sáhl na

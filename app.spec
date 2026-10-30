@@ -40,6 +40,10 @@ if os.path.exists('video_output.qml'):
 # Batch 6: MapLibre GL JS 5 (zeměkoule, terén, Cesta, minimapa), vč. licence – jediný mapový stack
 if os.path.isdir(os.path.join('vendor', 'maplibre')):
     datas.append((os.path.join('vendor', 'maplibre'), os.path.join('vendor', 'maplibre')))
+# Cesta 3.0 (C6): hudební podkres – vlastní skladby z `python ambient_music.py` (ambient_music.tracks
+# je hledá v RESOURCE_DIR/assets/music)
+if os.path.isdir(os.path.join('assets', 'music')):
+    datas.append((os.path.join('assets', 'music'), os.path.join('assets', 'music')))
 
 # Kairos dávka 5: ikona .exe (16–256 px) – vygeneruje `python brand.py` do assets/.
 # Okno a hlavní panel si ikonu kreslí za běhu (brand.app_icon), do balíčku se nic nepřidává.

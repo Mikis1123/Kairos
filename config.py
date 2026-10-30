@@ -39,6 +39,10 @@ DEFAULT_CONFIG = {
     "performance_tier": "auto",
     # Fáze 1 – 1080p SDR kopie videí 4K / HDR (video_proxy.py), limit na disku v MB
     "proxy_cache_mb": 4096,
+    # Cesta 3.0 (C7e) – místní úložiště mapových dlaždic (tile_store.py), limit na disku v MB
+    "tile_store_mb": 1024,
+    # Cesta 3.0 (C6) – hudební podkres Cesty (ambient_music.py); volitelný, výchozí vypnutý
+    "cesta_music": False,
 }
 
 

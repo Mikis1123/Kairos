@@ -148,6 +148,14 @@
   /* C5: přítah ke tvářím (transform-origin = střed obličejů z face_instances), jinak jemný přítah */
   @keyframes kenburns { from { transform: scale(1.0); } to { transform: scale(var(--kbs, 1.085)); } }
   body.paused .moment .ph { animation-play-state: paused; }
+  /* Cesta 3.0: Live Photo / 3s video bez zvuku přes nejlepší snímek – stejný Ken Burns jako fotka,
+     po doběhnutí prolnutí zpět na fotku (card_media.py vyrábí WebM VP9) */
+  .moment video.clip { position: absolute; inset: -1px; width: calc(100% + 2px); height: calc(100% + 2px);
+                       object-fit: cover; opacity: 0; transition: opacity .6s ease; pointer-events: none;
+                       transform-origin: var(--kox, 50%) var(--koy, 45%); }
+  .moment video.clip.on { opacity: 1; }
+  .moment.show video.clip { animation: kenburns var(--kb, 6s) cubic-bezier(.33,0,.4,1) both; }
+  body.paused .moment video.clip { animation-play-state: paused; }
   .moment .meta { margin-top: 16px; padding: 0 2px; text-shadow: 0 1px 14px rgba(0,0,0,0.65); }
   /* C5: typografie nastupuje postupně (štítek, místo, čas) až po fotce */
   .moment .meta > * { opacity: 0; transform: translateY(8px);
@@ -188,6 +196,10 @@
   #jctl button:hover { background: rgba(255,255,255,0.10); }
   #jctl button:focus-visible { outline: 2px solid var(--accent); }
   #jctl svg { width: 16px; height: 16px; fill: #F5F5F7; }
+  /* C6: hudba je volitelná – vypnutá ikona je ztlumená, zapnutá v barvě zvýraznění */
+  #jmusic svg { opacity: .55; }
+  #jmusic[aria-pressed="true"] svg { opacity: 1; fill: var(--accent); }
+  #jmusic[hidden] { display: none; }
   #jstripwrap { position: relative; flex: 1 1 auto; min-width: 0; border-radius: 14px; padding: 8px 10px 10px; box-sizing: border-box; }
   #jstrip { display: flex; gap: 6px; overflow-x: auto; height: 50px; align-items: center; scrollbar-width: none; }
   #jstrip::-webkit-scrollbar { display: none; }
@@ -244,6 +256,7 @@
       <button type="button" id="jprev" aria-label="Předchozí zastávka"><svg viewBox="0 0 16 16"><path d="M3 2.5h1.6v11H3zM13.5 2.8v10.4L5.8 8z"/></svg></button>
       <button type="button" id="jplay" aria-label="Pozastavit"><svg viewBox="0 0 16 16"><path id="jplayicon" d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg></button>
       <button type="button" id="jnext" aria-label="Další zastávka"><svg viewBox="0 0 16 16"><path d="M11.4 2.5H13v11h-1.6zM2.5 2.8v10.4L10.2 8z"/></svg></button>
+      <button type="button" id="jmusic" aria-label="Hudba" aria-pressed="false" title="Hudba" hidden><svg viewBox="0 0 16 16"><path d="M6 3.2 13.5 1.5v9.2a2.1 2.1 0 1 1-1.4-2V4.3L7.4 5.4v7.1a2.1 2.1 0 1 1-1.4-2z"/></svg></button>
       <button type="button" id="jclose" aria-label="Ukončit cestu (Esc)"><svg viewBox="0 0 16 16"><path d="M3.7 2.6 8 6.9l4.3-4.3 1.1 1.1L9.1 8l4.3 4.3-1.1 1.1L8 9.1l-4.3 4.3-1.1-1.1L6.9 8 2.6 3.7z"/></svg></button>
     </div>
     <div id="jstripwrap" class="solid"><div id="jstrip" role="list" aria-label="Zastávky cesty"></div>
@@ -784,7 +797,7 @@
       map = new maplibregl.Map({
         container: mapEl, style: built.style, center: [15.5, 49.8], zoom: GLOBE_ZOOM,
         maxZoom: BASE_LAYERS[baseName].maxZoom, maxPitch: 72, attributionControl: { compact: true },
-        fadeDuration: 180, canvasContextAttributes: { antialias: true }
+        fadeDuration: 180, canvasContextAttributes: { antialias: true }, transformRequest: transformRequest
       });
     } catch (e) {
       map = null;
@@ -857,8 +870,38 @@
   // z teplé cache = vektorové dlaždice, ne síť). Počet se musí nastavit před vznikem mapy.
   var TILE_WORKERS_MAX = 4;
   function tileWorkerCount(threads) {
+    if (+window.TILE_WORKERS_OVERRIDE > 0) return +window.TILE_WORKERS_OVERRIDE;   // jen měření (bench --workers)
     return Math.max(2, Math.min(TILE_WORKERS_MAX, Math.floor((threads || 4) / 3)));
   }
+  // ── C7e: místní úložiště dlaždic (tile_store.py) ──
+  // Dlaždice povolených serverů jdou přes místní server aplikace (SQLite, 1 GB): podruhé jsou
+  // z disku bez ověřování po síti. Port = součet kódů znaků klíče mod počet portů (shard_of
+  // v tile_store.py) – stejná dlaždice má vždy stejnou adresu (přednačtení i MapLibre).
+  var TILE_STORE = null;
+  function setTileStore(cfg) {
+    if (!cfg || !Array.isArray(cfg.bases) || !cfg.bases.length) { TILE_STORE = null; return false; }
+    var hosts = {};
+    (cfg.hosts || []).forEach(function (h) { hosts[String(h).toLowerCase()] = true; });
+    TILE_STORE = { bases: cfg.bases.slice(), hosts: hosts };
+    return true;
+  }
+  window.setTileStore = setTileStore;
+  setTileStore(window.TILE_STORE_CONFIG);        // vloženo aplikací před skripty stránky
+  function storeUrl(url) {
+    if (!TILE_STORE || typeof url !== 'string') return url;
+    var m = /^https:\/\/([^\/?#]+)\/(.*)$/.exec(url);
+    if (!m || !TILE_STORE.hosts[m[1].toLowerCase()]) return url;
+    var key = m[1].toLowerCase() + '/' + m[2], sum = 0;
+    for (var i = 0; i < key.length; i++) sum += key.charCodeAt(i);
+    return TILE_STORE.bases[sum % TILE_STORE.bases.length] + key;
+  }
+  window.storeUrl = storeUrl;
+  function transformRequest(url, type) {
+    if (type !== 'Tile') return undefined;
+    var s = storeUrl(url);
+    return s === url ? undefined : { url: s };
+  }
+
   function setTileWorkers() {
     try {
       if (typeof maplibregl.setWorkerCount === 'function') maplibregl.setWorkerCount(tileWorkerCount(navigator.hardwareConcurrency));
@@ -2594,6 +2637,7 @@
     showCaption(travel && u > 0.06 && u < CARD_IN_U && i >= 0);
     var card = cardStopAt(seg, u);
     if (card !== journey.card) showMoment(card);
+    if (seg.kind === 'dwell' && journey.card === seg.i && u >= CLIP_AT_U && !journey.paused) playClip();
     if (seg.kind === 'dwell' && journey.card === seg.i && u >= SECOND_SHOT_U && seg.dur >= SECOND_SHOT_MIN_S) secondShot();
     var cap = document.getElementById('jcap');
     if (seg.kind === 'intro') cap.classList.toggle('show', u < 0.86);
@@ -2680,13 +2724,73 @@
       var on = shot.querySelector('.ph.on');
       if (on) openFromJourney(+on.dataset.id);
     });
+    if (s.best && s.best.clip) attachClip(el, s.best.clip);    // načte se během příletu, hraje v cíli
     box.appendChild(el);
     void el.offsetWidth;                // přechod z výchozího stavu (ne skok rovnou do .show)
     el.classList.add('show');
   }
+  // ── Pohyb v kartě: Live Photo / 3s video (jen vysoký profil, ne s omezenými animacemi) ──
+  var CLIP_AT_U = 0.04;               // spustit hned po příjezdu (karta už je vidět od CARD_IN_U)
+  function clipAllowed() { return PERF.tier === 'high' && !reduceMotion; }
+  function attachClip(el, url) {
+    var shot = el && el.querySelector('.shot'), ph = shot && shot.querySelector('.ph');
+    if (!shot || !url || shot.querySelector('video.clip') || !clipAllowed()) return null;
+    var v = document.createElement('video');
+    v.className = 'clip';
+    v.muted = true;
+    v.defaultMuted = true;
+    v.playsInline = true;
+    v.preload = 'auto';
+    ['--kb', '--kox', '--koy', '--kbs'].forEach(function (k) {   // stejný výřez a přítah jako fotka
+      var val = ph && ph.style.getPropertyValue(k);
+      if (val) v.style.setProperty(k, val);
+    });
+    if (ph && ph.dataset.focus) v.style.objectPosition = ph.style.backgroundPosition;
+    v.addEventListener('playing', function () {
+      v.classList.add('on');
+      if (!v.dataset.counted) { v.dataset.counted = '1'; journey.clipsPlayed = (journey.clipsPlayed || 0) + 1; }
+    });
+    v.addEventListener('ended', function () { v.classList.remove('on'); v.dataset.done = '1'; });
+    v.addEventListener('error', function () { v.remove(); });
+    v.src = url;
+    shot.appendChild(v);
+    return v;
+  }
+  function currentClip() {
+    return document.querySelector('#jmoment .moment.show video.clip');
+  }
+  function playClip() {
+    var v = currentClip();
+    if (!v || v.dataset.started) return;
+    v.dataset.started = '1';
+    v.playbackRate = Math.max(0.25, Math.min(4, FILM_SPEED));
+    var p = v.play();
+    if (p && p.catch) p.catch(function () { v.remove(); });
+  }
+  function pauseClip(paused) {
+    var v = currentClip();
+    if (!v || !v.dataset.started || v.dataset.done) return;
+    if (paused) v.pause(); else { var p = v.play(); if (p && p.catch) p.catch(function () {}); }
+  }
+  window.journeyClip = function (id, i, url) {     // aplikace: klip dorazil za běhu Cesty
+    if (!journey.active || !journey.data || journey.data.id !== id) return false;
+    var s = journey.data.stops[i];
+    if (!s || !s.best) return false;
+    s.best.clip = url;
+    if (journey.card === i) attachClip(document.querySelector('#jmoment .moment.show[data-stop="' + i + '"]'), url);
+    return true;
+  };
+  window.getClipState = function () {
+    var v = currentClip();
+    return { allowed: clipAllowed(), played: journey.clipsPlayed || 0, stops:(journey.data ? journey.data.stops : []).filter(function (s) { return s.best && s.best.clip; }).length,
+             card: v ? { started: !!v.dataset.started, on: v.classList.contains('on'), done: !!v.dataset.done, paused: v.paused } : null };
+  };
+
   function secondShot() {
     var el = document.querySelector('#jmoment .moment.show');
     if (!el || el.dataset.second) return;
+    var clip = el.querySelector('video.clip');
+    if (clip && clip.dataset.started && !clip.dataset.done) return;    // klip má přednost, druhý snímek po něm
     el.dataset.second = '1';
     var phs = el.querySelectorAll('.ph');
     if (phs.length < 2) return;
@@ -2746,7 +2850,7 @@
     while (prefetchActive < PREFETCH_PARALLEL && prefetchQueue.length) {
       var url = prefetchQueue.shift();
       prefetchActive++;
-      fetch(url).then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+      fetch(storeUrl(url)).then(function (r) { return r.ok ? r.arrayBuffer() : null; })
         .catch(function () { /* offline / zablokováno – mapa si dlaždici řekne sama */ })
         .then(function () { prefetchActive--; pumpPrefetch(); });
     }
@@ -2797,8 +2901,8 @@
   var PREFETCH_DWELL_LOOKAHEAD_S = 24;   // v okamžiku (kamera skoro stojí) přednačíst celý další přesun
   var PREROLL_MAX_S = 1.6;               // C7a: na začátku počkat nejvýš tolik na dlaždice úvodu
   var prefetchTr = null;
-  function frustumTiles(pose, pad, out) {
-    var tr = prefetchTr;
+  function frustumTiles(pose, pad, out, cols, rows) {
+    var tr = prefetchTr, COLS = cols || FRUSTUM_COLS, ROWS = rows || FRUSTUM_ROWS;
     if (!tr) return false;
     try {
       tr.setPadding(pad || { left: 0, right: 0, top: 0, bottom: 0 });
@@ -2808,9 +2912,9 @@
       tr.setCenter(new maplibregl.LngLat(((pose.c[0] + 540) % 360) - 180, Math.max(-85, Math.min(85, pose.c[1]))));
     } catch (e) { return false; }
     var w = viewWidthPx(), h = viewHeightPx(), centerScale = 1 / (TILE_PX * Math.pow(2, pose.z)), P = maplibregl.Point;
-    for (var r = 0; r < FRUSTUM_ROWS; r++) {
-      for (var q = 0; q < FRUSTUM_COLS; q++) {
-        var x = (q + 0.5) * w / FRUSTUM_COLS, y = (r === 0 ? 2 : (r + 0.5) * h / FRUSTUM_ROWS);
+    for (var r = 0; r < ROWS; r++) {
+      for (var q = 0; q < COLS; q++) {
+        var x = (q + 0.5) * w / COLS, y = (r === 0 ? 2 : (r + 0.5) * h / ROWS);
         var a, b;
         try { a = tr.screenPointToLocation(new P(x, y)); b = tr.screenPointToLocation(new P(x, y + 12)); } catch (e) { continue; }
         if (!a || !b || !isFinite(a.lng) || !isFinite(a.lat) || Math.abs(a.lat) > 85) continue;
@@ -2885,6 +2989,48 @@
     return prefetchArea(stopLL(journey.data.stops[i]), STOP_ZOOM, 2);
   }
   window.prefetchStop = prefetchStop;
+  // ── C7e: předpečení celého filmu do úložiště ──
+  // Kamera je funkce času -> dlaždice celé Cesty jsou známé hned při startu. Seznam (v pořadí
+  // filmu) dostane místní úložiště a stáhne ho samo souběžně mimo limit spojení Chromia;
+  // MapLibre i přednačtení pak berou dlaždice z disku (nebo z už běžícího stažení).
+  // Hustší síť než průběžné přednačtení (9 × 7 bodů minulo ~60 % dlaždic, které MapLibre
+  // za letu opravdu chtěl – naměřeno 231 z 626); počítá se jednou při startu.
+  var BAKE_MAX = 6000, BAKE_COLS = 20, BAKE_ROWS = 14;
+  function filmTileKeys() {
+    if (!film || !map || !TILE_STORE) return [];
+    var keys = [], seen = {};
+    try { prefetchTr = map.transform.clone(); } catch (e) { prefetchTr = null; }
+    for (var t = 0; t <= film.total && keys.length < BAKE_MAX; t += PREFETCH_STEP_S) {
+      var r = filmPoseAt(t), pts = [];
+      if (!frustumTiles(r.pose, filmPadInto(r.seg, r.u), pts, BAKE_COLS, BAKE_ROWS)) break;
+      tileSourceIds.forEach(function (id) {
+        var s = map.getSource(id);
+        if (!s || !Array.isArray(s.tiles) || !s.tiles.length || id === 'pins' || id.indexOf('j-') === 0) return;
+        pts.forEach(function (pt) {
+          if (!filmSourceWanted(id, s, pt.z)) return;
+          var z = sourceTiles(s, pt.z), n = Math.pow(2, z);
+          var tx = ((lon2tile(pt.ll[0], z) % n) + n) % n, ty = lat2tile(pt.ll[1], z);
+          if (ty < 0 || ty >= n) return;
+          var u = storeUrl(s.tiles[0].replace('{z}', z).replace('{x}', tx).replace('{y}', ty));
+          var cut = u.indexOf('/', u.indexOf('//') + 2);           // http://127.0.0.1:port/
+          var key = u.slice(u.indexOf('/', cut + 1) + 1);            // bez /token/
+          if (seen[key] || u.indexOf('http://127.0.0.1') !== 0) return;
+          seen[key] = true;
+          keys.push(key);
+        });
+      });
+    }
+    prefetchTr = null;
+    return keys;
+  }
+  function bakeFilm() {
+    var keys = filmTileKeys();
+    if (!keys.length) return 0;
+    // text/plain = jednoduchý požadavek bez předletu CORS; odpověď nečekáme
+    fetch(TILE_STORE.bases[0] + '_bake', { method: 'POST', body: JSON.stringify(keys) }).catch(function () {});
+    return keys.length;
+  }
+  window.bakeFilm = bakeFilm;
 
   // ── Mapa ve filmu: bez terénu, bez šumu popisků, výchozí LOD ───────────────
   function filmLook(on) {
@@ -3000,8 +3146,10 @@
     director.pfAt = 0;
     director.pfUpTo = 0;
     setPlayIcon(false);
+    journey.baked = bakeFilm();                    // C7e: celý film do úložiště, souběžně s úvodem
     prefetchAhead(0, PREFETCH_AHEAD_S + 4);        // úvod + první přesun, než se kamera rozjede (C7a)
     directorStart();
+    syncMusic();                                   // C6: náběh hudby s úvodem (je-li zapnutá)
     return true;
   };
 
@@ -3012,6 +3160,7 @@
     document.getElementById('jcap').classList.add('end');
     markChapters(journey.data.stops.length);       // všechny kapitoly viděné
     setPlayIcon(true);
+    syncMusic();                                   // doznění se závěrem
   }
   function onFilmEnd() {
     if (!journey.ended) beginEnding();
@@ -3036,6 +3185,7 @@
     filmLook(false);
     journey.active = false;
     film = null;
+    syncMusic();
     setInteraction('journey', false);
     restResolution();
     if (map) {
@@ -3073,10 +3223,14 @@
       journey.paused = true;
       if (map) map.stop();
       document.body.classList.add('paused');
+      pauseClip(true);
+      syncMusic();
       setPlayIcon(true);
     } else {
       journey.paused = false;
       document.body.classList.remove('paused');
+      pauseClip(false);
+      syncMusic();
       director.last = performance.now();       // žádný skok o dobu pauzy
       directorStart();
       setPlayIcon(false);
@@ -3098,6 +3252,7 @@
     journey.paused = false;
     document.body.classList.remove('paused');
     setPlayIcon(false);
+    syncMusic();
     director.t = d.t0;
     director.heading = d.from.b;
     lastSky = { el: null, az: null };
@@ -3126,6 +3281,76 @@
     document.getElementById('jplayicon').setAttribute('d', paused ? 'M4 2.4v11.2L13.2 8z' : 'M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z');
     document.getElementById('jplay').setAttribute('aria-label', paused ? 'Přehrát' : 'Pozastavit');
   }
+  // ── C6: hudební podkres (volitelný, přibalené skladby ambient_music.py) ──
+  // Prolínání hlasitosti: náběh s úvodem, ztlumení při pauze, doznění v závěru a při ukončení.
+  var MUSIC_VOLUME = 0.5, MUSIC_IN_MS = 2600, MUSIC_PAUSE_MS = 600, MUSIC_OUT_MS = 4200, MUSIC_STOP_MS = 1200;
+  var music = { enabled: false, tracks: [], el: null, track: -1, fader: 0, target: 0 };
+  function musicButton() {
+    var b = document.getElementById('jmusic');
+    b.hidden = !music.tracks.length;
+    b.setAttribute('aria-pressed', music.enabled ? 'true' : 'false');
+    b.setAttribute('aria-label', music.enabled ? 'Vypnout hudbu' : 'Zapnout hudbu');
+    b.title = b.getAttribute('aria-label');
+  }
+  window.setJourneyMusic = function (cfg) {      // aplikace: {enabled, tracks: [{title, url}]}
+    cfg = cfg || {};
+    if (Array.isArray(cfg.tracks)) music.tracks = cfg.tracks.filter(function (t) { return t && t.url; });
+    if (cfg.enabled !== undefined) music.enabled = !!cfg.enabled;
+    musicButton();
+    syncMusic();
+    return music.tracks.length;
+  };
+  function musicFade(target, ms, then) {
+    var el = music.el;
+    if (!el) return;
+    clearInterval(music.fader);
+    music.target = target;
+    var from = el.volume, t0 = performance.now();
+    if (ms <= 0) { el.volume = target; if (then) then(); return; }
+    music.fader = setInterval(function () {
+      var k = Math.min(1, (performance.now() - t0) / ms);
+      el.volume = Math.max(0, Math.min(1, from + (target - from) * (k * k * (3 - 2 * k))));
+      if (k >= 1) { clearInterval(music.fader); music.fader = 0; if (then) then(); }
+    }, 40);
+  }
+  function musicStart() {
+    if (!music.tracks.length || !journey.data) return;
+    var i = Math.abs(+journey.data.id || 0) % music.tracks.length;   // stejná Cesta = stejná skladba
+    if (!music.el || music.track !== i) {
+      if (music.el) music.el.pause();
+      music.el = new Audio(music.tracks[i].url);
+      music.el.loop = true;
+      music.el.volume = 0;
+      music.track = i;
+    }
+    var p = music.el.play();
+    if (p && p.catch) p.catch(function () {});
+    musicFade(MUSIC_VOLUME, MUSIC_IN_MS);
+  }
+  function musicStop(ms, rewind) {
+    if (!music.el) return;
+    var el = music.el;
+    musicFade(0, ms, function () { el.pause(); if (rewind) el.currentTime = 0; });
+  }
+  // Stav hudby odvozený ze stavu Cesty (volá se při každé změně: start, pauza, závěr, konec)
+  function syncMusic() {
+    var want = music.enabled && journey.active && !journey.paused && !journey.ended;
+    if (want && (!music.el || music.el.paused || music.target === 0)) musicStart();
+    else if (!want && music.el && !music.el.paused && music.target !== 0) {
+      musicStop(!journey.active ? MUSIC_STOP_MS : journey.ended ? MUSIC_OUT_MS : MUSIC_PAUSE_MS, !journey.active || journey.ended);
+    }
+  }
+  window.getMusicState = function () {
+    return { enabled: music.enabled, tracks: music.tracks.length, track: music.track,
+             playing: !!music.el && !music.el.paused, volume: music.el ? +music.el.volume.toFixed(3) : 0, target: music.target };
+  };
+  document.getElementById('jmusic').addEventListener('click', function () {
+    music.enabled = !music.enabled;
+    musicButton();
+    syncMusic();
+    if (bridge && bridge.setJourneyMusic) bridge.setJourneyMusic(music.enabled);   // zapamatovat (config.json)
+  });
+
   document.getElementById('jplay').addEventListener('click', togglePause);
   document.getElementById('jprev').addEventListener('click', function () { skip(-1); });
   document.getElementById('jnext').addEventListener('click', function () { skip(1); });

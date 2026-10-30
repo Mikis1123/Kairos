@@ -149,6 +149,7 @@ def _hero(p):
     360 px roztažená na kartu polaroidu byla rozmazaná."""
     out = _public(p)
     out["image"] = p.get("image") or p["thumb"]
+    out["type"] = p.get("type") or "photo"      # Live Photo / video: karta dostane klip (card_media)
     return out
 
 

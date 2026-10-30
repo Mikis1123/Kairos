@@ -34,6 +34,12 @@ PROXY_DIR = os.path.join(CACHE_ROOT, "proxies")
 # ZAHODITELNÉ: HTTP cache mapy (vektorové dlaždice, styl, písma) – trvalý profil QtWebEngine.
 WEB_CACHE_DIR = os.path.join(CACHE_ROOT, "web")
 
+# ZAHODITELNÉ: místní úložiště mapových dlaždic (SQLite, tile_store.py, config „tile_store_mb“).
+TILE_STORE_PATH = os.path.join(CACHE_ROOT, "tiles.sqlite")
+
+# ZAHODITELNÉ: 3s klipy WebM pro karty Cesty (Live Photo, video; card_media.py).
+HIGHLIGHT_DIR = os.path.join(CACHE_ROOT, "highlights")
+
 # NEZAHAZOVAT: ořezy obličejů, na které odkazuje databáze (face_instances, people).
 FACE_DIR = os.path.join(CACHE_ROOT, "faces")
 

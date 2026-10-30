@@ -54,6 +54,8 @@ ICONS = {
              'c-2.6-2.4-3.8-5.2-3.8-8.5s1.2-6.1 3.8-8.5z"/>',
     "route": '<circle cx="6" cy="18" r="2"/><circle cx="18" cy="6" r="2"/><path d="M8 18h6.5a3.5 3.5 0 0 0 0-7h-5a3.5 3.5 0 0 1 0-7H16"/>',
     "sort": '<path d="M7 5v14M4 16l3 3 3-3M14 7h6M14 12h4.5M14 17h3"/>',
+    # Ozvěny: dva rámečky přes sebe (tehdy / teď) s ozvěnou oblouku
+    "echo": '<rect x="3.5" y="7.5" width="10" height="10" rx="2"/><path d="M16.5 7.5a6 6 0 0 1 0 10M19 5a9.5 9.5 0 0 1 0 15"/>',
     "chevron_down": '<path d="M7 10l5 5 5-5"/>',
     "sparkle":'<path d="M12 3.5q1 7.5 8.5 8.5q-7.5 1-8.5 8.5q-1-7.5-8.5-8.5q7.5-1 8.5-8.5z"/>',
 }

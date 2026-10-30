@@ -75,6 +75,10 @@ class NavigationController(QObject):
     def contains(self, page):
         return any(e.page is page for e in self._entries)
 
+    def pages(self):
+        """Otevřené podstránky od nejspodnější."""
+        return [e.page for e in self._entries]
+
     def previous(self, page):
         """Stránka, nad kterou byla page vložena (pro přechody prohlížeče), jinak None."""
         return next((e.previous for e in self._entries if e.page is page), None)

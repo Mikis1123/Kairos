@@ -1,6 +1,7 @@
 """Kairos dávka 3 – kostra okna: ikony, postranní panel s kolekcemi, prázdné stavy, listy v okně,
 toasty z tokenů a Mica (window_effects)."""
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -166,7 +167,7 @@ class TestShellWindow(WindowEnv):
     def test_sidebar_sections_and_collections(self):
         nav = self.w.sidebar_nav
         self.assertEqual([it.key for it in nav.items],
-                         ["photos", "people", "events", "map", "favorites", "videos", "trash"])
+                         ["photos", "people", "events", "map", "favorites", "videos", "trash", "echoes"])
         self.assertTrue(all(it.icon_name for it in nav.items), "každá položka má vektorovou ikonu")
         nav.item("trash").click()
         self.assertEqual(self.w._current_filter, "trash")
@@ -177,6 +178,22 @@ class TestShellWindow(WindowEnv):
         nav.item("photos").click()
         self.assertEqual(self.w._current_filter, "all", "Fotografie = celá knihovna")
         self.assertTrue(nav.item("photos").isChecked())
+
+    def test_echoes_opens_as_subpage_and_back_restores_sidebar(self):
+        nav = self.w.sidebar_nav
+        nav.item("photos").click()
+        nav.item("echoes").click()
+        page = self.w.nav.current()
+        self.assertEqual(page.property("sidebar_key"), "echoes")
+        self.assertTrue(nav.item("echoes").isChecked())
+        self.assertEqual(self.w.stack.indexOf(self.w.page_photos), 0, "indexy stránek stacku beze změny")
+        for _ in range(100):                     # hledání běží na pozadí (EchoJob)
+            _app.processEvents()
+            if self.w._echoes_panel.echoes is not None and not self.w._echoes_panel._job:
+                break
+            time.sleep(0.02)
+        self.w.nav.pop()
+        self.assertTrue(nav.item("photos").isChecked(), "Zpět vrátí jezdec na kořenovou stránku")
 
     def test_programmatic_page_switch_keeps_collection_highlighted(self):
         self.w._open_collection("favorites")

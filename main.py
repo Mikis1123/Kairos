@@ -49,7 +49,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
-    QWebEngineSettings, QWebEngineProfile, QWebEngineUrlRequestInterceptor, QWebEnginePage,
+    QWebEngineSettings, QWebEngineProfile, QWebEngineUrlRequestInterceptor, QWebEnginePage, QWebEngineScript,
 )
 from PyQt6.QtWebChannel import QWebChannel
 from web_console import QuietWebPage
@@ -106,6 +106,9 @@ import governor
 import perf_profile
 import scrub_strip
 import search_engine
+import ambient_music
+import card_media
+import tile_store
 import video_proxy
 import video_frames
 HOVER_PRELOAD_MS = 350      # setrvání kurzoru nad videem v mřížce před přednačtením
@@ -284,6 +287,9 @@ def is_allowed_web_url(url):
     scheme = u.scheme().lower()
     if scheme in LOCAL_WEB_SCHEMES:
         return True
+    if scheme == "http":                # C7e: jen místní úložiště dlaždic této aplikace
+        srv = tile_store.service()
+        return srv is not None and srv.owns(u.host(), u.port())
     return scheme == "https" and u.host().lower() in ALLOWED_WEB_HOSTS
 
 
@@ -354,6 +360,7 @@ def shutdown_app(app, window):
     theme.uninstall()
     icons.clear_cache()                     # Kairos: QPixmap ikon nesmí přežít QApplication
     release_map_profile()
+    tile_store.stop()                       # C7e: místní server dlaždic + dopsání fronty zápisů
     try:
         import scrub_strip
         scrub_strip.manager().shutdown()
@@ -394,6 +401,22 @@ def map_web_profile():
             print(f"[Map] trvalý profil nelze vytvořit, použije se výchozí: {e}")
             return None
     return _map_profile
+
+
+def install_tile_store(page, budget_mb=tile_store.DEFAULT_BUDGET_MB):
+    """C7e: spustí místní úložiště dlaždic a stránce ho ohlásí PŘED jejími skripty
+    (window.TILE_STORE_CONFIG) – i první dlaždice nově vzniklé mapy jdou přes něj.
+    Bez úložiště zůstává mapa u přímých adres serverů. Vrací službu nebo None."""
+    srv = tile_store.start(budget_mb)
+    if srv is None:
+        return None
+    script = QWebEngineScript()
+    script.setName("kairos-tile-store")
+    script.setSourceCode(f"window.TILE_STORE_CONFIG = {json.dumps(srv.config())};")
+    script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+    script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+    page.scripts().insert(script)
+    return srv
 
 
 # ── P3.9 LRU cache ───────────────────────────────────────────────────────────
@@ -2057,6 +2080,11 @@ class SearchModelWarmup(QThread):
 MAP_HOLD_TTL_S = 20.0       # nejdelší pohyb kamery mapy bez nového hlášení
 
 
+class ClipRelay(QObject):
+    """Hotový klip karty Cesty z vlákna card_media.ClipWorker -> GUI (fronta signálů Qt)."""
+    ready = pyqtSignal(int, int, str)       # id Cesty (události), index zastávky, URL klipu
+
+
 class MapBridge(QObject):
     def __init__(self, main_window):
         super().__init__()
@@ -2106,6 +2134,14 @@ class MapBridge(QObject):
         """Uživatel Cestu ukončil (×, Hotovo, Esc) -> případný návrat na stránku, odkud ji spustil."""
         if hasattr(self.main_window, "journey_closed"):
             QTimer.singleShot(0, self.main_window.journey_closed)
+
+    @pyqtSlot(bool)
+    def setJourneyMusic(self, enabled):
+        """Tlačítko hudby v Cestě -> zapamatovat volbu (config.json, C6)."""
+        mw = self.main_window
+        if hasattr(mw, "config"):
+            mw.config["cesta_music"] = bool(enabled)
+            save_config(mw.config)
 
 
 # ── Background AI daemon ──────────────────────────────────────────────────────
@@ -3090,6 +3126,8 @@ class MainWindow(QMainWindow):
             ("events", "Události", "events"), ("map", "Mapa", "map"),
             NavSection("Kolekce"),
             ("favorites", "Oblíbené", "heart"), ("videos", "Videa", "video"), ("trash", "Smazané", "trash"),
+            NavSection("Objevy"),
+            ("echoes", "Ozvěny", "echo"),
         ])
         # Kairos Spark: kliknutí na hlavní záložku vyšle z jiskry loga světelný puls (~180 ms);
         # spojení před přepnutím stránky, ať animace startuje bez čekání na novou stránku
@@ -3390,9 +3428,14 @@ class MainWindow(QMainWindow):
             # Žádné menu Chromia (Zpět / Znovu načíst / Zobrazit zdroj) na pravém tlačítku
             self.map_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
             self.map_view.page().setBackgroundColor(QColor("#1C1C1E"))
+            install_tile_store(self.map_view.page(),
+                               int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
             settings = self.map_view.settings()
             settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            # C6: hudba Cesty startuje z tlačítka v aplikaci (ne gestem ve stránce) – bez tohohle
+            # by ji Chromium zablokoval (autoplay policy)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
 
             self.map_channel = QWebChannel()
             self.map_bridge = MapBridge(self)
@@ -4024,6 +4067,9 @@ class MainWindow(QMainWindow):
         if key in self.COLLECTION_FILTERS:
             self._open_collection(key)
             return
+        if key == "echoes":
+            self.open_echoes()
+            return
         if key == "photos" and self._current_filter != "all":
             self._set_filter("all")
         self._switch_page(self.SIDEBAR_PAGES.index(key))
@@ -4037,6 +4083,9 @@ class MainWindow(QMainWindow):
         """Jezdec v postranním panelu podle stránky a filtru (i po programové změně)."""
         idx = self.stack.currentIndex()
         if not 0 <= idx < len(self.SIDEBAR_PAGES):
+            if any(p.property("sidebar_key") == "echoes" for p in self.nav.pages()):
+                self.sidebar_nav.set_current("echoes")  # Ozvěny i jejich srovnání (podstránky)
+                return
             idx = self.stack.indexOf(self.nav.root())    # podstránka: podle kořene pod ní
         if idx == 0:
             key = next((k for k, f in self.COLLECTION_FILTERS.items() if f == self._current_filter), "photos")
@@ -4253,6 +4302,7 @@ class MainWindow(QMainWindow):
         # adaptivní škálování mapy: meze rozlišení, LOD dlaždic a terénu podle profilu stroje
         page.runJavaScript(f"window.setPerfProfile && window.setPerfProfile({json.dumps(self.perf.for_map())});")
         page.runJavaScript(f"window.setBaseLayer && window.setBaseLayer({json.dumps(layer)});")
+        page.runJavaScript(f"window.setJourneyMusic && window.setJourneyMusic({json.dumps(self._music_config())});")
         self._sync_accent()
         self._sync_map_active()
         self._refresh_map()
@@ -4296,6 +4346,7 @@ class MainWindow(QMainWindow):
                     conn, event_id, get_local_thumb_url,
                     image_url=lambda p: get_local_thumb_url(preview_cache.get_preview(p, touch=False)))
                 row = conn.execute("SELECT tint FROM events WHERE id = ?", (int(event_id),)).fetchone()
+                clips = MainWindow._journey_clips(self, conn, data) if data is not None else []
             finally:
                 conn.close()
         except Exception as e:
@@ -4303,6 +4354,7 @@ class MainWindow(QMainWindow):
             return False
         if data is None:
             return False
+        MainWindow._start_clip_worker(self, data["id"], clips)
         glow = MainWindow._event_glow({"tint": row[0] if row else None}, mode="dark")
         if glow:
             data["accent"] = glow            # trasa v odstínu výletu; po konci Cesty zpět zvýraznění
@@ -4321,6 +4373,50 @@ class MainWindow(QMainWindow):
             return True
         self.map_view.page().runJavaScript(f"window.playJourney && window.playJourney({json.dumps(data)});")
         return True
+
+    def _music_config(self):
+        """C6: přibalené skladby pro Cestu + volba uživatele (výchozí vypnuto)."""
+        return {"enabled": bool(self.config.get("cesta_music", False)),
+                "tracks": [{"title": t["title"], "url": QUrl.fromLocalFile(t["path"]).toString()}
+                           for t in ambient_music.tracks()]}
+
+    def _journey_clips(self, conn, data):
+        """Cesta 3.0: klipy karet (Live Photo, 3 s videa) – jen vysoký profil. Hotové se přidají
+        rovnou do dat zastávek (best.clip), chybějící vyrobí _start_clip_worker za běhu."""
+        if getattr(self, "perf", None) is None or self.perf.tier != "high":
+            return []
+        try:
+            clips = card_media.plan(conn, data)
+        except Exception as e:
+            print(f"[Map] Cesta – klipy: {e}")
+            return []
+        for c in clips:
+            if c["ready"]:
+                data["stops"][c["stop"]]["best"]["clip"] = QUrl.fromLocalFile(c["path"]).toString()
+        return clips
+
+    def _start_clip_worker(self, journey_id, clips):
+        old = getattr(self, "_clip_worker", None)
+        if old is not None:
+            old.stop()
+        self._clip_worker = None
+        if not any(not c["ready"] for c in clips):
+            return
+        if getattr(self, "_clip_relay", None) is None:
+            self._clip_relay = ClipRelay(self)
+            self._clip_relay.ready.connect(self._on_clip_ready)
+        relay = self._clip_relay
+        worker = card_media.ClipWorker(
+            clips, lambda item, path: relay.ready.emit(int(journey_id), int(item["stop"]),
+                                                       QUrl.fromLocalFile(path).toString()))
+        self._clip_worker = worker
+        worker.start()
+
+    def _on_clip_ready(self, journey_id, stop, url):
+        if getattr(self, "map_view", None) is None or not self._map_loaded:
+            return
+        self.map_view.page().runJavaScript(
+            f"window.journeyClip && window.journeyClip({int(journey_id)}, {int(stop)}, {json.dumps(url)});")
 
     def _request_journey(self, event_id: int):
         """Tlačítko Cesta (karta / hlavička události). Odloženě: přepnutí stránky ruší podstránku,
@@ -4885,6 +4981,53 @@ class MainWindow(QMainWindow):
         self._add_slideshow_action(page, grid)
         page.set_content(grid)
         self.nav.push(page)
+
+    # ── Ozvěny (tehdy a teď) ──────────────────────────────────────────────────
+
+    def open_echoes(self):
+        """Postranní panel Objevy › Ozvěny: místa, kam se uživatel vrátil po letech (echoes.py).
+        Podstránka nad aktuální stránkou; hledání běží na pozadí (EchoJob)."""
+        import echoes_view
+        self.nav.reset()
+        page = DetailPage("Ozvěny", "Stejné místo, stejný záběr – o roky později")
+        page.setProperty("sidebar_key", "echoes")
+        panel = echoes_view.EchoesPanel(get_connection, page)
+        panel.opened.connect(self._open_echo)
+        panel.loaded.connect(lambda n: page.set_title(
+            "Ozvěny", f"{n} {'místo' if n == 1 else 'místa' if 2 <= n <= 4 else 'míst'}, kam jste se vrátili"
+            if n else "Stejné místo, stejný záběr – o roky později"))
+        page.set_content(panel)
+        self._echoes_panel = panel
+        self.nav.push(page, on_pop=self._sync_sidebar)
+        self._sync_sidebar()
+        panel.load()
+
+    def _open_echo(self, echo):
+        import echoes
+        import echoes_view
+        first, last = echo["items"][0], echo["items"][-1]
+        page = DetailPage(echo.get("place") or "Ozvěna", echoes.subtitle(echo))
+        page.setProperty("sidebar_key", "echoes")
+        view = echoes_view.ThenNowView(echo, page)
+        view.open_photo.connect(lambda mid: self._open_echo_photo(echo, mid))     # dvojklik na polovinu
+        page.add_action("Tehdy", lambda: self._open_echo_photo(echo, echo["items"][view.then_i]["id"]),
+                        f"Snímek z roku {first['year']} v prohlížeči")
+        page.add_action("Teď", lambda: self._open_echo_photo(echo, last["id"]),
+                        f"Snímek z roku {last['year']} v prohlížeči")
+        page.set_content(view)
+        self.nav.push(page)
+        view.setFocus()
+
+    def _open_echo_photo(self, echo, media_id):
+        ids = [it["id"] for it in echo["items"]]
+        try:
+            records = fetch_media_records(f"m.id IN ({','.join('?' * len(ids))})", tuple(ids),
+                                          order_by="m.date_taken, m.id")
+        except Exception as e:
+            show_toast(self, f"Fotky nelze otevřít: {e}", "error")
+            return
+        index = next((i for i, r in enumerate(records) if int(r[0]) == int(media_id)), 0)
+        self._open_viewer(records, index)
 
     # ── Import ────────────────────────────────────────────────────────────────
 

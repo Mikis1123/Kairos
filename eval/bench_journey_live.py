@@ -41,7 +41,7 @@ PROFILE_DIR = os.path.join(tempfile.gettempdir(), "kairos_bench_profile")
 
 # Měřák vložený do stránky: _render, snímky pohybu bez načtených dlaždic, čekání v cíli
 PROBE = r"""
-window.__b = {ren: [], moving: 0, holes: 0};
+window.__b = {ren: [], moving: 0, holes: 0, base: 0, src: {}};
 (function () {
   var orig = map._render.bind(map);
   map._render = function (t) {
@@ -49,7 +49,24 @@ window.__b = {ren: [], moving: 0, holes: 0};
     __b.ren.push(performance.now() - a);
     if (director.directing && journey.active && !journey.paused) {
       __b.moving++;
-      try { if (!map.areTilesLoaded()) __b.holes++; } catch (e) {}
+      try {
+        if (!map.areTilesLoaded()) {
+          __b.holes++;
+          // které zdroje díru tvoří (vektory / reliéf / rastr)
+          var sc = map.style.sourceCaches || map.style.tileManagers || {}, base = false;
+          Object.keys(sc).forEach(function (id) {
+            try {
+              if (!sc[id].loaded()) {
+                __b.src[id] = (__b.src[id] || 0) + 1;
+                // podklad = dlaždice ze sítě; trasa Cesty (j-*) a piny jsou GeoJSON přepočítávaný
+                // ve workeru při přechodu úrovně zoomu – mezitím zůstává vidět, díra to není
+                if (id.indexOf('j-') !== 0 && id !== 'pins') base = true;
+              }
+            } catch (e) {}
+          });
+          if (base) __b.base++;
+        }
+      } catch (e) {}
     }
     return r;
   };
@@ -95,15 +112,30 @@ def build_trip(event_id):
         conn.close()
 
 
-def open_page(size, html="map_vault.html"):
-    from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
+def make_profile():
+    from PyQt6.QtWebEngineCore import QWebEngineProfile
     profile = QWebEngineProfile("kairos_bench")
     profile.setPersistentStoragePath(PROFILE_DIR)
     profile.setCachePath(os.path.join(PROFILE_DIR, "cache"))
     profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
-    interceptor = main.WebUrlInterceptor()
-    profile.setUrlRequestInterceptor(interceptor)
+    profile._interceptor = main.WebUrlInterceptor()
+    profile.setUrlRequestInterceptor(profile._interceptor)
+    return profile
+
+
+def open_page(size, html="map_vault.html", profile=None, store=True, workers=0):
+    from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings, QWebEngineScript
+    profile = profile or make_profile()
+    interceptor = profile._interceptor
     page = QWebEnginePage(profile)
+    if store:                                   # C7e: dlaždice přes místní úložiště (jako aplikace)
+        main.install_tile_store(page)
+    if workers:                                 # počet workerů MapLibre se nastavuje před vznikem mapy
+        s = QWebEngineScript()
+        s.setSourceCode(f"window.TILE_WORKERS_OVERRIDE = {int(workers)};")
+        s.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        s.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        page.scripts().insert(s)
     page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
     view = QWebEngineView()
     view.setPage(page)
@@ -122,7 +154,7 @@ def pct(values, p):
     return v[min(len(v) - 1, int(round(p / 100 * (len(v) - 1))))] if v else 0.0
 
 
-def play(page, trip, label, timeout_s):
+def play(page, trip, label, timeout_s, tick=None):
     js(page, "resetFrameStats(); window.__arrivals = []; 0")
     js(page, PROBE)
     # příjezd = začátek zastávky; zaznamenat, zda byly dlaždice hotové a jak dlouho se čekalo
@@ -140,6 +172,8 @@ def play(page, trip, label, timeout_s):
         print(f"{label}: playJourney odmítl data")
         return None
     while time.time() - t0 < timeout_s and not js(page, "journeyState().ended"):
+        if tick:
+            tick()
         wait(250)
     wall = time.time() - t0
     stats = js(page, "getFrameStats()")["journey"]
@@ -151,7 +185,11 @@ def play(page, trip, label, timeout_s):
     line = (f"{label:6s} {wall:5.1f} s  snímky {stats.get('frames', 0):5d}  p50 {stats.get('p50', 0):5.1f}  "
             f"p95 {stats.get('p95', 0):5.1f}  p99 {stats.get('p99', 0):5.1f}  vynechané {stats.get('dropped', 0):4d} "
             f"({100 * stats.get('dropped', 0) / max(1, stats.get('frames', 1)):4.1f} %)  "
-            f"render p50 {pct(ren, 50):5.1f} p95 {pct(ren, 95):5.1f}  díry {100 * holes:4.1f} %")
+            f"render p50 {pct(ren, 50):5.1f} p95 {pct(ren, 95):5.1f}  díry {100 * holes:4.1f} %  "
+            f"podklad {100 * probe.get('base', 0) / max(1, probe['moving']):4.1f} %")
+    if probe.get("src"):
+        line += "  zdroje děr " + ", ".join(f"{k} {100 * v / max(1, probe['moving']):.1f} %"
+                                           for k, v in sorted(probe["src"].items(), key=lambda kv: -kv[1]))
     if arrivals:
         waited = [a.get("waitedMs", 0) for a in arrivals]
         unready = sum(1 for a in arrivals if not a.get("ready", True))
@@ -169,6 +207,12 @@ def main_():
     ap.add_argument("--inject", default="", help="JS před přehráním (pokusy: vypnout vrstvu, změnit parametr)")
     ap.add_argument("--report", default="", help="JS výraz vypsaný po každém přehrání (diagnostika)")
     ap.add_argument("--html", default="map_vault.html", help="stránka ve složce projektu (srovnání verzí)")
+    ap.add_argument("--no-store", action="store_true", help="bez místního úložiště dlaždic (srovnání)")
+    ap.add_argument("--workers", type=int, default=0, help="strop workerů MapLibre (ablace; 0 = jako aplikace)")
+    ap.add_argument("--clips", action="store_true",
+                    help="klipy karet (Live Photo / video) jako v aplikaci: chybějící se vyrábí ZA BĚHU Cesty")
+    ap.add_argument("--restart", action="store_true",
+                    help="navíc přehrání v nové stránce (= další spuštění aplikace: prázdná paměť MapLibre)")
     args = ap.parse_args()
     trip = build_trip(args.event)
     if trip is None:
@@ -179,26 +223,89 @@ def main_():
     print(f"Výlet {trip['id']} „{trip['title']}“: {len(trip['stops'])} zastávek, {km:.0f} km")
     if not args.warm_only:
         shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+    import paths
+    import tile_store
+    paths.TILE_STORE_PATH = os.path.join(PROFILE_DIR, "tiles.sqlite")
     w, h = (int(x) for x in args.size.split("x"))
-    profile, interceptor, page, view = open_page((w, h), args.html)
-    for _ in range(100):
-        if js(page, "typeof styleReady !== 'undefined' && styleReady === true && getBaseLayerEngine() === 'vector'"):
-            break
-        wait(100)
     prof = perf_profile.detect()
-    js(page, f"setPerfProfile({json.dumps(prof.for_map())}); reduceMotion = false; 0")
-    if args.inject:
-        js(page, args.inject + "; 0")
-    print(f"Profil {prof.tier}, podklad {js(page, 'getBaseLayerEngine()')}, okno {w}×{h}")
-    runs = ([] if args.warm_only else ["studená"]) + ["teplá"]
+
+    def ready_page(profile=None):
+        profile, _, page, view = open_page((w, h), args.html, profile, store=not args.no_store, workers=args.workers)
+        for _ in range(100):
+            if js(page, "typeof styleReady !== 'undefined' && styleReady === true && getBaseLayerEngine() === 'vector'"):
+                break
+            wait(100)
+        js(page, f"setPerfProfile({json.dumps(prof.for_map())}); reduceMotion = false; 0")
+        if args.inject:
+            js(page, args.inject + "; 0")
+        return profile, page, view
+
+    profile, page, view = ready_page()
+    srv = None if args.no_store else tile_store.service()
+    print(f"Profil {prof.tier}, podklad {js(page, 'getBaseLayerEngine()')}, okno {w}×{h}, úložiště dlaždic "
+          + ("vypnuto" if srv is None else f"{srv.store.bytes / 2**20:.0f} MB"))
+    runs = ([] if args.warm_only else ["studená"]) + ["teplá"] + (["restart"] if args.restart else [])
+    clip_state = {"worker": None, "ready": [], "built": 0, "t": 0.0}
+    if args.clips:
+        import queue
+        import card_media
+        paths.HIGHLIGHT_DIR = os.path.join(PROFILE_DIR, "highlights")   # studená = vyrábět znovu
+        js(page, "setPerfProfile({tier: 'high'}); 0")
+        clip_state["q"] = queue.Queue()
+
+    def start_clips():
+        conn = sqlite3.connect(os.path.join(ROOT, "photos.db"))
+        try:
+            clips = card_media.plan(conn, trip)
+        finally:
+            conn.close()
+        for c in clips:
+            if c["ready"]:
+                trip["stops"][c["stop"]]["best"]["clip"] = QUrl.fromLocalFile(c["path"]).toString()
+        clip_state["n"] = len(clips)
+        clip_state["t"] = time.time()
+        w = card_media.ClipWorker(clips, lambda item, p: clip_state["q"].put((item["stop"], p, time.time())))
+        clip_state["worker"] = w
+        w.start()
+
+    def tick_clips():
+        while not clip_state["q"].empty():
+            stop, p, at = clip_state["q"].get()
+            clip_state["built"] += 1
+            clip_state["ready"].append(at - clip_state["t"])
+            js(page, f"journeyClip({trip['id']}, {stop}, {json.dumps(QUrl.fromLocalFile(p).toString())}); 0")
+
     for label in runs:
-        play(page, trip, label, args.timeout)
+        if label == "restart":                 # nová stránka = prázdná paměť MapLibre, disk zůstává
+            view.close()
+            page.deleteLater()
+            wait(300)
+            profile, page, view = ready_page(profile)
+        before = dict(srv.store.stats()) if srv else None
+        if args.clips:
+            for s in trip["stops"]:
+                (s.get("best") or {}).pop("clip", None)
+            clip_state.update(built=0, ready=[])
+            start_clips()
+        play(page, trip, label, args.timeout, tick=tick_clips if args.clips else None)
+        if args.clips:
+            clip_state["worker"].stop()
+            on = js(page, "getClipState()")
+            print(f"    klipy: {clip_state['n']} v plánu, vyrobeno za běhu {clip_state['built']} "
+                  f"({', '.join(f'{t:.1f}' for t in clip_state['ready'])} s od startu), stav {json.dumps(on)}",
+                  flush=True)
+        if before is not None:
+            st = srv.store.stats()
+            print(f"    úložiště: z disku {st['hits'] - before['hits']}, přesměrováno {st['redirects'] - before['redirects']}, "
+                  f"staženo {st['misses'] - before['misses']}, "
+                  f"{st['bytes'] / 2**20:.0f} MB, předpečeno {srv.baking['done']}/{srv.baking['total']}", flush=True)
         if args.report:
             print("   ", json.dumps(js(page, args.report), ensure_ascii=False))
     view.close()
     page.deleteLater()
     wait(200)
     profile.deleteLater()
+    tile_store.stop()
     return 0
 
 
