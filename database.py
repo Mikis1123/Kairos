@@ -314,6 +314,8 @@ def init_db():
             ("face_score", "REAL"),
             ("det_score", "REAL"),
             ("gate_version", "INTEGER"),
+            # Sprint 4 (Reels): pravděpodobnost úsměvu 0–1 (smile.py, CLIP na ořezu); NULL = nespočítáno
+            ("smile", "REAL"),
         ])
 
         # Páry, které uživatel v dialogu duplicit označil "Ponechat obě" (id_a < id_b)

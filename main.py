@@ -2269,6 +2269,8 @@ class BackgroundAIDaemon(QThread):
             if self._running:
                 self._improve_person_covers()
             if self._running:
+                self._score_smiles()
+            if self._running:
                 self._index_ocr()
             if self._running:
                 self._index_siglip()
@@ -2523,6 +2525,20 @@ class BackgroundAIDaemon(QThread):
                 save_ocr_results(batch)
                 batch = []
         save_ocr_results(batch)
+
+    def _score_smiles(self):
+        """Sprint 4 (Reels): úsměv na nových tvářích (smile.py – CLIP na ořezu, ~10 ms na tvář)."""
+        import smile
+        try:
+            conn = get_connection()
+            try:
+                if smile.pending_faces(conn, limit=1):
+                    self._status("Hledám úsměvy pro sestřihy...")
+                    smile.score_faces(conn, should_stop=self._yield)
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[Smile] {e}")
 
     def _index_siglip(self):
         """Sprint 4.0: přesné hledání – vektory SigLIP 2 pro celou knihovnu (stejné zdroje jako CLIP).
@@ -3270,7 +3286,7 @@ class MainWindow(QMainWindow):
             ("favorites", "Oblíbené", "heart"), ("videos", "Videa", "video"), ("albums", "Alba", "album"),
             ("trash", "Smazané", "trash"),
             NavSection("Objevy"),
-            ("echoes", "Ozvěny", "echo"),
+            ("echoes", "Ozvěny", "echo"), ("reels", "Sestřihy", "reel"),
         ])
         # Kairos Spark: kliknutí na hlavní záložku vyšle z jiskry loga světelný puls (~180 ms);
         # spojení před přepnutím stránky, ať animace startuje bez čekání na novou stránku
@@ -4293,6 +4309,9 @@ class MainWindow(QMainWindow):
         if key == "echoes":
             self.open_echoes()
             return
+        if key == "reels":
+            self.open_reels()
+            return
         if key == "albums":
             self.open_albums()
             return
@@ -4309,7 +4328,7 @@ class MainWindow(QMainWindow):
         """Jezdec v postranním panelu podle stránky a filtru (i po programové změně)."""
         idx = self.stack.currentIndex()
         if not 0 <= idx < len(self.SIDEBAR_PAGES):
-            for sub_key in ("echoes", "albums"):           # Ozvěny / Alba i jejich podstránky
+            for sub_key in ("echoes", "albums", "reels"):  # Ozvěny / Alba / Sestřihy i jejich podstránky
                 if any(p.property("sidebar_key") == sub_key for p in self.nav.pages()):
                     self.sidebar_nav.set_current(sub_key)
                     return
@@ -5095,6 +5114,8 @@ class MainWindow(QMainWindow):
             Command("Alba", lambda: nav("albums"), "page", icon="album", keywords="kolekce výběry"),
             Command("Smazané", lambda: nav("trash"), "page", icon="trash", keywords="koš"),
             Command("Ozvěny", lambda: nav("echoes"), "page", icon="echo", keywords="tehdy teď návrat"),
+            Command("Sestřihy", lambda: nav("reels"), "page", icon="reel",
+                    keywords="reels video film throwback vzpomínky hudba export mp4"),
             Command("Importovat fotky…", self._start_import, "action", icon="import", keywords="přidat složka"),
             Command("Předvolby", self._open_settings, "action", icon="settings", keywords="nastavení možnosti"),
             Command("Nové album…", lambda: self._new_album(), "action", icon="plus", keywords="vytvořit album"),
@@ -5509,6 +5530,88 @@ class MainWindow(QMainWindow):
         page.set_content(view)
         self.nav.push(page)
         view.setFocus()
+
+    # ── Throwback Reels (Sprint 4) ────────────────────────────────────────────
+
+    def open_reels(self):
+        """Objevy › Sestřihy: návrhy filmových sestřihů (reels.py) – výpočet na pozadí."""
+        import reels_view
+        self.nav.reset()
+        page = DetailPage("Sestřihy", "Nejlepší chvíle ve střihu na rytmus hudby")
+        page.setProperty("sidebar_key", "reels")
+        panel = reels_view.ReelsPanel(get_connection, page)
+        panel.opened.connect(self._open_reel)
+        panel.loaded.connect(lambda n: page.set_title(
+            "Sestřihy", f"{n} {'sestřih' if n == 1 else 'sestřihy' if 2 <= n <= 4 else 'sestřihů'} připraveno"
+            if n else "Nejlepší chvíle ve střihu na rytmus hudby"))
+        page.set_content(panel)
+        self._reels_panel = panel
+        self.nav.push(page, on_pop=self._sync_sidebar)
+        self._sync_sidebar()
+        panel.load()
+
+    def _open_reel(self, suggestion):
+        import reels_view
+        track = reels_view._music_for(suggestion["key"], ambient_music.tracks())
+        page = DetailPage(suggestion["title"], suggestion.get("subtitle", ""))
+        page.setProperty("sidebar_key", "reels")
+        body = reels_view.ReelPage(page)
+        page.set_content(body)
+        btn_play = page.add_action("Pauza", lambda: body.player and body.player.toggle(), "Přehrát / pozastavit (mezerník)")
+        btn_export = page.add_action("Exportovat MP4…", lambda: self._export_reel(body), "Video H.264 1080p s hudbou ke sdílení")
+        btn_export.setEnabled(False)
+
+        def sync_play():
+            if body.player is not None:
+                btn_play.setText("Pauza" if body.player.playing else "Přehrát")
+
+        def ready(renderer):
+            body.set_renderer(renderer)
+            btn_export.setEnabled(renderer is not None)
+            if renderer is not None:
+                plan = renderer.plan
+                music = (plan.get("music") or {}).get("title")
+                page.set_title(suggestion["title"], " · ".join(x for x in (
+                    suggestion.get("subtitle", ""), f"{plan['shots']} záběrů", f"{plan['total']:.0f} s",
+                    f"hudba: {music}" if music else "") if x))
+                body.player.ended.connect(sync_play)
+                timer = QTimer(page)
+                timer.timeout.connect(sync_play)
+                timer.start(300)
+        job = reels_view.BuildJob(get_connection, suggestion, track)
+        job.signals.done.connect(ready)
+        self._reel_job = job
+        QThreadPool.globalInstance().start(job)
+        self.nav.push(page, on_pop=lambda: body.player and body.player.stop())
+        self._sync_sidebar()
+
+    def _export_reel(self, body):
+        import reel_export
+        import reels_view
+        if body.player is None:
+            return
+        plan = body.player.plan
+        body.player.pause()
+        start = os.path.join(os.path.expanduser("~"), "Videos", reel_export.default_name(plan))
+        path, _ = QFileDialog.getSaveFileName(self, "Uložit sestřih", start, "Video MP4 (*.mp4)")
+        if not path:
+            return
+        job = reels_view.ExportJob(plan, path, self)
+        job.progress.connect(lambda f: self.lbl_status.set_task("reel_export", f"Exportuji sestřih… {f * 100:.0f} %"))
+
+        def done(out, stats):
+            self.lbl_status.set_task("reel_export", "")
+            print(f"[Reels] export {stats}")
+            show_toast(self, f"Sestřih uložen ({stats['mb']:.0f} MB)", "success", action_text="Zobrazit ve složce",
+                       on_action=lambda: subprocess.Popen(["explorer", "/select,", os.path.normpath(out)]))
+
+        def failed(err):
+            self.lbl_status.set_task("reel_export", "")
+            show_toast(self, f"Export se nepodařil: {err}", "error")
+        job.finished_ok.connect(done)
+        job.failed.connect(failed)
+        self._reel_export = job
+        job.start()
 
     def _open_echo_photo(self, echo, media_id):
         ids = [it["id"] for it in echo["items"]]

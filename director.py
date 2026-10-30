@@ -141,6 +141,30 @@ def snap_cuts(segs, grid, cut, stretch, min_k=0.75, max_k=1.35, down_tol=None):
     return snapped
 
 
+class BeatClock:
+    """Fázový zámek času filmu na hodiny hudby (director.js BeatClock): film jemně zrychlí /
+    zpomalí (±max_rate), aby střihy naplánované na doby na dobách zůstaly."""
+
+    def __init__(self, offset=None, gain=0.9, max_rate=0.12, relock=1.5):
+        self.initial, self.offset = offset, offset
+        self.gain, self.max_rate, self.relock = gain, max_rate, relock
+
+    def reset(self):
+        self.offset = self.initial
+
+    def rate(self, film_t, audio_t):
+        if audio_t is None or not math.isfinite(audio_t):
+            return 1.0
+        if self.offset is None:
+            self.offset = audio_t - film_t
+            return 1.0
+        err = (audio_t - self.offset) - film_t
+        if abs(err) > self.relock:
+            self.offset = audio_t - film_t
+            return 1.0
+        return 1.0 + max(-self.max_rate, min(self.max_rate, err * self.gain))
+
+
 # ── kamera: Ken Burns ──
 def ken_burns(focus, seed, zoom=(1.0, 1.12), aspect_in=1.0, aspect_out=16 / 9):
     """Pohyb výřezu fotky během záběru: {"from": (cx, cy, s), "to": (cx, cy, s)} v souřadnicích
