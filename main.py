@@ -4605,8 +4605,10 @@ class MainWindow(QMainWindow):
 
     def _music_config(self):
         """C6: přibalené skladby pro Cestu + volba uživatele (výchozí vypnuto)."""
+        # Sprint 4: s mapou dob – Director přichytí příjezdy na zastávky na doby (director.js)
         return {"enabled": bool(self.config.get("cesta_music", False)),
-                "tracks": [{"title": t["title"], "url": QUrl.fromLocalFile(t["path"]).toString()}
+                "tracks": [{"title": t["title"], "url": QUrl.fromLocalFile(t["path"]).toString(),
+                            "beats": ambient_music.beat_map(t)}
                            for t in ambient_music.tracks()]}
 
     def _journey_clips(self, conn, data):

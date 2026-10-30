@@ -11,6 +11,7 @@
      Vše ostatní blokuje WebUrlInterceptor v main.py (ALLOWED_WEB_HOSTS). -->
 <link rel="stylesheet" href="vendor/maplibre/maplibre-gl.css">
 <script src="vendor/maplibre/maplibre-gl.js"></script>
+<script src="director.js"></script>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <style>
   :root { --accent: #8B7CF6; --accent-soft: rgba(139,124,246,0.28);
@@ -2276,11 +2277,9 @@
   var director = { raf: 0, watchdog: 0, last: 0, t: 0, heading: 0, directing: false, hold: 0, pfAt: 0 };
   var film = null;                    // {segs, total, pad, starts, dwells, overview}
 
-  function smootherstep(u) { u = Math.max(0, Math.min(1, u)); return u * u * u * (u * (6 * u - 15) + 10); }
-  function smoothstep(u) { u = Math.max(0, Math.min(1, u)); return u * u * (3 - 2 * u); }
-  function lerp(a, b, t) { return a + (b - a) * t; }
-  function angleTo(from, to) { return ((to - from + 540) % 360) - 180; }
-  function lerpAngle(a, b, t) { return a + angleTo(a, b) * t; }
+  // Sprint 4: časová osa, kamera a beat jsou ve sdíleném Directoru (director.js – i Throwback Reels)
+  var D = window.KairosDirector;
+  var smootherstep = D.smootherstep, smoothstep = D.smoothstep, lerp = D.lerp, angleTo = D.angleTo, lerpAngle = D.lerpAngle;
 
   // ── hodiny ──
   function directorStart() {
@@ -2308,8 +2307,9 @@
     if (!fromWatchdog) meterTick(journeyMeter, now);
     if (journey.active && film && !journey.paused && director.directing) {
       if (holdForTiles(dt)) dt = 0;
-      director.t = Math.min(film.total, director.t + dt * FILM_SPEED);
-      renderFilm(dt * FILM_SPEED);
+      var rate = beatRate();
+      director.t = Math.min(film.total, director.t + dt * FILM_SPEED * rate);
+      renderFilm(dt * FILM_SPEED * rate);
       if (director.t >= film.total) { director.directing = false; onFilmEnd(); }
     }
     if (!fromWatchdog) director.raf = journey.active && director.directing ? requestAnimationFrame(directorTick) : 0;
@@ -2434,32 +2434,25 @@
     segs.push({ kind: 'outro', i: st.length - 1, from: pose, to: outro, dur: reduceMotion ? 1.2 : FILM_OUTRO_S,
                 vw: vanWijk(pose.c, outro.c, worldW(pose.z), worldW(outro.z), VW_RHO) });
     // dlouhé výlety: zkrátit přesuny i okamžiky úměrně (s podlahou), ať film nemá čtvrt hodiny
-    var total = segs.reduce(function (a, g) { return a + g.dur; }, 0);
-    if (total > FILM_MAX_S) {
-      var fixed = segs[0].dur + segs[segs.length - 1].dur, k = (FILM_MAX_S - fixed) / (total - fixed);
-      segs.forEach(function (g) {
-        if (g.kind === 'dwell') g.dur = Math.max(DWELL_FLOOR_S, g.dur * k);
-        else if (g.kind === 'glide' || g.kind === 'hop') g.dur = Math.max(TRAVEL_FLOOR_S, g.dur * k);
-      });
+    D.compress(segs, FILM_MAX_S, function (g) { return g.kind === 'intro' || g.kind === 'outro'; },
+               function (g) { return g.kind === 'dwell' ? DWELL_FLOOR_S : TRAVEL_FLOOR_S; });
+    var t = D.layout(segs);
+    // Sprint 4: s hudbou přijede kamera na zastávku (karta okamžiku) na dobu – přednostně těžkou
+    var beats = 0, grid = musicGrid(data, t + 30);
+    if (grid && !reduceMotion) {
+      beats = D.snapCuts(segs, grid, { cut: function (g) { return g.kind === 'dwell'; },
+                                       stretch: function (g) { return g.kind === 'glide' || g.kind === 'hop' || g.kind === 'intro'; } });
+      t = D.layout(segs);
     }
-    var t = 0;
-    segs.forEach(function (g) { g.t0 = t; t += g.dur; });
     var dwells = segs.filter(function (g) { return g.kind === 'dwell'; });
-    return { segs: segs, total: t, pad: pad, overview: overview, dwells: dwells };
+    return { segs: segs, total: t, pad: pad, overview: overview, dwells: dwells, beats: beats, grid: grid };
   }
   // (ne window.planFilm – deklarace funkce v hlavním skriptu JE window.planFilm, přepsání = rekurze)
   window.getFilmPlan = function (data) {    // pro testy: plán bez přehrávání
     return validJourney(data) ? planFilm(data, cameraNow(), filmPadding()) : null;
   };
 
-  function segIndexAt(t) {
-    var segs = film.segs, lo = 0, hi = segs.length - 1;
-    while (lo < hi) {
-      var mid = (lo + hi + 1) >> 1;
-      if (segs[mid].t0 <= t) lo = mid; else hi = mid - 1;
-    }
-    return lo;
-  }
+  function segIndexAt(t) { return D.indexAt(film.segs, t); }
   function travelPath(seg) {          // trasa po cestách mohla dorazit z Workeru až po plánu
     var legs = journey.legs, i = seg.i;
     if (!seg.path || (legs && legs[i] && seg.path !== legs[i])) seg.path = i > 0 ? legPath(i) : [seg.from.c, seg.to.c];
@@ -2474,11 +2467,7 @@
   // s nenulovou rychlostí na koncích (dosednutí / rozjezd navazují na pomalý pohyb okamžiku),
   // úvod se rozjíždí z klidu a závěr do klidu dobrzdí.
   var CAM_END_SLOPE = 0.35;           // rychlost na konci přesunu (podíl průměrné)
-  function hermite(u, m0, m1) {
-    u = Math.max(0, Math.min(1, u));
-    var u2 = u * u, u3 = u2 * u;
-    return (u3 - 2 * u2 + u) * m0 + (3 * u2 - 2 * u3) + (u3 - u2) * m1;
-  }
+  var hermite = D.hermite;
   function travelEase(seg, u) {
     var m0 = seg.kind === 'intro' ? 0 : CAM_END_SLOPE, m1 = seg.kind === 'outro' ? 0 : CAM_END_SLOPE;
     return hermite(u, m0, m1);
@@ -2541,31 +2530,16 @@
     }
     return { x: x, y: mercY(g.c[1]), z: g.z, p: g.p, b: b };
   }
-  function smoothChannel(raw, tau) {  // exponenciála dopředu a zpět = nulové zpoždění
-    var n = raw.length, a = 1 - Math.exp(-CAM_DT / tau), fwd = new Array(n), out = new Array(n);
-    fwd[0] = raw[0];
-    for (var k = 1; k < n; k++) fwd[k] = fwd[k - 1] + a * (raw[k] - fwd[k - 1]);
-    out[n - 1] = fwd[n - 1];
-    for (k = n - 2; k >= 0; k--) out[k] = out[k + 1] + a * (fwd[k] - out[k + 1]);
-    return out;
+  function smoothChannel(raw, tau) { return D.smoothChannel(raw, tau, CAM_DT); }
+  function unwrapSample(s, p) {       // rozbalení přes antimeridián a přes 360° (navázání za změnou)
+    s.x += Math.round(p.x - s.x);
+    s.b = p.b + angleTo(p.b, s.b);
   }
+  // Začátek a konec drží přesně (Director): první snímek = kamera před filmem, konec = přehled
   function buildCamera(f) {
-    var n = Math.max(2, Math.ceil(f.total / CAM_DT) + 1), raw = [], prev = null;
-    for (var k = 0; k < n; k++) { prev = camSample(Math.min(f.total, k * CAM_DT), prev); raw.push(prev); }
-    f.camRaw = raw;
-    smoothCamera(f);
-  }
-  function smoothCamera(f) {
-    var cam = {};
-    CAM_KEYS.forEach(function (key) {
-      var raw = f.camRaw.map(function (s) { return s[key]; });
-      if (key === 'z') raw = detentZoom(raw);     // před vyhlazením: křivka zůstane C2
-      cam[key] = smoothChannel(raw, CAM_TAU[key]);
-    });
-    // začátek a konec drží přesně: první snímek = kamera před filmem (žádný skok), konec = přehled
-    var first = f.camRaw[0], last = f.camRaw[f.camRaw.length - 1];
-    CAM_KEYS.forEach(function (key) { cam[key][0] = first[key]; cam[key][cam[key].length - 1] = last[key]; });
-    f.cam = cam;
+    f.spline = new D.CameraSpline({ dt: CAM_DT, keys: CAM_KEYS, tau: CAM_TAU, sample: camSample,
+                                    prefilter: { z: detentZoom }, unwrap: unwrapSample }).build(f.total);
+    f.cam = f.spline.cam;
   }
   // ── Sprint 1: zpomalení na hranicích úrovní dlaždic ──
   // Vektorové dlaždice (512 px) mění úroveň, když zoom kamery překročí celé číslo; v tu chvíli
@@ -2590,24 +2564,11 @@
   }
   window.detentZoom = detentZoom;
   function resampleCamera(f, t0, t1) {   // úsek se změnil (trasa po cestách dorazila později)
-    if (!f.camRaw) return;
-    var raw = f.camRaw, k0 = Math.max(1, Math.floor(t0 / CAM_DT)), k1 = Math.min(raw.length - 1, Math.ceil(t1 / CAM_DT));
-    for (var k = k0; k <= k1; k++) raw[k] = camSample(Math.min(f.total, k * CAM_DT), raw[k - 1]);
-    for (k = k1 + 1; k < raw.length; k++) {      // navázat rozbalení za změněným úsekem
-      var s = raw[k], p = raw[k - 1];
-      s.x += Math.round(p.x - s.x);
-      s.b = p.b + angleTo(p.b, s.b);
-    }
-    smoothCamera(f);
+    if (!f.spline) return;
+    f.spline.resample(t0, t1);
+    f.cam = f.spline.cam;
   }
-  function bspline(arr, t) {          // uniformní kubický B-spline (C2) přes vzorky
-    var n = arr.length, s = t / CAM_DT, k = Math.floor(s), u = s - k;
-    var i0 = Math.max(0, Math.min(n - 1, k - 1)), i1 = Math.max(0, Math.min(n - 1, k)),
-        i2 = Math.max(0, Math.min(n - 1, k + 1)), i3 = Math.max(0, Math.min(n - 1, k + 2));
-    var u2 = u * u, u3 = u2 * u;
-    return ((1 - u) * (1 - u) * (1 - u) * arr[i0] + (3 * u3 - 6 * u2 + 4) * arr[i1]
-            + (-3 * u3 + 3 * u2 + 3 * u + 1) * arr[i2] + u3 * arr[i3]) / 6;
-  }
+  function bspline(arr, t) { return D.bspline(arr, t, CAM_DT); }
   function filmPoseAt(t) {
     var r = filmGeomAt(t);
     if (reduceMotion || !film.cam) return r;
@@ -3233,6 +3194,7 @@
     if (map) map.stop();
     director.heading = map ? map.getBearing() : 0;
     film = planFilm(data, cameraNow(), filmPadding());
+    music.loops = 0; music.lastT = 0; beatClock.reset();
     buildCamera(film);                             // C1: celá dráha kamery předem (~750 vzorků, < 10 ms)
     director.t = 0;
     director.pfAt = 0;
@@ -3432,6 +3394,53 @@
       musicStop(!journey.active ? MUSIC_STOP_MS : journey.ended ? MUSIC_OUT_MS : MUSIC_PAUSE_MS, !journey.active || journey.ended);
     }
   }
+  // ── Sprint 4: beat synchronizace (Director) ──
+  // Plán filmu počítá s tím, že čas skladby = čas filmu (hudba startuje s úvodem od nuly a hraje
+  // ve smyčce). Příjezdy na zastávky jsou naplánované na doby (planFilm -> D.snapCuts); za běhu
+  // čas filmu jemně dotahuje hodiny hudby (D.BeatClock, ±12 %), takže zdržení kvůli dlaždicím
+  // nebo pomalý start přehrávače rytmus nerozbije. Skok (kapitola, přetočení) posune hudbu za filmem.
+  var BEAT_RELOCK_S = 2.5;
+  var beatClock = new D.BeatClock({ offset: 0, relock: 1e9 });
+  function musicTrackFor(data) {
+    if (!music.tracks.length || !data) return null;
+    return music.tracks[Math.abs(+data.id || 0) % music.tracks.length];   // stejná volba jako musicStart
+  }
+  function musicGrid(data, until) {
+    var tr = music.enabled ? musicTrackFor(data) : null;
+    return tr && tr.beats && tr.beats.period > 0 ? D.beatGrid(tr.beats, until) : null;
+  }
+  function musicLength() {
+    var tr = musicTrackFor(journey.data), el = music.el;
+    var len = tr && tr.beats && tr.beats.length > 0 ? tr.beats.length : el ? el.duration : NaN;
+    return isFinite(len) && len > 0 ? len : NaN;
+  }
+  function musicClock() {             // čas skladby přes smyčky (s), nebo NaN (hudba nehraje)
+    var el = music.el, len = musicLength();
+    if (!el || el.paused || !isFinite(len) || el.readyState < 2) return NaN;
+    if (el.currentTime + 1 < (music.lastT || 0)) music.loops = (music.loops || 0) + 1;
+    music.lastT = el.currentTime;
+    return (music.loops || 0) * len + el.currentTime;
+  }
+  function musicSeekTo(t) {
+    var el = music.el, len = musicLength();
+    if (!el || !isFinite(len)) return;
+    music.loops = Math.floor(t / len);
+    try { el.currentTime = t - music.loops * len; } catch (e) { /* ještě nenačteno */ }
+    music.lastT = el.currentTime;
+  }
+  function beatRate() {
+    if (!film || !film.grid || !music.enabled || FILM_SPEED !== 1) return 1;
+    var at = musicClock();
+    if (!isFinite(at)) return 1;
+    if (Math.abs(at - director.t) > BEAT_RELOCK_S) { musicSeekTo(director.t); return 1; }
+    return beatClock.rate(director.t, at);
+  }
+  window.getBeatState = function () {
+    if (!film) return null;
+    return { locked: !!film.grid, snapped: film.beats || 0, period: film.grid ? film.grid.period : 0,
+             cuts: film.dwells.map(function (g) { return +g.t0.toFixed(3); }),
+             downbeats: film.grid ? film.grid.downbeats.slice(0, 64) : [], beats: film.grid ? film.grid.beats.slice(0, 256) : [] };
+  };
   window.getMusicState = function () {
     return { enabled: music.enabled, tracks: music.tracks.length, track: music.track,
              playing: !!music.el && !music.el.paused, volume: music.el ? +music.el.volume.toFixed(3) : 0, target: music.target };
