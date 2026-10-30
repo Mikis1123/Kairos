@@ -1,4 +1,4 @@
-"""Throwback Reels – zobrazení (Objevy › Sestřihy).
+"""Throwback Reels – zobrazení (Pro vás › Sestřihy).
 
 ReelsPanel: karty návrhů (výlety, roky, „Před N lety“) – výpočet na pozadí (SuggestJob).
 ReelPlayer: přehrávač sestřihu 16:9 – kreslí ReelRenderer (stejný jako export), hraje skladbu

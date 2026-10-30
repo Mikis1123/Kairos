@@ -167,8 +167,8 @@ class TestShellWindow(WindowEnv):
     def test_sidebar_sections_and_collections(self):
         nav = self.w.sidebar_nav
         self.assertEqual([it.key for it in nav.items],
-                         ["photos", "people", "events", "map", "favorites", "videos", "albums", "trash", "echoes",
-                          "reels", "atlas", "constellations"])   # Sprint 2: Alba; Sprint 4: Objevy
+                         ["photos", "people", "events", "map", "favorites", "videos", "albums", "trash", "reels",
+                          "echoes"])   # Sprint 2: Alba; Pro vás (Atlas a Konstelace odstraněny)
         self.assertTrue(all(it.icon_name for it in nav.items), "každá položka má vektorovou ikonu")
         nav.item("trash").click()
         self.assertEqual(self.w._current_filter, "trash")

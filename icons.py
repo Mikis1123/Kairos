@@ -60,12 +60,8 @@ ICONS = {
     "album": '<rect x="3.5" y="7.5" width="17" height="13" rx="2.5"/><path d="M6.5 4.5h11"/>',
     "chevron_down": '<path d="M7 10l5 5 5-5"/>',
     "sparkle":'<path d="M12 3.5q1 7.5 8.5 8.5q-7.5 1-8.5 8.5q-1-7.5-8.5-8.5q7.5-1 8.5-8.5z"/>',
-    # Sprint 4: Sestřihy (filmový pás s přehráním), Atlas (zeměkoule s obloukem), Konstelace (síť)
+    # Sprint 4: Sestřihy (filmový pás s přehráním)
     "reel": '<rect x="3.5" y="5.5" width="17" height="13" rx="2.5"/><path d="M3.5 9h17M3.5 15h17M10.5 10.6v2.8l2.6-1.4z"/>',
-    "atlas": '<circle cx="12" cy="12" r="8.5"/><path d="M5.5 15.5c3-6 9-8 13-6.5"/><circle cx="18.5" cy="9" r="1.3"/>'
-             '<circle cx="5.5" cy="15.5" r="1.3"/>',
-    "constellation": '<circle cx="6" cy="7" r="1.8"/><circle cx="17.5" cy="6" r="1.8"/><circle cx="12" cy="17.5" r="1.8"/>'
-                     '<circle cx="19" cy="15" r="1.3"/><path d="M7.7 7.6l8-1.3M7 8.6l4 7.4M13.6 16.9l4-1.4M17.7 7.8l-5 8"/>',
 }
 FILLED = {
     "heart_fill": f'<path d="{_HEART}"/>',
