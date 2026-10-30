@@ -51,6 +51,8 @@ DEFAULT_CONFIG = {
     "borrow_location": True,
     # Sprint 3 – text na fotkách (OCR Windows, offline) pro hledání slovem
     "ocr_text": True,
+    # Stage 2 – barvy fotek: "auto" = do profilu displeje (color_manage), "srgb" = vždy sRGB
+    "color_output": "auto",
 }
 
 

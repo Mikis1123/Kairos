@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 
 import frame_meter
+import viewer_zoom
 
 HUD_HIDE_DELAY_MS = 2000
 HUD_FADE_MS = 220
@@ -161,6 +162,52 @@ class MediaCanvas(QGraphicsView):
         self._refit_timer.setInterval(SMOOTH_REFIT_MS)
         self._refit_timer.timeout.connect(self._refit_smooth)
 
+        # Stage 2: hluboké přiblížení (viewer_zoom) – sklo HUD se přepočítá až po zastavení pohybu
+        self.zoom = viewer_zoom.ZoomController(self)
+        self._zoom_settle = QTimer(self)
+        self._zoom_settle.setSingleShot(True)
+        self._zoom_settle.setInterval(120)
+        self._zoom_settle.timeout.connect(self._bump)
+        self.zoom.changed.connect(lambda _p: self._zoom_settle.start())
+        self.zoom_badge = ZoomBadge(self)
+        self.zoom.changed.connect(self._on_zoom_changed)
+
+    def _on_zoom_changed(self, percent):
+        if self.zoom.is_zoomed() or self.zoom_badge.isVisible():
+            self.zoom_badge.flash(percent)
+
+    def event(self, event):
+        # sevření prstů (macOS / některé ovladače Windows posílají nativní gesto)
+        if event.type() == QEvent.Type.NativeGesture and getattr(self, "zoom", None) is not None:
+            if event.gestureType() == Qt.NativeGestureType.ZoomNativeGesture:
+                self.zoom.gesture_zoom(event.value(), event.position())
+                return True
+        return super().event(event)
+
+    def wheelEvent(self, event):
+        if not self.is_video_shown() and self.zoom.wheel(event):
+            event.accept()
+            return
+        event.ignore()      # žádné posouvání scény kolečkem
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.zoom.press(event.position()):
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.zoom.move(event.position()):
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.zoom.release(event.position()):
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
     def paintEvent(self, event):
         super().paintEvent(event)
         frame_meter.tick("viewer")              # Fáze 0: doba snímku prohlížeče (Ctrl+Shift+F)
@@ -204,6 +251,7 @@ class MediaCanvas(QGraphicsView):
         self._pixmap = pixmap
         self._sources[self.photo_item] = pixmap
         self._fit(self.photo_item)
+        self.zoom.set_base(pixmap)           # přiblížení pokračuje i po výměně náhledu za originál
         self._bump()
 
     # ── Patch 14: snímky náhledového pásu při tažení časové osy ──
@@ -249,6 +297,7 @@ class MediaCanvas(QGraphicsView):
 
     def clear_image(self):
         self._fade.stop()
+        self.zoom.set_photo()
         self._scrub_frames = False
         self.photo_item.setScale(1.0)
         self._pixmap = QPixmap()
@@ -275,6 +324,8 @@ class MediaCanvas(QGraphicsView):
         """True = video nad fotkou (po prvním snímku), False = statická fotka / plakát."""
         on = bool(on)
         changed = on != self._video_on
+        if on and self.zoom.is_zoomed():
+            self.zoom.reset(animate=False)           # video (Live Photo) hraje vždy celé
         self._video_on = on
         if self.video_surface is not None:
             self.video_surface.setGeometry(self.rect())
@@ -362,6 +413,9 @@ class MediaCanvas(QGraphicsView):
         else:
             self.video_item.setPos(0, 0)
             self.video_item.setSize(QSizeF(vw, vh))
+        self.zoom.resized()
+        if getattr(self, "zoom_badge", None) is not None:
+            self.zoom_badge.place()
         # během tažení okna rychlé zmenšení, vyhlazené až po zastavení
         self._fit(self.photo_item, Qt.TransformationMode.FastTransformation)
         if self.back_item.isVisible():
@@ -382,13 +436,43 @@ class MediaCanvas(QGraphicsView):
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.double_clicked.emit()
+            if self.zoom.enabled and not self._video_on and not self.is_showing_scrub_frame():
+                self.zoom.toggle_one_to_one(event.position())     # fotka: dvojklik = 1:1 a zpět
+            else:
+                self.double_clicked.emit()                        # video: celá obrazovka
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
 
-    def wheelEvent(self, event):
-        event.ignore()      # žádné posouvání scény kolečkem
+
+class ZoomBadge(QLabel):
+    """Krátce ukázané procento přiblížení (100 % = pixel originálu na pixel displeje)."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("QLabel { background: rgba(28, 28, 30, 0.78); color: #FFFFFF; border-radius: 13px;"
+                           " padding: 4px 12px; font-size: 12px; font-weight: 600; }")
+        self.hide()
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(900)
+        self._timer.timeout.connect(self.hide)
+
+    def flash(self, percent):
+        self.setText(f"{percent:.0f} %")
+        self.adjustSize()
+        self.place()
+        self.show()
+        self.raise_()
+        self._timer.start()
+
+    def place(self):
+        p = self.parentWidget()
+        if p is not None:
+            self.move((p.width() - self.width()) // 2, 18)
+
 
 
 # ── Ikony ─────────────────────────────────────────────────────────────────────
@@ -853,10 +937,13 @@ def load_image_file(path, max_size=None, use_preview=True):
                 pillow_heif.register_heif_opener()
             except ImportError:
                 pass
+            import color_manage
             with Image.open(path) as pil:
+                icc = color_manage.source_profile(pil)        # Display P3 z iPhonu -> profil displeje
                 pil = ImageOps.exif_transpose(pil).convert("RGB")
                 if max_size is not None:
                     pil.thumbnail((max_size.width(), max_size.height()), Image.Resampling.LANCZOS)
+                pil = color_manage.pil_to_output(pil, icc)     # až po zmenšení: méně pixelů
                 w, h = pil.size
                 img = QImage(pil.tobytes("raw", "RGB"), w, h, w * 3, QImage.Format.Format_RGB888).copy()
         except Exception:
@@ -867,6 +954,9 @@ def load_image_file(path, max_size=None, use_preview=True):
         img = reader.read()
     if img.isNull():
         return img
+    import color_manage
+    if not color_manage.is_cache_file(path):         # cache už je v profilu displeje
+        img = color_manage.qimage_to_output(img)
     if max_size is not None and (img.width() > max_size.width() or img.height() > max_size.height()):
         img = img.scaled(max_size, Qt.AspectRatioMode.KeepAspectRatio,
                          Qt.TransformationMode.SmoothTransformation)

@@ -613,6 +613,13 @@ def compute_phash_and_sharpness(image_path):
                 img_gray = np.array(pil_img.convert("L"))
         if img_gray is None or img_gray.size == 0:
             return None, 0.0
+        # Stage 2: miniatury jsou větší (kratší strana 840 px) – ostrost (Laplacián) závisí na
+        # měřítku, proto vždy ze stejné velikosti jako dřív (delší strana 360 px)
+        h, w = img_gray.shape[:2]
+        if max(h, w) > PHASH_EDGE:
+            k = PHASH_EDGE / float(max(h, w))
+            img_gray = cv2.resize(img_gray, (max(1, round(w * k)), max(1, round(h * k))),
+                                  interpolation=cv2.INTER_AREA)
 
         # 1. Laplaciánské skóre ostrosti
         sharpness = float(cv2.Laplacian(img_gray, cv2.CV_64F).var())
@@ -636,7 +643,8 @@ def compute_phash_and_sharpness(image_path):
 # Zvýšit při změně algoritmu nebo zdroje otisku -> refresh_phashes() přepočítá všechno.
 # Verze 2: otisky z dřívějších verzí byly zastaralé (různé fotky se stejným pHash
 # I STEJNOU ostrostí = spočítané ze stejného obrázku), proto se nedůvěřuje NULL verzi.
-PHASH_VERSION = 2
+PHASH_VERSION = 3               # 3 = z normalizované velikosti (PHASH_EDGE) po zvětšení miniatur
+PHASH_EDGE = 360
 _phash_lock = threading.Lock()
 
 

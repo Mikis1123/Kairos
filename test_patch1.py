@@ -283,7 +283,7 @@ class TestThumbnails(TempEnv):
         with Image.open(out) as im_out:
             w, h = im_out.size
         self.assertGreater(h, w, "po aplikaci EXIF orientace má být miniatura na výšku")
-        self.assertLessEqual(max(w, h), 360)
+        self.assertEqual((w, h), (200, 400), "menší originál se nezvětšuje (Stage 2: kratší strana 840 px)")
 
     def test_cache_clear_keeps_faces_and_repair_regenerates(self):
         src = os.path.join(self.tmp, "x.jpg")

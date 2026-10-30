@@ -13,6 +13,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from database import get_connection, db_transaction, upsert_media_item
 import reverse_geocoder as rg
 from PIL import Image, ImageOps
+import color_manage
 
 try:
     import pillow_heif
@@ -33,7 +34,15 @@ from paths import (
 )
 
 SUPPORTED_EXTS = {'.heic', '.jpg', '.jpeg', '.png', '.mov', '.mp4', '.dng'}
-THUMB_SIZE = 360
+# Stage 2: miniatura = kratší strana 840 px (= 2 × GRID_MAX_CELL při DPR 2). Dřív 360 px na
+# DELŠÍ straně -> čtvercová dlaždice nad ~135 logických px se na HiDPI zvětšovala (rozmazaná
+# mřížka). Delší strana nejvýš 1680 px (panoramata). Paměť hlídá mřížka: do RAM si bere jen
+# tolik pixelů, kolik dlaždice potřebuje (main.thumb_tier).
+THUMB_SHORT_EDGE = 840
+THUMB_LONG_MAX = 1680
+THUMB_QUALITY = 88
+THUMB_VERSION = 2               # 2 = kratší strana 840 px + převod do profilu displeje (color_manage)
+THUMB_VERSION_FILE = "THUMB_VERSION"
 MTIME_TOLERANCE_SEC = 2.0   # FAT/exFAT ukládá mtime s přesností 2 s
 
 
@@ -87,8 +96,28 @@ def _clean_exif_date(raw):
 # MINIATURY (sdílené skenerem i obnovou po vyčištění mezipaměti)
 # ==============================================================================
 
+def _thumb_box(w, h):
+    """Rámeček pro Image.thumbnail(): kratší strana THUMB_SHORT_EDGE, delší nejvýš THUMB_LONG_MAX."""
+    w, h = max(1, int(w)), max(1, int(h))
+    scale = min(1.0, THUMB_SHORT_EDGE / min(w, h), THUMB_LONG_MAX / max(w, h))
+    return max(1, round(w * scale)), max(1, round(h * scale))
+
+
+def _video_thumb_filter(file_path, ffmpeg_path):
+    """Zmenšení snímku videa na kratší stranu miniatury + HDR -> SDR (HLG / Dolby Vision z iPhonu
+    by jinak vypadaly vybledle)."""
+    s = THUMB_SHORT_EDGE
+    vf = f"scale='if(gt(iw,ih),-2,min({s},iw))':'if(gt(iw,ih),min({s},ih),-2)'"
+    try:
+        import video_proxy
+        sdr = video_proxy.sdr_filter(video_proxy.probe(file_path, ffmpeg_path))
+    except Exception:
+        sdr = ""
+    return vf + ("," + sdr if sdr else "") + ",format=yuvj420p"
+
+
 def make_thumbnail(file_path, thumb_path, m_type, paired_video, ffmpeg_path=DEFAULT_FFMPEG):
-    """Vytvoří miniaturu (max. 360 px). Zápis je atomický. Vrací True při úspěchu."""
+    """Vytvoří miniaturu (kratší strana THUMB_SHORT_EDGE, sRGB). Zápis je atomický. Vrací True při úspěchu."""
     startupinfo = _hidden_startupinfo()
     tmp_path = os.path.splitext(thumb_path)[0] + ".tmp.jpg"
     is_video_only = (m_type == 'video' and not paired_video)
@@ -98,7 +127,7 @@ def make_thumbnail(file_path, thumb_path, m_type, paired_video, ffmpeg_path=DEFA
             return
         cmd = [ffmpeg_path, "-loglevel", "quiet", "-y"] + extra_before_input + [
             "-i", file_path, "-map", "0:v:0", "-frames:v", "1",
-            "-vf", f"scale='min({THUMB_SIZE},iw)':-2,format=yuvj420p",
+            "-vf", _video_thumb_filter(file_path, ffmpeg_path),
             "-q:v", "3", tmp_path,
         ]
         subprocess.run(cmd, capture_output=True, startupinfo=startupinfo)
@@ -109,17 +138,20 @@ def make_thumbnail(file_path, thumb_path, m_type, paired_video, ffmpeg_path=DEFA
         if not is_video_only:
             try:
                 with Image.open(file_path) as img:
+                    icc = color_manage.source_profile(img)
+                    box = _thumb_box(*img.size)
                     # JPEG: dekodér umí rovnou zmenšit (DCT scaling), ušetří paměť i čas.
                     try:
-                        img.draft("RGB", (THUMB_SIZE * 2, THUMB_SIZE * 2))
+                        img.draft("RGB", (box[0] * 2, box[1] * 2))
                     except Exception:
                         pass
                     # Nejdřív zmenšit, teprve potom otáčet / konvertovat (žádné kopie v plné velikosti).
-                    img.thumbnail((THUMB_SIZE * 2, THUMB_SIZE * 2))
+                    img.thumbnail((box[0] * 2, box[1] * 2))
                     oriented = ImageOps.exif_transpose(img)
                     rgb = oriented.convert("RGB")
-                    rgb.thumbnail((THUMB_SIZE, THUMB_SIZE))
-                    rgb.save(tmp_path, "JPEG", quality=85)
+                    rgb.thumbnail(_thumb_box(*rgb.size), Image.Resampling.LANCZOS)
+                    rgb = color_manage.pil_to_output(rgb, icc)     # Display P3 -> profil displeje
+                    rgb.save(tmp_path, "JPEG", quality=THUMB_QUALITY)
             except Exception:
                 _ffmpeg([])
         else:
@@ -138,16 +170,55 @@ def make_thumbnail(file_path, thumb_path, m_type, paired_video, ffmpeg_path=DEFA
     return False
 
 
+def _thumb_version_path():
+    return os.path.join(CACHE_DIR, THUMB_VERSION_FILE)
+
+
+def thumb_version_tag():
+    """Verze miniatur = algoritmus + otisk výstupního profilu (jiný displej = jiné barvy)."""
+    return f"{THUMB_VERSION}:{color_manage.target_fingerprint()}"
+
+
+def thumb_version_state():
+    """(verze, od_kdy) z THUMB_VERSION v cache miniatur. „2:abcd“ = hotovo; „2:abcd pending <t>“
+    = převod běží od času t (miniatury starší než t jsou ještě staré verze)."""
+    try:
+        with open(_thumb_version_path(), encoding="ascii") as f:
+            parts = f.read().split()
+        since = float(parts[2]) if len(parts) >= 3 and parts[1] == "pending" else None
+        return parts[0], since
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def _write_thumb_version(text):
+    try:
+        with open(_thumb_version_path(), "w", encoding="ascii") as f:
+            f.write(text)
+    except OSError:
+        pass
+
+
 def repair_missing_thumbnails(should_stop=None, progress=None, flush_every=50):
-    """Doplní miniatury, které chybí v databázi (NULL) nebo na disku (smazaná cache).
+    """Doplní miniatury, které chybí v databázi (NULL) nebo na disku (smazaná cache),
+    a převede miniatury starší verze (THUMB_VERSION) – po kouskách, přerušitelně: miniatura
+    novější než začátek převodu už je nová; stará zůstává vidět, dokud ji nová nenahradí.
 
     thumbnail_path == '' znamená "už se to zkoušelo a nešlo" - takové soubory se
     znovu nezkouší, dokud se nezmění (UPSERT při změně velikosti vrátí NULL).
     Vrací počet vytvořených miniatur.
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
+    tag = thumb_version_tag()
+    ver, since = thumb_version_state()
+    upgrading = ver != tag or since is not None
+    if upgrading and (ver != tag or since is None):
+        since = time.time()
+        _write_thumb_version(f"{tag} pending {since}")
+    cache_key = os.path.normcase(os.path.abspath(CACHE_DIR))
     conn = get_connection()
     created = 0
+    stopped = False
     try:
         c = conn.cursor()
         c.execute("SELECT id, file_path, media_type, paired_video_path, thumbnail_path FROM media_items")
@@ -156,7 +227,14 @@ def repair_missing_thumbnails(should_stop=None, progress=None, flush_every=50):
             if thumb == "":
                 continue
             if thumb is None or not os.path.exists(thumb):
-                todo.append((item_id, fp, m_type, paired))
+                todo.append((item_id, fp, m_type, paired, False))
+            elif upgrading and os.path.normcase(os.path.dirname(os.path.abspath(thumb))) == cache_key:
+                try:
+                    stale = os.path.getmtime(thumb) < since
+                except OSError:
+                    stale = False
+                if stale:
+                    todo.append((item_id, fp, m_type, paired, True))
 
         total = len(todo)
         updates = []
@@ -167,8 +245,9 @@ def repair_missing_thumbnails(should_stop=None, progress=None, flush_every=50):
                 conn.commit()
                 updates.clear()
 
-        for i, (item_id, fp, m_type, paired) in enumerate(todo):
+        for i, (item_id, fp, m_type, paired, upgrade) in enumerate(todo):
             if should_stop and should_stop():
+                stopped = True
                 break
             if not fp or not os.path.exists(fp):
                 continue  # zdroj chybí (odpojený disk?) - nic neznačit, zkusí se příště
@@ -176,8 +255,8 @@ def repair_missing_thumbnails(should_stop=None, progress=None, flush_every=50):
             if make_thumbnail(fp, thumb_path, m_type, paired):
                 updates.append((thumb_path, item_id))
                 created += 1
-            else:
-                updates.append(("", item_id))  # trvale nečitelné
+            elif not upgrade:
+                updates.append(("", item_id))  # trvale nečitelné (stará miniatura při převodu zůstává)
             if len(updates) >= flush_every:
                 flush()
             if progress:
@@ -185,6 +264,8 @@ def repair_missing_thumbnails(should_stop=None, progress=None, flush_every=50):
         flush()
     finally:
         conn.close()
+    if upgrading and not stopped:
+        _write_thumb_version(tag)
     return created
 
 

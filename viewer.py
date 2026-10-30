@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QSlider, QFrame,
     QInputDialog, QLineEdit, QStyle
 )
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QSize, QTimer, QEvent, QPoint, QRect, QRectF
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QSize, QTimer, QEvent, QPoint, QRect, QRectF, QThreadPool
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QPainter, QColor, QPainterPath, QIcon
 from PyQt6.QtMultimedia import QMediaPlayer
 import media_engine
@@ -19,6 +19,7 @@ import perf_profile
 import scrub_strip
 import video_proxy
 import viewer_motion
+import viewer_zoom
 from ui_sheets import InWindowDialog   # Kairos: dotazy jako list v okně
 import tokens
 from moments_view import czech_day
@@ -336,6 +337,10 @@ class MediaViewerWidget(QWidget):
         self._media_timer.timeout.connect(self._start_media)
         self._images = ImagePipeline(self._display_size, capacity=8, threads=2, parent=self)
         self._images.loaded.connect(self._on_image_loaded)
+        # Stage 2: originál v plném rozlišení pro přiblížení (jedno vlákno, jen aktuální fotka)
+        self._full_pool = QThreadPool(self)
+        self._full_pool.setMaxThreadCount(1)
+        self.canvas.zoom.full_res_wanted.connect(self._load_full_res)
         self._video_sink = self.player.videoSink()
         # signály neaktivního (přednačítajícího) přehrávače se do UI nepouštějí
         for i, player in enumerate(self._players):
@@ -538,7 +543,8 @@ class MediaViewerWidget(QWidget):
         """Stáhnout dolů jde statickou fotku v okně (ne video, pás časové osy, celou obrazovku)."""
         pm = self.canvas.displayed_pixmap()
         return (bool(self.media_list) and not self.is_fullscreen and not self.canvas.is_video_shown()
-                and not self.canvas.is_showing_scrub_frame() and pm is not None and not pm.isNull())
+                and not self.canvas.is_showing_scrub_frame() and not self.canvas.zoom.is_zoomed()
+                and pm is not None and not pm.isNull())
 
     def photo_area(self):
         """Plocha plátna v souřadnicích prohlížeče (sem se fotka vejde při otevření)."""
@@ -603,8 +609,20 @@ class MediaViewerWidget(QWidget):
         self.load_current_item()
 
     def request_close(self):
+        self.canvas.zoom.reset(animate=False)       # zavření (hero do dlaždice) z vešlé fotky
         self.cleanup_playback()
         self.close_requested.emit()
+
+    def _load_full_res(self):
+        """Přiblížení fotky: originál v plném rozlišení na pozadí (pyramida), pak ostré detaily."""
+        zoom = self.canvas.zoom
+        path = getattr(zoom, "path", None)
+        if not path or not os.path.exists(path):
+            return
+        job = viewer_zoom.FullResJob(path, zoom.token)
+        job.signals.done.connect(lambda p, token, levels: zoom.set_full_levels(token, levels))
+        self._full_pool.clear()                     # čekající originály dřívějších fotek už nejsou potřeba
+        self._full_pool.start(job)
 
     def closeEvent(self, event):
         # Zavření křížkem okna nesmí nechat hrát zvuk videa / Live Photo
@@ -999,6 +1017,11 @@ class MediaViewerWidget(QWidget):
         self.btn_live.setVisible(self._is_live)
 
         self._current_photo_path = None
+        # Stage 2: nová položka = vešlá; přiblížit jde jen fotku (rozměr originálu z hlavičky, ~5 ms)
+        zoomable = bool(not self._is_video and path and os.path.exists(path))
+        self.canvas.zoom.set_photo(path if zoomable else None,
+                                   viewer_zoom.original_size(path) if zoomable else None)
+        self.canvas.zoom.set_enabled(zoomable)
         if self._is_video:
             # Plakát drží obraz, dokud video nevykreslí 1. snímek -> žádné černé bliknutí.
             # Patch 11: plakát v rozlišení náhledu (2048 px, z preview cache), ne rozmazaná miniatura
@@ -1357,8 +1380,17 @@ class MediaViewerWidget(QWidget):
             self.step_frame(40)
         elif key == Qt.Key.Key_M and video:
             self.toggle_mute()
+        elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal) and self.canvas.zoom.enabled:
+            self.canvas.zoom.zoom_by(viewer_zoom.NOTCH_FACTOR ** 2)
+        elif key == Qt.Key.Key_Minus and self.canvas.zoom.enabled:
+            self.canvas.zoom.zoom_by(viewer_zoom.NOTCH_FACTOR ** -2)
+        elif key == Qt.Key.Key_0 and self.canvas.zoom.enabled:
+            self.canvas.zoom.reset()
+        elif key == Qt.Key.Key_1 and self.canvas.zoom.enabled:
+            self.canvas.zoom.zoom_to(self.canvas.zoom.one_to_one_w())
         elif key == Qt.Key.Key_Space:
             if self._is_live:
+                self.canvas.zoom.reset(animate=False)
                 self.toggle_live_playback()
             elif video:
                 self.toggle_play_pause()
@@ -1373,8 +1405,10 @@ class MediaViewerWidget(QWidget):
             self.btn_info.setChecked(not self.btn_info.isChecked())
             self.toggle_info_panel()
         elif key == Qt.Key.Key_Escape:
-            # Esc postupně: celá obrazovka -> panel Info -> zpět
-            if self.is_fullscreen:
+            # Esc postupně: přiblížení -> celá obrazovka -> panel Info -> zpět
+            if self.canvas.zoom.is_zoomed():
+                self.canvas.zoom.reset()
+            elif self.is_fullscreen:
                 self.set_fullscreen(False)
             elif self.info_panel.isVisible():
                 self.btn_info.setChecked(False)

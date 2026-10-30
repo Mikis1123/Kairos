@@ -116,8 +116,8 @@ class TestPreviewCache(unittest.TestCase):
         p = preview_cache.save_preview(src, QImage(src))
         img = QImage(p)
         self.assertEqual(max(img.width(), img.height()), preview_cache.PREVIEW_EDGE)
-        self.assertEqual(img.width(), 2048)
-        self.assertEqual(img.height(), 512)
+        self.assertEqual(img.width(), preview_cache.PREVIEW_EDGE)        # Stage 2: rozměr displeje
+        self.assertEqual(img.height(), preview_cache.PREVIEW_EDGE // 4)
         self.assertFalse([f for f in os.listdir(preview_cache.preview_dir()) if f.endswith(".tmp")])
 
     def test_budget_evicts_least_recently_used_first(self):
@@ -175,10 +175,11 @@ class TestPreviewCache(unittest.TestCase):
         src = self._src(w=3000, h=2000)
         self._run_job(src, QSize(1600, 1600))       # duplicity dřív dekódovaly 1600 px
         self.assertIsNone(preview_cache.get_preview(src), "1600px dekód není 2048px náhled")
-        self._run_job(src, QSize(2048, 2048))
+        edge = preview_cache.PREVIEW_EDGE                 # Stage 2: rozměr displeje (2880)
+        self._run_job(src, QSize(edge, edge))
         p = preview_cache.get_preview(src)
         self.assertIsNotNone(p)
-        self.assertEqual(QImage(p).width(), 2048)
+        self.assertEqual(QImage(p).width(), edge)
 
     def test_pipeline_writes_preview_from_full_small_original(self):
         src = self._src(w=900, h=600)
@@ -215,7 +216,7 @@ class TestPreviewCache(unittest.TestCase):
 
     def test_duplicates_review_decodes_at_preview_edge(self):
         view = main.DuplicateReviewView.__new__(main.DuplicateReviewView)
-        self.assertEqual(main.DuplicateReviewView._review_size(view), QSize(2048, 2048))
+        self.assertEqual(main.DuplicateReviewView._review_size(view), QSize(preview_cache.PREVIEW_EDGE, preview_cache.PREVIEW_EDGE))   # Stage 2: rozměr displeje
 
 
 def make_and_load(path, color, w=3000, h=2000):

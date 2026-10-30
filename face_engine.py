@@ -250,6 +250,106 @@ def _extract_apple_avatar_crop(img, bbox, target_size=256, pad_ratio=0.50):
     return cv2.resize(crop, (target_size, target_size), interpolation=interp)
 
 
+# ── Stage 2: barvy avatarů ───────────────────────────────────────────────────
+# Ořezy tváří z FOTEK jsou v profilu displeje (color_manage), stejně jako miniatury; z videí ne
+# (video se kreslí bez správy barev). Převádí se jen hotový ořez 256 px, ne celá fotka.
+
+CROP_COLOR_MARKER = "CROP_COLOR"
+
+
+def _source_icc(path):
+    try:
+        with Image.open(path) as im:
+            return im.info.get("icc_profile") or None
+    except Exception:
+        return None
+
+
+def _avatar_to_output(avatar_bgr, source_path, src_icc=False):
+    """Ořez (BGR) z fotky převedený z profilu fotky do výstupního profilu. Video beze změny."""
+    if avatar_bgr is None or os.path.splitext(source_path or "")[1].lower() in VIDEO_EXTS:
+        return avatar_bgr
+    try:
+        import color_manage
+        icc = _source_icc(source_path) if src_icc is False else src_icc
+        rgb = Image.fromarray(cv2.cvtColor(avatar_bgr, cv2.COLOR_BGR2RGB))
+        out = color_manage.pil_to_output(rgb, icc)
+        return cv2.cvtColor(np.asarray(out), cv2.COLOR_RGB2BGR) if out is not rgb else avatar_bgr
+    except Exception:
+        return avatar_bgr
+
+
+def recolor_face_crops(should_stop=None):
+    """Jednorázově převede uložené ořezy tváří z fotek do výstupního profilu – přímo z ořezu
+    (256 px), bez dekódování originálů. Ořezy bez značky jsou v profilu fotky (stav před
+    Stage 2); po změně displeje se převádí z dřívějšího výstupního profilu (uložený .icc).
+    Přerušitelné: hotová id se průběžně zapisují. Vrací počet převedených ořezů."""
+    import json
+    import color_manage
+    marker = os.path.join(FACE_CACHE_DIR, CROP_COLOR_MARKER)
+    cur = color_manage.target_fingerprint()
+    try:
+        with open(marker, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {"fp": None, "pending": None, "done": []}
+    if state.get("fp") == cur and not state.get("pending"):
+        return 0
+    if state.get("pending") != cur:                  # nový průchod
+        state = {"fp": state.get("fp"), "pending": cur, "done": []}
+    prev_icc = False                                 # False = ořezy jsou v profilu své fotky
+    if state.get("fp"):
+        try:
+            with open(marker + ".icc", "rb") as f:
+                prev_icc = f.read() or None
+        except OSError:
+            prev_icc = None                          # dřívější výstup byl sRGB
+    done = set(state.get("done") or [])
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT f.id, f.face_crop_path, m.file_path FROM face_instances f
+            JOIN media_items m ON m.id = f.media_id WHERE f.face_crop_path IS NOT NULL
+        """).fetchall()
+    finally:
+        conn.close()
+
+    def save_state(final=False):
+        os.makedirs(FACE_CACHE_DIR, exist_ok=True)
+        data = {"fp": cur, "pending": None, "done": []} if final else dict(state, done=sorted(done))
+        with open(marker, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        if final:
+            with open(marker + ".icc", "wb") as f:
+                f.write(color_manage.target()["icc"] or b"")
+
+    converted, icc_cache = 0, {}
+    for i, (fid, crop_path, file_path) in enumerate(rows):
+        if should_stop and should_stop():
+            save_state()
+            return converted
+        if fid in done:
+            continue
+        path = resolve_face_path(crop_path, FACE_CACHE_DIR)
+        if path and os.path.splitext(file_path or "")[1].lower() not in VIDEO_EXTS:
+            if prev_icc is False:
+                if file_path not in icc_cache:
+                    icc_cache[file_path] = _source_icc(file_path) if file_path and os.path.exists(file_path) else None
+                src = icc_cache[file_path]
+            else:
+                src = prev_icc
+            img = cv_io.imread(path)
+            if img is not None and img.size:
+                out = _avatar_to_output(img, file_path or "x.jpg", src)
+                if out is not img and cv_io.imwrite(path, out, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+                    converted += 1
+        done.add(fid)
+        if i % 50 == 49:
+            save_state()
+    save_state(final=True)
+    return converted
+
+
 def _is_stretched_window(img_w, img_h, bbox, pad_ratio=0.50, tolerance=0.03):
     """Byl by ořez starým algoritmem (okno oříznuté okrajem) deformovaný?"""
     x1, y1, x2, y2 = bbox
@@ -581,7 +681,7 @@ def repair_stretched_face_crops(should_stop=None, target_size=256, pad_ratio=0.5
             target = resolve_face_path(crop_path, FACE_CACHE_DIR) or os.path.join(
                 FACE_CACHE_DIR, f"face_{media_id}_rec_{fid}.jpg")
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            if cv_io.imwrite(target, avatar, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+            if cv_io.imwrite(target, _avatar_to_output(avatar, path), [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
                 repaired += 1
                 if target != crop_path:
                     conn = get_connection()
@@ -677,7 +777,7 @@ def reconstruct_face_crop(face_instance_id, target_size=256, pad_ratio=0.50):
         crop_path = os.path.join(FACE_CACHE_DIR, crop_filename)
 
     os.makedirs(os.path.dirname(crop_path), exist_ok=True)
-    if not cv_io.imwrite(crop_path, avatar, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+    if not cv_io.imwrite(crop_path, _avatar_to_output(avatar, file_path), [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
         return None
 
     # Aktualizujeme cestu v DB (pokud se změnila nebo chyběla)
@@ -795,7 +895,8 @@ def detect_and_extract_faces(media_id, image_path, preloaded_image=None):
 
             crop_filename = f"face_{media_id}_{int(time.time())}_{np.random.randint(1000,9999)}.jpg"
             crop_path = os.path.join(FACE_CACHE_DIR, crop_filename)
-            if not cv_io.imwrite(crop_path, avatar_crop, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+            if not cv_io.imwrite(crop_path, _avatar_to_output(avatar_crop, image_path),
+                                 [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
                 # cv2.imwrite by tady selhal TIŠE (např. diakritika v cestě) a v DB by zůstala
                 # cesta k neexistujícímu souboru. Raději hlasitě selhat - fotka se zkusí příště.
                 _discard_crops(raw_detections)

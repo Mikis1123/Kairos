@@ -451,6 +451,17 @@ class SettingsDialog(QDialog):
         self._row(g, "Kopie se na pozadí vytvoří znovu, když je potřeba", self.btn_clear_proxies)
         self._update_proxy_impact(self.slider_proxy_mb.value())
 
+        # Stage 2: správa barev – výstupní profil fotek (Display P3 z iPhonu -> displej)
+        g = self._group(layout, "Barvy")
+        import color_manage
+        self.chk_color_display = ToggleSwitch("Barvy fotek podle displeje")
+        self.chk_color_display.setChecked(self.config.get("color_output", "auto") != color_manage.MODE_SRGB)
+        self._row(g, stacked=self.chk_color_display)
+        tgt = color_manage.target()
+        self._row(g, stacked=_hint(
+            f"Teď: {tgt['name']} – {tgt['reason']}. Vypnuto = vždy sRGB (pro displeje, které barvy "
+            "převádějí samy). Po změně se náhledy na pozadí přegenerují."))
+
         # Sprint 4.0: přesné hledání (SigLIP 2) – volitelné, výchozí lehký CLIP
         g = self._group(layout, "Přesné hledání")
         import siglip_engine
@@ -702,6 +713,7 @@ class SettingsDialog(QDialog):
         self.chk_borrow.setChecked(DEFAULT_CONFIG.get("borrow_location", True))
         self.chk_ocr.setChecked(DEFAULT_CONFIG.get("ocr_text", True))
         self.chk_precise.setChecked(DEFAULT_CONFIG.get("search_precise", False))
+        self.chk_color_display.setChecked(DEFAULT_CONFIG.get("color_output", "auto") != "srgb")
         self.chk_memories.setChecked(DEFAULT_CONFIG.get("show_memories", True))
         self.chk_adaptive.setChecked(DEFAULT_CONFIG.get("adaptive_accent", True))
         self.combo_default_sort.setCurrentText(DEFAULT_CONFIG.get("default_sort_order", "Datum pořízení (Nejnovější)"))
@@ -726,6 +738,7 @@ class SettingsDialog(QDialog):
         self.config["borrow_location"] = self.chk_borrow.isChecked()
         self.config["ocr_text"] = self.chk_ocr.isChecked()
         self.config["search_precise"] = self.chk_precise.isChecked()
+        self.config["color_output"] = "auto" if self.chk_color_display.isChecked() else "srgb"
         self.config["show_memories"] = self.chk_memories.isChecked()
         self.config["adaptive_accent"] = self.chk_adaptive.isChecked()
         self.config["default_sort_order"] = self.combo_default_sort.currentText()

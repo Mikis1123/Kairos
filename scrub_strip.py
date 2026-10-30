@@ -52,7 +52,7 @@ SHORT_QUALITY = 3
 DENSE_MAX_S = 90                 # hustý průchod jen pro krátká videa (4K dekód ~0,45 s / s videa)
 DENSE_FPS = 12
 STRIP_MAGIC = b"OPVS"
-STRIP_VERSION = 1
+STRIP_VERSION = 2               # 2 = HDR originál (bez proxy) převedený na SDR jako přehrávání
 DECODED_CACHE = 48               # dekódované QImage v RAM na pás
 _PTS = re.compile(r"pts_time:\s*(-?[0-9.]+)")
 _DURATION = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
@@ -60,8 +60,7 @@ _EOI = b"\xff\xd9"
 
 
 def strip_path(source):
-    base, _ = os.path.splitext(preview_cache.preview_path(source))
-    return base + ".scrub"
+    return preview_cache.base_path(source) + ".scrub"
 
 
 def edge_for(duration_ms):
@@ -218,11 +217,13 @@ class ScrubStrip:
         return strip
 
 
-def _ffmpeg_cmd(source, keyframes_only, hw, threads=2, edge=STRIP_EDGE):
+def _ffmpeg_cmd(source, keyframes_only, hw, threads=2, edge=STRIP_EDGE, sdr=""):
     sharp = edge > STRIP_EDGE
     # delší strana nejvýš edge, menší videa se nezvětšují
     scale = (f"scale='if(gt(iw,ih),min({edge},iw),-2)':'if(gt(iw,ih),-2,min({edge},ih))'"
              f":flags={'area' if sharp else 'fast_bilinear'}")
+    if sdr:                                          # HDR -> SDR až po zmenšení (video_proxy.sdr_filter)
+        scale += "," + sdr
     vf = (scale if keyframes_only else f"fps={DENSE_FPS},{scale}") + ",format=yuvj420p,showinfo"
     cmd = [paths.FFMPEG_PATH, "-hide_banner", "-nostats", "-loglevel", "info", "-threads", str(threads)]
     if hw:
@@ -319,7 +320,16 @@ class StripBuilder(QThread):
         flags = 0
         if os.name == "nt":
             flags = subprocess.CREATE_NO_WINDOW | 0x00004000   # BELOW_NORMAL_PRIORITY_CLASS
-        proc = subprocess.Popen(_ffmpeg_cmd(self.decode_source(), keyframes_only, hw, self.threads, self.strip.edge),
+        src = self.decode_source()
+        sdr = ""
+        if src == self.strip.source:                  # proxy je už SDR; originál může být HDR
+            if not hasattr(self, "_sdr"):
+                try:
+                    self._sdr = video_proxy.sdr_filter(video_proxy.probe(src))
+                except Exception:
+                    self._sdr = ""
+            sdr = self._sdr
+        proc = subprocess.Popen(_ffmpeg_cmd(src, keyframes_only, hw, self.threads, self.strip.edge, sdr),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
         self._proc = proc
         if self.governed:

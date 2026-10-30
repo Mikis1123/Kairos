@@ -45,7 +45,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QIcon, QPixmap, QImage, QFont, QPainter, QColor, QKeyEvent,
-    QPainterPath, QLinearGradient, QPen, QKeySequence, QShortcut, QCursor,
+    QPainterPath, QLinearGradient, QPen, QKeySequence, QShortcut, QCursor, QImageReader,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
@@ -82,7 +82,6 @@ from viewer_hud import SlideshowView, load_image_file, MediaWarmUp, ImagePipelin
 from events_view import (EventCard, BentoLayout, fetch_event_cards, split_event_title, COVER_MAX_EDGE,
                          AmbientCycler, AmbientFramesJob)
 import preview_cache
-from preview_cache import PREVIEW_EDGE
 import theme
 import tokens
 import motion
@@ -495,20 +494,44 @@ THUMB_MISSING_FILE = "missing"        # originál na disku není (smazaný / odp
 THUMB_UNAVAILABLE = "unavailable"     # soubor je, ale náhled se nepodařilo načíst
 
 
+# Stage 2: miniatury na disku mají kratší stranu 840 px (scanner.THUMB_SHORT_EDGE). Do RAM se
+# berou jen v rozlišení, které dlaždice potřebuje (kratší strana ve fyzických px) – hustá
+# mřížka (14 sloupců) tak nedrží 4 MB na dlaždici, velké dlaždice (3 sloupce) nejsou rozmazané.
+THUMB_TIERS = (256, 512, 840)
+
+
+def thumb_tier(cell_px_physical):
+    """Nejmenší úroveň, která pokryje dlaždici (fyzické px), jinak největší."""
+    need = int(math.ceil(max(1.0, float(cell_px_physical))))
+    return next((t for t in THUMB_TIERS if t >= need), THUMB_TIERS[-1])
+
+
+def _shrink_short_edge(img, short):
+    """QImage zmenšený tak, aby kratší strana byla `short` (menší se nezvětšuje)."""
+    w, h = img.width(), img.height()
+    if min(w, h) <= short:
+        return img
+    k = short / float(min(w, h))
+    return img.scaled(max(1, round(w * k)), max(1, round(h * k)), Qt.AspectRatioMode.IgnoreAspectRatio,
+                      Qt.TransformationMode.SmoothTransformation)
+
+
 class ThumbnailWorkerSignals(QObject):
     loaded = pyqtSignal(int, QImage)
     failed = pyqtSignal(int, str)
+    source_short = pyqtSignal(int, int)      # kratší strana zdroje (víc z něj nevytěžíme)
 
 
 class ThumbnailWorker(QRunnable):
     """Načte náhled mimo GUI vlákno. Pracuje jen s QImage (QPixmap mimo GUI vlákno
     není bezpečný); na QPixmap ho převede až model v hlavním vlákně."""
 
-    def __init__(self, item_id: int, thumb_path: str, fallback_path: str = None):
+    def __init__(self, item_id: int, thumb_path: str, fallback_path: str = None, tier: int = 512):
         super().__init__()
         self.item_id = item_id
         self.thumb_path = thumb_path
         self.fallback_path = fallback_path
+        self.tier = int(tier)
         self.signals = ThumbnailWorkerSignals()
         self.setAutoDelete(True)
 
@@ -525,27 +548,33 @@ class ThumbnailWorker(QRunnable):
                      else THUMB_MISSING_FILE)
             self.signals.failed.emit(self.item_id, state)
             return
-        if img.width() > 360 or img.height() > 360:
-            img = img.scaled(360, 360, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                             Qt.TransformationMode.SmoothTransformation)
-        self.signals.loaded.emit(self.item_id, img)
+        self.signals.source_short.emit(self.item_id, min(img.width(), img.height()))
+        self.signals.loaded.emit(self.item_id, _shrink_short_edge(img, self.tier))
 
-    @staticmethod
-    def _load(path):
+    def _load(self, path):
         ext = os.path.splitext(path)[1].lower()
         if ext in {".heic", ".dng"}:
             try:
+                import color_manage
                 from PIL import Image, ImageOps
                 with Image.open(path) as img:
+                    icc = color_manage.source_profile(img)
                     img = ImageOps.exif_transpose(img)
-                    img.thumbnail((360, 360))
-                    img = img.convert("RGB")
+                    img.thumbnail((self.tier * 2, self.tier * 2))
+                    img = color_manage.pil_to_output(img.convert("RGB"), icc)
                     w, h = img.size
                     return QImage(img.tobytes("raw", "RGB"), w, h, w * 3,
                                   QImage.Format.Format_RGB888).copy()
             except Exception:
                 pass
-        return QImage(path)
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        img = reader.read()
+        if not img.isNull():
+            import color_manage
+            if not color_manage.is_cache_file(path):     # záložně originál: do profilu displeje
+                img = color_manage.qimage_to_output(img)
+        return img
 
 
 # ── ApplePhotoModel ───────────────────────────────────────────────────────────
@@ -566,6 +595,28 @@ class ApplePhotoModel(QAbstractListModel):
         self.loading_ids = set()
         self.failed = {}          # item_id -> THUMB_MISSING_FILE | THUMB_UNAVAILABLE
         self._meta = {}           # řádek -> slovník MetaRole (delegát ho čte při každém snímku)
+        self.tier = THUMB_TIERS[1]                # kratší strana v RAM (podle velikosti dlaždic)
+        self._src_short = {}      # item_id -> kratší strana miniatury na disku (strop zlepšení)
+
+    def set_tier(self, tier: int):
+        """Velikost dlaždic se změnila: větší úroveň se dotáhne líně (data() vrací dosavadní
+        pixmapu a na pozadí načte ostřejší); menší nic nestojí – stávající se jen zmenší."""
+        self.tier = int(tier)
+
+    def _needs_upgrade(self, item_id, pix):
+        want = min(self.tier, self._src_short.get(item_id, self.tier))
+        return min(pix.width(), pix.height()) < want - 2
+
+    def _start_worker(self, item_id, rec):
+        self.loading_ids.add(item_id)
+        w = ThumbnailWorker(item_id, rec[5], rec[2], self.tier)
+        w.signals.source_short.connect(self._on_source_short)
+        w.signals.loaded.connect(self._on_thumb_loaded)
+        w.signals.failed.connect(self._on_thumb_failed)
+        self.thread_pool.start(w)
+
+    def _on_source_short(self, item_id: int, short: int):
+        self._src_short[item_id] = int(short)
 
     def set_records(self, db_records, possible=()):
         """possible = id položek z pásma „možné shody“ hledání (kreslí se tlumeně)."""
@@ -582,6 +633,7 @@ class ApplePhotoModel(QAbstractListModel):
         self.ram_cache.clear()
         self.loading_ids.clear()
         self.failed.clear()
+        self._src_short.clear()
 
     def thumb_state(self, item_id: int):
         if self.ram_cache.get(item_id) is not None:
@@ -616,13 +668,11 @@ class ApplePhotoModel(QAbstractListModel):
         if role == self.ThumbRole:
             pix = self.ram_cache.get(item_id)
             if pix is not None:
+                if item_id not in self.loading_ids and self._needs_upgrade(item_id, pix):
+                    self._start_worker(item_id, rec)     # ostřejší úroveň; do té doby dosavadní
                 return pix
             if item_id not in self.loading_ids and item_id not in self.failed:
-                self.loading_ids.add(item_id)
-                w = ThumbnailWorker(item_id, rec[5], rec[2])
-                w.signals.loaded.connect(self._on_thumb_loaded)
-                w.signals.failed.connect(self._on_thumb_failed)
-                self.thread_pool.start(w)
+                self._start_worker(item_id, rec)
             return None
 
         if role == self.StateRole:
@@ -645,6 +695,12 @@ class ApplePhotoModel(QAbstractListModel):
             self.dataChanged.emit(idx, idx, roles)
 
     def _on_thumb_loaded(self, item_id: int, image: QImage):
+        old = self.ram_cache.get(item_id)
+        if old is not None and min(old.width(), old.height()) >= min(image.width(), image.height()):
+            # zlepšení nepřišlo (menší zdroj): zapamatovat strop, ať se to nezkouší pořád
+            self._src_short[item_id] = min(self._src_short.get(item_id, 1 << 30), min(old.width(), old.height()))
+            self.loading_ids.discard(item_id)
+            return
         self.ram_cache.put(item_id, QPixmap.fromImage(image))   # QPixmap až v GUI vlákně
         self.loading_ids.discard(item_id)
         self.failed.pop(item_id, None)
@@ -1100,6 +1156,12 @@ class AppleGridView(QListView):
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
     # ── velikost dlaždic ──
+    def _update_thumb_tier(self):
+        """Rozlišení miniatur v RAM podle dlaždice ve fyzických px (Stage 2)."""
+        model = getattr(self, "photo_model", None)
+        if model is not None and hasattr(model, "set_tier"):
+            model.set_tier(thumb_tier(self.cell_size * self.viewport().devicePixelRatioF()))
+
     def set_cell_size(self, px: int):
         # strop tří sloupců až u rozvržené mřížky: při startu je viewport ~100 px a strop by
         # zapamatovanou velikost natrvalo zmenšil (sloupce pak hlídá resizeEvent)
@@ -1110,6 +1172,7 @@ class AppleGridView(QListView):
         self._cols = None                  # sloupce se dopočítají z velikosti při dalším rozvržení
         self.cell_size = px
         self.photo_delegate.set_cell_size(px)
+        self._update_thumb_tier()
         self.setGridSize(QSize(px, px))
         self.photo_model.layoutChanged.emit()
 
@@ -1166,6 +1229,7 @@ class AppleGridView(QListView):
             return
         self.cell_size = px
         self.photo_delegate.set_cell_size(px)
+        self._update_thumb_tier()
         self.setGridSize(QSize(px, px))
         self.photo_model.layoutChanged.emit()
 
@@ -2399,9 +2463,12 @@ class BackgroundAIDaemon(QThread):
             self.embeddings_added.emit(batch)
 
     def _build_previews(self):
-        """Náhledy 2048 px a plakáty videí na pozadí, v pořadí podle užitku: kandidáti duplicit,
+        """Náhledy v rozlišení displeje a plakáty videí na pozadí, v pořadí podle užitku: kandidáti duplicit,
         obálky událostí, pak celá knihovna od nejnovějších. Nakonec LRU úklid na rozpočet."""
         try:
+            removed = preview_cache.sweep_legacy()          # Stage 2: náhledy staré verze / profilu
+            if removed:
+                print(f"[Previews] smazáno {removed} náhledů staré verze")
             for path, mtype in preview_build_order():
                 if self._yield():
                     return
@@ -2437,6 +2504,8 @@ class BackgroundAIDaemon(QThread):
         try:
             self._status("Kontroluji ořezy obličejů...", force=True)
             fixed = face_engine.repair_stretched_face_crops(should_stop=self._yield)
+            if self._running:
+                fixed += face_engine.recolor_face_crops(should_stop=self._yield)   # Stage 2: barvy
             if fixed and self._running:
                 self.face_crops_repaired.emit(fixed)
         except Exception as e:
@@ -2833,7 +2902,7 @@ class DuplicateReviewView(ReviewView):
 
     def _review_size(self):
         # Velikost náhledové vrstvy: z cache se čte ~25 ms; chybí-li, první dekód ji zároveň vytvoří
-        return QSize(PREVIEW_EDGE, PREVIEW_EDGE)
+        return QSize(preview_cache.PREVIEW_EDGE, preview_cache.PREVIEW_EDGE)
 
     def _prefetch_following(self):
         """Další páry (originály) se dekódují na pozadí, než se k nim uživatel dostane."""
@@ -5689,6 +5758,7 @@ class MainWindow(QMainWindow):
         old_accent = (self.config.get("accent"), self.config.get("accent_custom"))
         old_memories = self.config.get("show_memories", True)
         old_precise = self._precise_wanted()
+        old_color = self.config.get("color_output", "auto")
         dlg = SettingsDialog(self)
         accepted = dlg.exec()
         if dlg.trash_emptied:                  # proběhlo i při Zrušit – knihovna musí sedět s DB
@@ -5704,6 +5774,8 @@ class MainWindow(QMainWindow):
             for card in getattr(self, "event_cards", []):
                 card.update()
             self.memory_card.update()
+        if self.config.get("color_output", "auto") != old_color:
+            configure_display_pipeline(QApplication.instance(), self.config)   # démon přegeneruje cache
         # P3.9 resize LRU cache
         cap = int(self.config.get("thumbnail_lru_capacity", 1200))
         self.grid_view.photo_model.resize_cache(cap)
@@ -5855,6 +5927,22 @@ class MainWindow(QMainWindow):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def configure_display_pipeline(app, cfg):
+    """Stage 2: výstupní barevný profil (color_manage) a velikost náhledů podle displeje.
+    Volat z GUI vlákna před prvním náhledem / démonem."""
+    import color_manage
+    try:
+        tgt = color_manage.configure(cfg.get("color_output", color_manage.MODE_AUTO))
+        print(f"[Barvy] výstup: {tgt['name']} ({tgt['reason']})")
+    except Exception as e:
+        print(f"[Barvy] {e}")
+    screen = app.primaryScreen() if app is not None else None
+    if screen is not None:
+        dpr = screen.devicePixelRatio()
+        size = screen.size()
+        preview_cache.configure_for_display(round(max(size.width(), size.height()) * dpr))
+
+
 def main(app=None, splash=None):
     """Hlavní okno. app/splash předává splash.boot(); bez nich (KAIROS_NO_SPLASH) se vytvoří tady."""
     if app is None:
@@ -5872,6 +5960,7 @@ def main(app=None, splash=None):
     cfg = load_config()
     tokens.configure(cfg)
     motion.configure(cfg)
+    configure_display_pipeline(app, cfg)
     theme.apply(cfg.get("theme", theme.DEFAULT_THEME))
 
     window = MainWindow()
