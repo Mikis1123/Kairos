@@ -59,7 +59,7 @@ from database import (
     get_media_pending_face_scan, save_faces_for_media, relocate_face_paths,
     visible_media_sql, query_geo_bounds, sync_geo_index, trash_media, restore_media,
     dismiss_duplicate_pair, undismiss_duplicate_pair, purge_orphan_test_rows,
-    get_search_vectors, get_videos_needing_frames, save_video_frame_embeddings,
+    get_search_vectors, get_videos_needing_frames, save_video_frame_embeddings, db_transaction,
 )
 from scanner import MediaScannerThread, repair_missing_thumbnails
 from face_cluster import (
@@ -111,6 +111,10 @@ import card_media
 import tile_store
 import video_proxy
 import video_frames
+import xmp_sync
+import albums
+import command_palette
+from command_palette import Command
 HOVER_PRELOAD_MS = 350      # setrvání kurzoru nad videem v mřížce před přednačtením
 SMART_IMPORT_DELAY_MS = 4000 # kontrola nových fotek až po usazení startu
 import face_engine
@@ -361,6 +365,10 @@ def shutdown_app(app, window):
     icons.clear_cache()                     # Kairos: QPixmap ikon nesmí přežít QApplication
     release_map_profile()
     tile_store.stop()                       # C7e: místní server dlaždic + dopsání fronty zápisů
+    try:
+        xmp_sync.uninstall()                # dopsat čekající XMP sidecary
+    except Exception as e:
+        print(f"[Shutdown] {e}")
     try:
         import scrub_strip
         scrub_strip.manager().shutdown()
@@ -2420,6 +2428,7 @@ class BackgroundAIDaemon(QThread):
             print(f"Rozpoznávání tváří není dostupné: {e}")
             return
         new_faces_found = False
+        scanned = []
         total = len(pending)
         for idx, (media_id, file_path) in enumerate(pending):
             if self._yield():
@@ -2432,6 +2441,7 @@ class BackgroundAIDaemon(QThread):
                 save_faces_for_media(media_id, faces)
                 if faces:
                     new_faces_found = True
+                    scanned.append(media_id)
                 # embedding hledání už nevzniká tady (dřív jen jednou s obličeji a bez podpisu
                 # zdroje – po re-importu pod novým id zůstal u cizí fotky): _refresh_embeddings
             except Exception as e:
@@ -2443,7 +2453,23 @@ class BackgroundAIDaemon(QThread):
                                        merge_threshold=self.merge_threshold)
             except Exception as e:
                 print(f"[Cluster] {e}")
+            self._apply_sidecar_faces(scanned)
             self.people_updated.emit()
+
+    def _apply_sidecar_faces(self, media_ids):
+        """Sprint 2: jména tváří z XMP sidecarů (knihovna po ztrátě databáze) a pak zápis
+        sidecarů položkám, kterým shlukování přidalo pojmenovanou osobu."""
+        if not media_ids:
+            return
+        try:
+            with db_transaction() as conn:
+                named = sum(xmp_sync.apply_faces(conn, mid) for mid in media_ids)
+            if named:
+                invalidate_centroid_cache()
+                print(f"[XMP] jména ze sidecarů: {named} tváří")
+        except Exception as e:
+            print(f"[XMP] {e}")
+        xmp_sync.touch(media_ids)
 
 
 # ── Kontroly (duplicity, hraniční obličeje) jako stránky v okně ───────────────
@@ -2984,6 +3010,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config = load_config()
+        # Sprint 2: kurátorská data i do XMP sidecarů (zápis na pozadí, vypínatelné v Předvolbách)
+        xmp_sync.install(get_connection, lambda: bool(self.config.get("xmp_sidecars", True)))
         self.setWindowTitle(brand.APP_NAME)
         self.setMinimumSize(1100, 700)
         self.resize(1280, 800)
@@ -3044,6 +3072,8 @@ class MainWindow(QMainWindow):
         # Fáze 0: měření doby snímku (Ctrl+Shift+F), rozpočet podle obnovovací frekvence displeje
         frame_meter.set_refresh(self.perf.refresh_hz)
         self._frame_stats = FrameStatsOverlay(self)
+        # Sprint 2: paleta příkazů (Ctrl + K) – stránky, osoby, události, alba, akce, hledání
+        self.palette = command_palette.install(self, self._palette_commands, self._palette_search)
         self._frame_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self)
         self._frame_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._frame_shortcut.activated.connect(self._frame_stats.toggle)
@@ -3125,7 +3155,8 @@ class MainWindow(QMainWindow):
             ("photos", "Fotografie", "photos"), ("people", "Osoby", "people"),
             ("events", "Události", "events"), ("map", "Mapa", "map"),
             NavSection("Kolekce"),
-            ("favorites", "Oblíbené", "heart"), ("videos", "Videa", "video"), ("trash", "Smazané", "trash"),
+            ("favorites", "Oblíbené", "heart"), ("videos", "Videa", "video"), ("albums", "Alba", "album"),
+            ("trash", "Smazané", "trash"),
             NavSection("Objevy"),
             ("echoes", "Ozvěny", "echo"),
         ])
@@ -4070,6 +4101,9 @@ class MainWindow(QMainWindow):
         if key == "echoes":
             self.open_echoes()
             return
+        if key == "albums":
+            self.open_albums()
+            return
         if key == "photos" and self._current_filter != "all":
             self._set_filter("all")
         self._switch_page(self.SIDEBAR_PAGES.index(key))
@@ -4083,9 +4117,10 @@ class MainWindow(QMainWindow):
         """Jezdec v postranním panelu podle stránky a filtru (i po programové změně)."""
         idx = self.stack.currentIndex()
         if not 0 <= idx < len(self.SIDEBAR_PAGES):
-            if any(p.property("sidebar_key") == "echoes" for p in self.nav.pages()):
-                self.sidebar_nav.set_current("echoes")  # Ozvěny i jejich srovnání (podstránky)
-                return
+            for sub_key in ("echoes", "albums"):           # Ozvěny / Alba i jejich podstránky
+                if any(p.property("sidebar_key") == sub_key for p in self.nav.pages()):
+                    self.sidebar_nav.set_current(sub_key)
+                    return
             idx = self.stack.indexOf(self.nav.root())    # podstránka: podle kořene pod ní
         if idx == 0:
             key = next((k for k, f in self.COLLECTION_FILTERS.items() if f == self._current_filter), "photos")
@@ -4718,6 +4753,9 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         act_fav = menu.addAction("Přidat/odebrat oblíbené (F)")
         act_open = menu.addAction("Otevřít")
+        ids = [int(self._filtered_records[r][0]) for r in rows if 0 <= r < len(self._filtered_records)]
+        if self._current_filter != "trash":
+            self._add_album_menu(menu, ids)
         menu.addSeparator()
         act_info = menu.addAction("Informace o souboru")
         menu.addSeparator()
@@ -4821,13 +4859,270 @@ class MainWindow(QMainWindow):
         btn.setEnabled(grid.photo_model.rowCount() > 0)
         return btn
 
-    def _make_collection_grid(self, records, parent):
+    def _make_collection_grid(self, records, parent, album_id=None):
         grid = AppleGridView(self, parent)
         grid.set_cell_size(self.grid_view.cell_size)
         grid.photo_model.set_records(records)
         grid.item_activated.connect(
             lambda row, g=grid: self._open_viewer(g.photo_model.records, row, g.photo_model))
+        grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        grid.customContextMenuRequested.connect(
+            lambda pos, g=grid: self._collection_context_menu(g, pos, album_id))
         return grid
+
+    # ── Sprint 2: Paleta příkazů ──────────────────────────────────────────────
+
+    def _palette_search(self, query):
+        def run():
+            self.nav.reset()
+            if self._current_filter == "trash":
+                self._set_filter("all")
+            self._switch_page(0)
+            self.search_bar.setText(query)
+            self._sync_sidebar()
+        return Command(f"Hledat „{query}“ v knihovně", run, "search", "Chytré hledání podle obsahu fotek",
+                       "search")
+
+    def _palette_commands(self):
+        """Všechno, kam paleta umí skočit. Volá se při každém otevření (aktuální data)."""
+        def nav(key):                            # jako klik do postranního panelu
+            self.nav.reset()
+            self.sidebar_nav.set_current(key)
+            self._on_sidebar(key)
+        cmds = [
+            Command("Fotografie", lambda: nav("photos"), "page", icon="photos", keywords="knihovna mřížka vše"),
+            Command("Osoby", lambda: nav("people"), "page", icon="people", keywords="tváře lidé obličeje"),
+            Command("Události", lambda: nav("events"), "page", icon="events", keywords="výlety akce cesty"),
+            Command("Mapa", lambda: nav("map"), "page", icon="map", keywords="místa poloha zeměkoule"),
+            Command("Oblíbené", lambda: nav("favorites"), "page", icon="heart", keywords="srdce"),
+            Command("Videa", lambda: nav("videos"), "page", icon="video", keywords="klipy filmy"),
+            Command("Alba", lambda: nav("albums"), "page", icon="album", keywords="kolekce výběry"),
+            Command("Smazané", lambda: nav("trash"), "page", icon="trash", keywords="koš"),
+            Command("Ozvěny", lambda: nav("echoes"), "page", icon="echo", keywords="tehdy teď návrat"),
+            Command("Importovat fotky…", self._start_import, "action", icon="import", keywords="přidat složka"),
+            Command("Předvolby", self._open_settings, "action", icon="settings", keywords="nastavení možnosti"),
+            Command("Nové album…", lambda: self._new_album(), "action", icon="plus", keywords="vytvořit album"),
+            Command("Nápověda a tipy", self.open_guide, "action", icon="info", keywords="průvodce help"),
+        ]
+        if self._search_query.strip():
+            cmds.append(Command(f"Uložit hledání „{self._search_query.strip()}“ jako chytré album",
+                                self.save_search_as_smart_album, "action", icon="sparkle",
+                                keywords="chytré album uložit"))
+        conn = get_connection()
+        try:
+            albums.ensure_tables(conn)
+            for a in albums.list_albums(conn):
+                sub_text = (f"Hledání „{a['query']}“" if a["kind"] == "smart"
+                            else _czech_item_count(a["count"] or 0))
+                cmds.append(Command(a["name"], lambda a=a: self._open_album(a), "album", sub_text,
+                                    "sparkle" if a["kind"] == "smart" else "album"))
+        finally:
+            conn.close()
+        for pid, (name, _cover, count) in sorted(getattr(self, "_people_rows", {}).items(),
+                                                 key=lambda kv: -(kv[1][2] or 0)):
+            if not name or name.lower().startswith(("neznámá osoba", "unknown")):
+                continue
+            cmds.append(Command(name, lambda pid=pid, name=name: self._palette_person(pid, name), "person",
+                                _czech_photo_count(count or 0), "people"))
+        for ev in getattr(self, "_event_cards", []):
+            when = (ev.get("start") or "")[:10]
+            cmds.append(Command(ev.get("title") or "Událost", lambda eid=ev["id"]: self._palette_event(eid), "event",
+                                " · ".join(x for x in (ev.get("location"), when) if x), "events",
+                                keywords=f"{ev.get('location') or ''} {when[:4]}"))
+        return cmds
+
+    def _palette_person(self, person_id, name):
+        self.nav.reset()
+        self.sidebar_nav.set_current("people")
+        self._on_sidebar("people")
+        self._on_person_card_clicked(person_id, name)
+
+    def _palette_event(self, event_id):
+        self.nav.reset()
+        self.sidebar_nav.set_current("events")
+        self._on_sidebar("events")
+        self._open_event(event_id)
+
+    # ── Sprint 2: Alba ────────────────────────────────────────────────────────
+
+    def _grid_ids(self, grid):
+        recs = grid.photo_model.records
+        return [int(recs[r][0]) for r in grid.selected_row_indices() if 0 <= r < len(recs)]
+
+    def _collection_context_menu(self, grid, pos, album_id=None):
+        ids = self._grid_ids(grid)
+        if not ids:
+            return
+        menu = QMenu(self)
+        act_fav = menu.addAction("Přidat/odebrat oblíbené (F)")
+        self._add_album_menu(menu, ids, exclude=album_id)
+        act_remove = act_cover = None
+        if album_id is not None:
+            menu.addSeparator()
+            act_cover = menu.addAction("Nastavit jako obálku alba") if len(ids) == 1 else None
+            act_remove = menu.addAction("Odebrat z alba")
+        chosen = menu.exec(grid.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_fav:
+            self.toggle_favorite_on_selection(grid)
+        elif chosen == act_remove:
+            self._album_edit(lambda conn: albums.remove_items(conn, album_id, ids))
+            gone = set(ids)
+            grid.photo_model.set_records([r for r in grid.photo_model.records if int(r[0]) not in gone])
+            show_toast(self, f"Odebráno z alba: {_czech_item_count(len(ids))}", "success")
+            self._refresh_albums_panel()
+        elif chosen == act_cover:
+            self._album_edit(lambda conn: albums.set_cover(conn, album_id, ids[0]))
+            self._refresh_albums_panel()
+
+    def _add_album_menu(self, menu, ids, exclude=None):
+        """Podnabídka „Přidat do alba“: existující ruční alba + nové album z výběru."""
+        sub = menu.addMenu("Přidat do alba")
+        conn = get_connection()
+        try:
+            albums.ensure_tables(conn)
+            manual = [a for a in albums.list_albums(conn) if a["kind"] == "manual" and a["id"] != exclude]
+        finally:
+            conn.close()
+        act_new = sub.addAction("Nové album…")
+        act_new.triggered.connect(lambda: self._new_album(ids))
+        if manual:
+            sub.addSeparator()
+        for a in manual:
+            act = sub.addAction(a["name"])
+            act.triggered.connect(lambda _=False, a=a: self._add_to_album(a, ids))
+        return sub
+
+    def _album_edit(self, fn):
+        try:
+            with db_transaction() as conn:
+                albums.ensure_tables(conn)
+                result = fn(conn)
+            return True if result is None else result
+        except Exception as e:
+            show_toast(self, f"Album nelze upravit: {e}", "error")
+            return None
+
+    def _add_to_album(self, album, ids):
+        added = self._album_edit(lambda conn: albums.add_items(conn, album["id"], ids))
+        if added is None:
+            return
+        text = (f"Přidáno do alba „{album['name']}“: {_czech_item_count(added)}" if added
+                else f"Vše už v albu „{album['name']}“ je")
+        show_toast(self, text, "success", action_text="Otevřít",
+                   on_action=lambda: self._open_album_by_id(album["id"]))
+        self._refresh_albums_panel()
+
+    def _new_album(self, ids=()):
+        name, ok = InWindowDialog.getText(self, "Nové album", "Název alba:", text="")
+        if not ok or not name.strip():
+            return None
+        aid = self._album_edit(lambda conn: albums.create_album(conn, name, ids))
+        if aid is None:
+            return None
+        if ids:
+            show_toast(self, f"Album „{name.strip()}“: {_czech_item_count(len(ids))}", "success",
+                       action_text="Otevřít", on_action=lambda: self._open_album_by_id(aid))
+        self._refresh_albums_panel()
+        return aid
+
+    def save_search_as_smart_album(self):
+        """Aktuální hledání (a kolekce) jako chytré album – samo se doplňuje novými fotkami."""
+        query = self._search_query.strip()
+        if not query:
+            show_toast(self, "Nejdřív něco vyhledejte – chytré album uloží hledání", "info")
+            return None
+        flt = self._current_filter if self._current_filter in albums.SMART_FILTERS else "all"
+        name, ok = InWindowDialog.getText(self, "Chytré album", "Název alba:", text=query[:1].upper() + query[1:])
+        if not ok or not name.strip():
+            return None
+        aid = self._album_edit(lambda conn: albums.create_smart_album(conn, name, query, flt))
+        if aid is not None:
+            show_toast(self, f"Chytré album „{name.strip()}“ uloženo", "success")
+            self._refresh_albums_panel()
+        return aid
+
+    def _refresh_albums_panel(self):
+        panel = getattr(self, "_albums_panel", None)
+        if panel is None:
+            return
+        try:
+            panel.load()
+        except RuntimeError:                     # stránka už zavřená (C++ objekt smazán)
+            self._albums_panel = None
+
+    def open_albums(self):
+        """Postranní panel Kolekce › Alba: ruční a chytrá alba (albums.py)."""
+        import albums_view
+        self.nav.reset()
+        page = DetailPage("Alba", "Vaše výběry a uložená hledání")
+        page.setProperty("sidebar_key", "albums")
+        panel = albums_view.AlbumsPanel(get_connection, page)
+        panel.opened.connect(self._open_album)
+        panel.rename_requested.connect(self._rename_album)
+        panel.delete_requested.connect(self._delete_album)
+        page.add_action("Nové album", lambda: self._new_album())
+        btn = page.add_action("Uložit hledání", self.save_search_as_smart_album,
+                              "Aktuální hledání jako chytré album (samo se doplňuje)")
+        btn.setEnabled(bool(self._search_query.strip()))
+        page.set_content(panel)
+        self._albums_panel = panel
+        self.nav.push(page, on_pop=self._sync_sidebar)
+        self._sync_sidebar()
+        n = panel.load()
+        if n:
+            page.set_title("Alba", albums.czech_albums(n))
+
+    def _open_album_by_id(self, album_id):
+        conn = get_connection()
+        try:
+            albums.ensure_tables(conn)
+            album = albums.get_album(conn, album_id)
+        finally:
+            conn.close()
+        if album:
+            self._open_album(album)
+
+    def _open_album(self, album):
+        if album["kind"] == "smart":             # chytré album = hledání v mřížce Fotografie
+            self.nav.reset()
+            self._set_filter(album.get("filter") or "all")
+            self._switch_page(0)
+            self.search_bar.setText(album["query"])
+            self._sync_sidebar()
+            return
+        conn = get_connection()
+        try:
+            ids = albums.item_ids(conn, album["id"])
+        finally:
+            conn.close()
+        records = fetch_media_records(f"m.id IN ({','.join('?' * len(ids))})", tuple(ids)) if ids else []
+        page = DetailPage(album["name"], _czech_photo_count(len(records)))
+        page.setProperty("sidebar_key", "albums")
+        page.add_action("Přejmenovat", lambda: self._rename_album(album, page))
+        grid = self._make_collection_grid(records, page, album_id=album["id"])
+        self._add_slideshow_action(page, grid)
+        page.set_content(grid)
+        self.nav.push(page, on_pop=self._sync_sidebar)
+        self._sync_sidebar()
+
+    def _rename_album(self, album, page=None):
+        name, ok = InWindowDialog.getText(self, "Přejmenovat album", "Nový název:", text=album["name"])
+        if not ok or not name.strip():
+            return
+        if self._album_edit(lambda conn: albums.rename_album(conn, album["id"], name)) is None:
+            return
+        album["name"] = " ".join(name.split())
+        if isinstance(page, DetailPage):
+            page.set_title(album["name"])
+        self._refresh_albums_panel()
+
+    def _delete_album(self, album):
+        if self._album_edit(lambda conn: albums.delete_album(conn, album["id"])) is None:
+            return
+        show_toast(self, f"Album „{album['name']}“ smazáno – fotky zůstaly v knihovně", "success")
+        self._refresh_albums_panel()
 
     def _rename_person(self, person_id: int, current_name: str, page=None):
         new_name, ok = InWindowDialog.getText(
@@ -4839,6 +5134,7 @@ class MainWindow(QMainWindow):
                     conn.execute("UPDATE people SET name=? WHERE id=?",
                                  (new_name.strip(), person_id))
                 confirm_person(person_id)    # přejmenovaná osoba = kotva, přeshlukování ji nesmaže
+                xmp_sync.touch_person(person_id)   # nové jméno do sidecarů všech jejích fotek
                 self._load_people()
                 if isinstance(page, DetailPage):
                     page.set_title(new_name.strip())

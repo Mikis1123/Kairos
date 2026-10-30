@@ -248,6 +248,9 @@ def init_db():
             # Koš (měkké smazání): soubor na disku zůstává, položka se jen skryje
             ("is_trashed", "INTEGER DEFAULT 0"),
             ("trashed_at", "TEXT"),
+            # Sprint 2: původ polohy – NULL/'exif' = ze souboru, 'borrowed' = z telefonu ve stejné
+            # chvíli (location_borrow), 'manual' = oprava uživatelem; opravy jdou i do XMP sidecaru
+            ("gps_source", "TEXT"),
         ])
         if "faces_scanned" in added_media:
             # Fotky, které už mají nalezené obličeje, se znovu analyzovat nemusí.
@@ -319,6 +322,10 @@ def init_db():
             PRIMARY KEY (id_a, id_b)
         );
         """)
+
+        # Sprint 2: ruční a chytrá alba
+        import albums
+        albums.ensure_tables(cursor)
 
         # MODUL 3: SQLite R*Tree prostorový index pro bleskové dotazy mapy (< 2 ms)
         try:
@@ -530,6 +537,8 @@ def toggle_favorite(media_id):
         """, (media_id,))
         c.execute("SELECT is_favorite FROM media_items WHERE id = ?", (media_id,))
         row = c.fetchone()
+    import xmp_sync                      # oblíbené do XMP sidecaru (Sprint 2)
+    xmp_sync.touch([media_id])
     return int(row[0]) if row and row[0] else 0
 
 

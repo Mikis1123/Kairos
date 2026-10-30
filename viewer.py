@@ -955,6 +955,8 @@ class MediaViewerWidget(QWidget):
             c.execute("UPDATE face_instances SET person_id = ? WHERE id = ?", (target_person_id, face_id))
             conn.commit()
             conn.close()
+            import xmp_sync
+            xmp_sync.touch_faces([face_id])      # jméno tváře do sidecaru (Sprint 2)
             
             from face_engine import update_person_key_photo
             update_person_key_photo(target_person_id)

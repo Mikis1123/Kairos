@@ -343,6 +343,10 @@ class MediaScannerThread(QThread):
             done += len(batch)
             self._emit_progress((done / total_files) * 45)
 
+        # Sprint 2: nové položky – oblíbené a opravená poloha z XMP sidecarů (knihovna po ztrátě DB)
+        if to_process:
+            self._restore_sidecars([b[1] for b in to_process])
+
         self._emit_progress(45, force=True)
         if not self._is_running:
             return 0
@@ -385,6 +389,7 @@ class MediaScannerThread(QThread):
             if self._is_running:
                 self.status_signal.emit("Shlukuji výlety...")
                 self._cluster_into_events(conn)
+                self._borrow_locations(conn)
                 self._emit_progress(100, force=True)
         finally:
             conn.close()
@@ -392,6 +397,38 @@ class MediaScannerThread(QThread):
         return len(to_process)
 
     # ------------------------------------------------------------------
+    def _restore_sidecars(self, db_paths):
+        try:
+            import xmp_sync
+            with db_transaction() as conn:
+                ids = []
+                for k in range(0, len(db_paths), 500):
+                    chunk = db_paths[k:k + 500]
+                    ids += [r[0] for r in conn.execute(
+                        f"SELECT id FROM media_items WHERE file_path IN ({','.join('?' * len(chunk))})", chunk)]
+                n = xmp_sync.restore_media(conn, ids)
+            if n:
+                print(f"[XMP] obnoveno ze sidecarů: {n} položek")
+        except Exception as e:
+            print(f"[XMP] obnova: {e}")
+
+    def _borrow_locations(self, conn):
+        """Sprint 2: fotky bez GPS převezmou polohu z telefonu ve stejné události a chvíli."""
+        try:
+            from config import load_config
+            if not load_config().get("borrow_location", True):
+                return
+            import location_borrow
+            import xmp_sync
+            ids = location_borrow.borrow(conn)
+            conn.commit()
+            if ids:
+                print(f"[Poloha] vypůjčeno pro {len(ids)} položek")
+                self._geocode_locations(conn)
+                xmp_sync.touch(ids)
+        except Exception as e:
+            print(f"Chyba výpůjčky polohy: {e}")
+
     def _run_exiftool(self, file_paths):
         cmd = [
             self.exiftool_path, "-json", "-n",

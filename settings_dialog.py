@@ -327,6 +327,12 @@ class SettingsDialog(QDialog):
         ])
         self.combo_default_sort.setCurrentText(self.config.get("default_sort_order", "Datum pořízení (Nejnovější)"))
         self._row(g, "Výchozí řazení", self.combo_default_sort)
+        self.chk_xmp = ToggleSwitch("Ukládat oblíbené, jména a polohu do souborů XMP vedle fotek")
+        self.chk_xmp.setChecked(bool(self.config.get("xmp_sidecars", True)))
+        self._row(g, stacked=self.chk_xmp)
+        self.chk_borrow = ToggleSwitch("Doplnit polohu fotek bez GPS z telefonu ve stejné chvíli")
+        self.chk_borrow.setChecked(bool(self.config.get("borrow_location", True)))
+        self._row(g, stacked=self.chk_borrow)
         layout.addWidget(_hint("Velikost dlaždic měníte přímo v mřížce: Ctrl + kolečko myši nebo sevření prstů."))
 
         # Koš
@@ -676,6 +682,8 @@ class SettingsDialog(QDialog):
             self._add_folder_item(f, False)
         self.chk_autoscan.setChecked(DEFAULT_CONFIG.get("auto_scan_on_startup", True))
         self.chk_reduce_motion.setChecked(DEFAULT_CONFIG.get("reduce_motion", False))
+        self.chk_xmp.setChecked(DEFAULT_CONFIG.get("xmp_sidecars", True))
+        self.chk_borrow.setChecked(DEFAULT_CONFIG.get("borrow_location", True))
         self.chk_memories.setChecked(DEFAULT_CONFIG.get("show_memories", True))
         self.chk_adaptive.setChecked(DEFAULT_CONFIG.get("adaptive_accent", True))
         self.combo_default_sort.setCurrentText(DEFAULT_CONFIG.get("default_sort_order", "Datum pořízení (Nejnovější)"))
@@ -696,6 +704,8 @@ class SettingsDialog(QDialog):
         self.config["watched_folders"] = [it.text() for it in items if it.checkState() == Qt.CheckState.Checked]
         self.config["auto_scan_on_startup"] = self.chk_autoscan.isChecked()
         self.config["reduce_motion"] = self.chk_reduce_motion.isChecked()
+        self.config["xmp_sidecars"] = self.chk_xmp.isChecked()
+        self.config["borrow_location"] = self.chk_borrow.isChecked()
         self.config["show_memories"] = self.chk_memories.isChecked()
         self.config["adaptive_accent"] = self.chk_adaptive.isChecked()
         self.config["default_sort_order"] = self.combo_default_sort.currentText()

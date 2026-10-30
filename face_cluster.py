@@ -22,6 +22,7 @@ Rozdíl proti původní strict_recluster_faces() v main.py:
     průběžně aktualizuje – žádný naivní pevný práh bez kontextu.
   * Vše v jedné transakci (při chybě rollback), vektorizovaně (numpy matice).
 """
+import xmp_sync
 import os
 import traceback
 import numpy as np
@@ -195,6 +196,7 @@ def assign_face_to_person(face_id, person_id):
         c.execute("UPDATE face_instances SET person_id = ? WHERE id = ?", (person_id, face_id))
         conn.commit()
         invalidate_centroid_cache(person_id)
+        xmp_sync.touch_faces([face_id])          # jméno tváře do sidecaru (Sprint 2)
         return True
     except Exception as e:
         try:
@@ -680,6 +682,7 @@ def merge_people(target_id, source_ids, name=None, pull_threshold=None):
                               [(target_id, fid) for fid in pulled])
 
     invalidate_centroid_cache()
+    xmp_sync.touch_person(target_id)
     try:
         refresh_person_covers([target_id])     # nejlepší portrét ze sloučených obličejů
     except Exception as e:
@@ -711,6 +714,8 @@ def undo_merge(undo):
         c.execute("UPDATE people SET name = ?, cover_face_path = ?, key_face_id = ?, is_favorite = ?, "
                   "is_confirmed = ? WHERE id = ?", (target[1], target[2], target[3], target[4], target[5], target[0]))
     invalidate_centroid_cache()
+    xmp_sync.touch_person(target[0])
+    xmp_sync.touch_faces([fid for fid, _ in undo["faces"]] + list(undo["pulled"]))
     return True
 
 
