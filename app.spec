@@ -74,6 +74,11 @@ hidden_imports = [
     'pillow_heif'
 ]
 hidden_imports += collect_submodules('pillow_heif')
+# Sprint 3: OCR Windows (ocr_engine) – projekce winrt se načítají dynamicky
+try:
+    hidden_imports += collect_submodules('winrt')
+except Exception:
+    pass
 
 a = Analysis(
     ['main.py'],

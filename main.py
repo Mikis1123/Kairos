@@ -60,6 +60,7 @@ from database import (
     visible_media_sql, query_geo_bounds, sync_geo_index, trash_media, restore_media,
     dismiss_duplicate_pair, undismiss_duplicate_pair, purge_orphan_test_rows,
     get_search_vectors, get_videos_needing_frames, save_video_frame_embeddings, db_transaction,
+    get_media_needing_ocr, save_ocr_results,
 )
 from scanner import MediaScannerThread, repair_missing_thumbnails
 from face_cluster import (
@@ -2173,6 +2174,7 @@ class BackgroundAIDaemon(QThread):
         self.merge_threshold = merge_threshold     # None = face_cluster.MERGE_THRESHOLD
         self.preview_budget_mb = preview_cache.DEFAULT_BUDGET_MB
         self.proxy_budget_mb = video_proxy.DEFAULT_BUDGET_MB
+        self.ocr_enabled = True                    # Sprint 3: text na fotkách (Předvolby › ocr_text)
 
     def stop(self):
         self._running = False
@@ -2227,6 +2229,8 @@ class BackgroundAIDaemon(QThread):
                 self._index_video_frames()           # až po proxy: snímky z rychlé SDR kopie
             if self._running:
                 self._improve_person_covers()
+            if self._running:
+                self._index_ocr()
         except Exception as e:
             print(f"AI Daemon error: {e}")
         self.status_changed.emit("")
@@ -2455,6 +2459,29 @@ class BackgroundAIDaemon(QThread):
                 print(f"[Cluster] {e}")
             self._apply_sidecar_faces(scanned)
             self.people_updated.emit()
+
+    def _index_ocr(self):
+        """Sprint 3: text na fotkách (OCR Windows, offline) pro hledání slovem. Poslední krok
+        démona – nejpomalejší (~0,5 s na fotku HEIC) a nejméně naléhavý."""
+        import ocr_engine
+        if not self.ocr_enabled or not ocr_engine.available():
+            return
+        try:
+            rows = get_media_needing_ocr()
+        except Exception as e:
+            print(f"[OCR] {e}")
+            return
+        total, batch = len(rows), []
+        for i, (media_id, path, sig) in enumerate(rows):
+            if self._yield():
+                break
+            self._status(f"Čtu text na fotkách ({i + 1}/{total})...")
+            text = ocr_engine.recognize_file(path) if path and os.path.exists(path) else ""
+            batch.append((media_id, text, sig))
+            if len(batch) >= 25:
+                save_ocr_results(batch)
+                batch = []
+        save_ocr_results(batch)
 
     def _apply_sidecar_faces(self, media_ids):
         """Sprint 2: jména tváří z XMP sidecarů (knihovna po ztrátě databáze) a pak zápis
@@ -3993,6 +4020,7 @@ class MainWindow(QMainWindow):
                                              merge_threshold=self.config.get("face_merge_threshold"))
         self._ai_daemon.preview_budget_mb = int(self.config.get("preview_cache_mb", preview_cache.DEFAULT_BUDGET_MB))
         self._ai_daemon.proxy_budget_mb = int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB))
+        self._ai_daemon.ocr_enabled = bool(self.config.get("ocr_text", True))
         self._ai_daemon.people_updated.connect(self._load_people)
         self._ai_daemon.embeddings_updated.connect(self._load_embeddings)
         self._ai_daemon.embeddings_added.connect(self._merge_embeddings)

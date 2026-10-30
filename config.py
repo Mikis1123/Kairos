@@ -47,6 +47,8 @@ DEFAULT_CONFIG = {
     "xmp_sidecars": True,
     # Sprint 2 – poloha vypůjčená z telefonu ve stejné události pro fotky bez GPS
     "borrow_location": True,
+    # Sprint 3 – text na fotkách (OCR Windows, offline) pro hledání slovem
+    "ocr_text": True,
 }
 
 

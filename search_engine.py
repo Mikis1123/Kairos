@@ -83,6 +83,7 @@ class Vocab:
     places: dict
     people: dict
     items: dict        # id -> Item
+    ocr: dict = field(default_factory=dict)    # id -> tuple složených slov textu na fotce (Sprint 3)
 
 
 def load_vocab(conn=None):
@@ -101,6 +102,12 @@ def load_vocab(conn=None):
             faces.setdefault(media_id, set())
             if person_id is not None:
                 faces[media_id].add(person_id)
+        ocr = {}
+        try:
+            for mid, text in conn.execute("SELECT media_id, text FROM media_ocr WHERE text != ''"):
+                ocr[mid] = tuple(tokens(text))
+        except Exception:                        # starší DB bez tabulky
+            ocr = {}
         people = {}
         for pid, name in conn.execute("SELECT id, name FROM people"):
             if name and fold(name) not in ("neznama osoba", "unknown"):
@@ -115,7 +122,21 @@ def load_vocab(conn=None):
                 places.setdefault(fold(name), name)
         items[mid] = Item(mid, fold(city), fold(ev_place), day if len(day) == 10 else "", mtype or "",
                           bool(fav), mid in faces, frozenset(faces.get(mid, ())))
-    return Vocab(places, people, items)
+    return Vocab(places, people, items, ocr)
+
+
+def ocr_matches(text, vocab, pool):
+    """Položky poolu, na kterých je VŠECHNA obsahová slova dotazu vidět jako text (OCR) –
+    se skloňováním (_same_word) a od 3 písmen; pořadí poolu (mřížky). [] když dotaz nemá slova."""
+    words = [w for w in tokens(text) if w not in FILLER and len(w) >= 3]
+    if not words or not vocab.ocr:
+        return []
+    out = []
+    for mid in pool:
+        toks = vocab.ocr.get(mid)
+        if toks and all(any(_same_word(w, t) or (len(w) >= 4 and t.startswith(w)) for t in toks) for w in words):
+            out.append(mid)
+    return out
 
 
 # ── plán dotazu ───────────────────────────────────────────────────────────────
@@ -329,6 +350,14 @@ def run_search(query, universe, embeddings, vocab=None, semantic_fn=None, today=
         labels.append("lidé")
         text = f"lidé {text}".strip() if text else "lidé"
     confident, possible = semantic_fn(text, pool, embeddings, face_ids if plan.people else None)
+    if plan.text:
+        # Sprint 3: text na fotce (cedule, dokument) = jistá shoda, před obrazovými
+        read = ocr_matches(plan.text, vocab, pool)
+        if read:
+            labels.append("text na fotce")
+            seen = set(read)
+            confident = read + [m for m in confident if m not in seen]
+            possible = [m for m in possible if m not in seen]
     if plan.people and not plan.text:
         # „lidi“: rozpoznaná tvář = jistá shoda (řazená podle obrazu), zbytek jen možný
         ranked = confident + possible + [m for m in pool if m in face_ids]

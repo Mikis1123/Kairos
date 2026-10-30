@@ -323,6 +323,17 @@ def init_db():
         );
         """)
 
+        # Sprint 3: text rozpoznaný na fotkách (ocr_engine, OCR Windows). text '' = zkontrolováno,
+        # nic; source_sig = podpis souboru (změněný soubor = znovu)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS media_ocr (
+            media_id INTEGER PRIMARY KEY,
+            text TEXT NOT NULL DEFAULT '',
+            source_sig TEXT,
+            FOREIGN KEY (media_id) REFERENCES media_items (id) ON DELETE CASCADE
+        );
+        """)
+
         # Sprint 2: ruční a chytrá alba
         import albums
         albums.ensure_tables(cursor)
@@ -572,6 +583,29 @@ def get_media_needing_embedding():
         """).fetchall()
     finally:
         conn.close()
+
+
+def get_media_needing_ocr():
+    """[(id, file_path, podpis)] fotek bez platného OCR (videa ne – text na videu zatím ne)."""
+    conn = get_connection()
+    try:
+        return conn.execute(f"""
+            SELECT m.id, m.file_path, {EMBEDDING_SIG_SQL}
+            FROM media_items m LEFT JOIN media_ocr o ON o.media_id = m.id
+            WHERE m.media_type IN ('photo', 'live_photo') AND COALESCE(m.is_trashed, 0) = 0
+              AND (o.media_id IS NULL OR o.source_sig IS NULL OR o.source_sig != {EMBEDDING_SIG_SQL})
+            ORDER BY m.date_taken DESC, m.id DESC
+        """).fetchall()
+    finally:
+        conn.close()
+
+
+def save_ocr_results(rows):
+    """rows = [(media_id, text, podpis)]"""
+    if not rows:
+        return
+    with db_transaction() as conn:
+        conn.executemany("INSERT OR REPLACE INTO media_ocr (media_id, text, source_sig) VALUES (?, ?, ?)", rows)
 
 
 def get_all_embeddings():

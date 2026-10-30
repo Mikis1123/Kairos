@@ -333,6 +333,9 @@ class SettingsDialog(QDialog):
         self.chk_borrow = ToggleSwitch("Doplnit polohu fotek bez GPS z telefonu ve stejné chvíli")
         self.chk_borrow.setChecked(bool(self.config.get("borrow_location", True)))
         self._row(g, stacked=self.chk_borrow)
+        self.chk_ocr = ToggleSwitch("Číst text na fotkách (cedule, dokumenty) pro hledání – offline")
+        self.chk_ocr.setChecked(bool(self.config.get("ocr_text", True)))
+        self._row(g, stacked=self.chk_ocr)
         layout.addWidget(_hint("Velikost dlaždic měníte přímo v mřížce: Ctrl + kolečko myši nebo sevření prstů."))
 
         # Koš
@@ -684,6 +687,7 @@ class SettingsDialog(QDialog):
         self.chk_reduce_motion.setChecked(DEFAULT_CONFIG.get("reduce_motion", False))
         self.chk_xmp.setChecked(DEFAULT_CONFIG.get("xmp_sidecars", True))
         self.chk_borrow.setChecked(DEFAULT_CONFIG.get("borrow_location", True))
+        self.chk_ocr.setChecked(DEFAULT_CONFIG.get("ocr_text", True))
         self.chk_memories.setChecked(DEFAULT_CONFIG.get("show_memories", True))
         self.chk_adaptive.setChecked(DEFAULT_CONFIG.get("adaptive_accent", True))
         self.combo_default_sort.setCurrentText(DEFAULT_CONFIG.get("default_sort_order", "Datum pořízení (Nejnovější)"))
@@ -706,6 +710,7 @@ class SettingsDialog(QDialog):
         self.config["reduce_motion"] = self.chk_reduce_motion.isChecked()
         self.config["xmp_sidecars"] = self.chk_xmp.isChecked()
         self.config["borrow_location"] = self.chk_borrow.isChecked()
+        self.config["ocr_text"] = self.chk_ocr.isChecked()
         self.config["show_memories"] = self.chk_memories.isChecked()
         self.config["adaptive_accent"] = self.chk_adaptive.isChecked()
         self.config["default_sort_order"] = self.combo_default_sort.currentText()
