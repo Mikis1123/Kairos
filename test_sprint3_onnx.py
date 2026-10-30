@@ -64,3 +64,30 @@ class TestEncoders(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSoftAnd(unittest.TestCase):
+    def test_query_parts(self):
+        import ai_engine
+        self.assertEqual(ai_engine.query_parts("les"), [])
+        self.assertEqual(ai_engine.query_parts("západ slunce a oheň"), ["západ", "slunce", "oheň"])
+        self.assertEqual(ai_engine.query_parts("lidi u jezera"), ["lidi", "jezera"])
+        self.assertEqual(ai_engine.query_parts("a b c d e f"), [])
+
+    def test_soft_min_prefers_items_with_all_parts(self):
+        import ai_engine
+        whole = np.zeros(3, np.float32)
+        comps = {"ohen": np.array([3.0, 3.0, 0.0]), "zapad": np.array([3.0, 0.0, 3.0])}
+        out = ai_engine.soft_and("ohen zapad", whole, comps.get, lambda z: z, weight=0.5)
+        self.assertEqual(int(np.argmax(out)), 0, "obojí > jen jedno")
+        self.assertAlmostEqual(float(out[1]), float(out[2]), places=5)
+
+    def test_absent_part_is_dropped(self):
+        import ai_engine
+        whole = np.array([1.0, 2.0], np.float32)
+        comps = {"ohen": np.array([3.0, 0.0]), "smich": np.array([0.1, 0.2])}   # smích není vidět
+        np.testing.assert_array_equal(ai_engine.soft_and("ohen smich", whole, comps.get, lambda z: z, 0.5), whole)
+
+    def test_disabled_by_default(self):
+        import ai_engine
+        self.assertEqual(ai_engine.SOFTAND_WEIGHT, 0.0)

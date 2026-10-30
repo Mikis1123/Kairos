@@ -419,10 +419,16 @@ def rank_semantic(text, pool_ids, photo_embeddings_dict, face_ids=None):
             return [], []                               # všechny fotky stejně (ne)podobné = nic nevyčnívá
         zl_all = (scores - float(scores.mean())) / sd
     stats = _image_stats(matrix, text_model)
-    if stats is not None:
-        zi_all = (row_scores - stats[0]) / stats[1]     # každý snímek vůči své bance pojmů
+
+    def image_z(rs):                                    # každý snímek vůči své bance pojmů
+        z = (rs - stats[0]) / stats[1]
         if starts is not None:
-            zi_all = np.maximum.reduceat(zi_all, starts) - frame_penalty(state["rows_per_item"])
+            z = np.maximum.reduceat(z, starts) - frame_penalty(state["rows_per_item"])
+        return z
+
+    if stats is not None:
+        zi_all = image_z(row_scores)
+        zi_all = soft_and(text, zi_all, lambda t: _component_scores(t, text_model, matrix), image_z)
     elif zl_all is not None:
         zi_all = zl_all                                 # bez banky pojmů (mock model): jen knihovna
     else:
@@ -433,6 +439,58 @@ def rank_semantic(text, pool_ids, photo_embeddings_dict, face_ids=None):
         key = key + SEARCH_FACE_BONUS * np.array([media_ids[i] in face_ids for i in rows], dtype=np.float32)
     confident, possible = tier_scores(zi, zl, key, n)
     return [media_ids[rows[i]] for i in confident], [media_ids[rows[i]] for i in possible]
+
+
+# ── Sprint 3: měkké AND přes složky dotazu ──
+# „západ slunce oheň smích“ jako jeden vektor = průměr pojmů: fotka silná v jednom (jen oheň)
+# předběhne fotku, kde je všechno trochu. Dotaz se proto rozloží na slova (bez výplňových),
+# každé se ohodnotí samostatně a z se smíchá s měkkým minimem přes složky (log-sum-exp):
+# vyhrává fotka, která splní všechny. Složka, kterou knihovna vůbec nezná (max z < SHOW –
+# „smích“ není vidět), se z AND vynechá, jinak by shodila celý dotaz.
+# Naměřeno (eval/eval_softand.py, 30 dvojic pojmů ze zlaté sady): váha 0 -> P@k 0,734, 0,3 -> 0,734,
+# 0,5 -> 0,701, 0,7 -> 0,681 (τ 0,25–2 stejně); jednoslovné dotazy beze změny. Celý dotaz jako jeden
+# vektor CLIP zvládá dvojice pojmů sám -> VYPNUTO, mechanismus zůstává pro větší knihovny.
+SOFTAND_WEIGHT = 0.0
+SOFTAND_TAU = 0.5
+SOFTAND_MAX_PARTS = 4
+SOFTAND_FILLER = {"and", "with", "or", "a", "i", "s", "se", "u", "v", "ve", "na", "z", "ze", "the", "of", "in", "at",
+                  "do", "pod", "nad", "pred", "za", "k", "ke", "pri", "po", "od"}
+
+
+def query_parts(text):
+    """Obsahová slova dotazu (2–4), jinak [] – jednoslovný dotaz se nerozkládá."""
+    from search_engine import fold
+    words = [w for w in str(text or "").replace(",", " ").replace("+", " ").split()
+             if fold(w) not in SOFTAND_FILLER and len(fold(w)) > 1]
+    return words if 2 <= len(words) <= SOFTAND_MAX_PARTS else []
+
+
+def _component_scores(word, text_model, matrix):
+    v = query_vector(word, text_model)
+    if v is None or v.size != matrix.shape[1]:
+        return None
+    return matrix @ v
+
+
+def soft_and(text, zi_whole, scores_for, image_z, weight=None):
+    """Smíchá z celého dotazu s měkkým minimem z jeho složek (viz výše). Bez složek beze změny."""
+    weight = SOFTAND_WEIGHT if weight is None else weight
+    parts = query_parts(text) if weight > 0 else []
+    if not parts:
+        return zi_whole
+    zs = []
+    for w in parts:
+        rs = scores_for(w)
+        if rs is None:
+            continue
+        z = image_z(rs)
+        if float(np.max(z)) >= SEARCH_Z_SHOW:            # pojem v knihovně je – patří do AND
+            zs.append(z)
+    if len(zs) < 2:
+        return zi_whole
+    Z = np.stack(zs).astype(np.float64)
+    soft_min = -SOFTAND_TAU * np.log(np.mean(np.exp(-Z / SOFTAND_TAU), axis=0))
+    return ((1 - weight) * zi_whole + weight * soft_min).astype(np.float32)
 
 
 def frame_penalty(rows_per_item):
