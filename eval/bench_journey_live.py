@@ -95,7 +95,7 @@ def build_trip(event_id):
         conn.close()
 
 
-def open_page(size):
+def open_page(size, html="map_vault.html"):
     from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
     profile = QWebEngineProfile("kairos_bench")
     profile.setPersistentStoragePath(PROFILE_DIR)
@@ -112,7 +112,7 @@ def open_page(size):
     loop = QEventLoop()
     page.loadFinished.connect(lambda ok: loop.quit())
     QTimer.singleShot(15000, loop.quit)
-    page.load(QUrl.fromLocalFile(os.path.join(ROOT, "map_vault.html")))
+    page.load(QUrl.fromLocalFile(os.path.join(ROOT, html)))
     loop.exec()
     return profile, interceptor, page, view
 
@@ -168,6 +168,7 @@ def main_():
     ap.add_argument("--timeout", type=float, default=240)
     ap.add_argument("--inject", default="", help="JS před přehráním (pokusy: vypnout vrstvu, změnit parametr)")
     ap.add_argument("--report", default="", help="JS výraz vypsaný po každém přehrání (diagnostika)")
+    ap.add_argument("--html", default="map_vault.html", help="stránka ve složce projektu (srovnání verzí)")
     args = ap.parse_args()
     trip = build_trip(args.event)
     if trip is None:
@@ -179,7 +180,7 @@ def main_():
     if not args.warm_only:
         shutil.rmtree(PROFILE_DIR, ignore_errors=True)
     w, h = (int(x) for x in args.size.split("x"))
-    profile, interceptor, page, view = open_page((w, h))
+    profile, interceptor, page, view = open_page((w, h), args.html)
     for _ in range(100):
         if js(page, "typeof styleReady !== 'undefined' && styleReady === true && getBaseLayerEngine() === 'vector'"):
             break

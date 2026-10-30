@@ -369,12 +369,16 @@ class TestJourneyDirector(unittest.TestCase):
         self.assertLess(r[4], 11, "uprostřed letu výš (oblouk), ne přímka ve stejné výšce")
         self.assertTrue(r[5])
 
-    def test_steering_is_frame_rate_independent(self):
-        h = self.js("(function () { function sim(dt) { director.heading = 0;"
-                    " for (var t = 0; t < 0.6; t += dt) steer(90, dt); return director.heading; }"
-                    " return [sim(1 / 60), sim(1 / 120)]; })()")
-        self.assertAlmostEqual(h[0], h[1], delta=1.0, msg="stejná rychlost natáčení při 60 i 120 Hz")
-        self.assertGreater(h[0], 30)
+    def test_camera_is_a_pure_function_of_time(self):
+        # Cesta 3.0 (C1): natáčení podle snímků (steer) nahradila předem spočtená C2 křivka ->
+        # stejná póza při 60 i 120 Hz i po skoku zpět
+        self.assertTrue(self.js(f"playJourney({json.dumps(TRIP)})"))
+        self.js("journeyPause(); 0")
+        a = self.js("getFilmPose(film.total * 0.4)")
+        self.js("journeySeek(film.total * 0.9); journeySeek(film.total * 0.1); journeyPause(); 0")
+        b = self.js("getFilmPose(film.total * 0.4)")
+        self.assertEqual(a, b)
+        self.assertEqual(self.js("typeof steer"), "undefined")
 
     def test_pause_freezes_the_timeline(self):
         self.assertTrue(self.js(f"playJourney({json.dumps(TRIP)})"))
@@ -398,7 +402,9 @@ class TestJourneyDirector(unittest.TestCase):
         self.assertEqual(self.js("journeyState().index"), 1)
         self.assertTrue(self.js("!!map.getLayer('j-cur')"))
         grad = self.js("map.getPaintProperty('j-cur', 'line-gradient')")
-        self.assertEqual(grad[0], "step", "projetá část = přechod barvy na line-progress, ne setData")
+        # Cesta 3.0 (C4): kometa = plynulý přechod (ocas -> hlava) na line-progress, pořád bez setData
+        self.assertIn(grad[0], ("step", "interpolate"), "projetá část = přechod barvy na line-progress, ne setData")
+        self.assertIn(["line-progress"], grad)
         self.assertTrue(self.until("journey.curFrac > 0.05", 6000), "čára roste s kamerou")
         self.js("HOLD_MS = 1700; POP_MS = 700; DROP_MS = 760; window.endJourney(true); 0")
 

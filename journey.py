@@ -102,7 +102,46 @@ def best_shot(photos):
 
 
 def _public(p):
-    return {"id": p["id"], "thumb": p["thumb"], "date": p["date"]}
+    out = {"id": p["id"], "thumb": p["thumb"], "date": p["date"]}
+    if p.get("focus"):
+        out["focus"] = p["focus"]
+    return out
+
+
+def face_focus(boxes):
+    """Cesta 3.0 (C5): kam má Ken Burns mířit – střed tváří vážený plochou (větší tvář = blíž
+    a důležitější), v rozměrech fotky 0–1. boxes = [(x, y, w, h)] normalizované; None = bez tváří."""
+    total = sx = sy = 0.0
+    for x, y, w, h in boxes:
+        try:
+            x, y, w, h = float(x), float(y), float(w), float(h)
+        except (TypeError, ValueError):
+            continue
+        if not (w > 0 and h > 0) or not (-0.1 <= x <= 1.1 and -0.1 <= y <= 1.1):
+            continue
+        a = w * h
+        total += a
+        sx += a * (x + w / 2)
+        sy += a * (y + h / 2)
+    if total <= 0:
+        return None
+    return [round(min(1.0, max(0.0, sx / total)), 3), round(min(1.0, max(0.0, sy / total)), 3)]
+
+
+def _event_focus(conn, event_id):
+    """{media_id: [fx, fy]} pro fotky události s rozpoznanými tvářemi (jeden dotaz)."""
+    try:
+        rows = conn.execute("""
+            SELECT f.media_id, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h
+            FROM face_instances f JOIN media_items m ON m.id = f.media_id
+            WHERE m.event_id = ? AND f.bbox_w IS NOT NULL
+        """, (event_id,)).fetchall()
+    except Exception:
+        return {}                   # starší / testovací DB bez tabulky tváří
+    boxes = {}
+    for mid, x, y, w, h in rows:
+        boxes.setdefault(int(mid), []).append((x, y, w, h))
+    return {mid: f for mid, f in ((m, face_focus(b)) for m, b in boxes.items()) if f}
 
 
 def _hero(p):
@@ -155,6 +194,7 @@ def _geo_photos(conn, event_id, thumb_url, image_url=None):
           AND {visible_media_sql('m')}
         LIMIT {MAX_JOURNEY_ROWS}
     """, (event_id,)).fetchall()
+    focus = _event_focus(conn, event_id)
     photos = []
     for mid, lat, lon, city, date, thumb, phash, sharp, fav, mtype, path in rows:
         ll = _valid(lat, lon)
@@ -163,7 +203,8 @@ def _geo_photos(conn, event_id, thumb_url, image_url=None):
         photos.append({"id": int(mid), "lat": ll[0], "lon": ll[1], "city": city or "",
                        "date": iso_minute(date), "thumb": thumb_url(thumb),
                        "image": image_url(path) if image_url else "",
-                       "phash": phash, "sharpness": sharp or 0.0, "fav": bool(fav), "type": mtype})
+                       "phash": phash, "sharpness": sharp or 0.0, "fav": bool(fav), "type": mtype,
+                       "focus": focus.get(int(mid))})
     # řadit až po převodu: EXIF „2023:07:06“ by v SQL skončilo za ISO „2023-07-06“
     photos.sort(key=lambda p: (p["date"], p["id"]))
     return photos
