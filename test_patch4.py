@@ -413,7 +413,9 @@ class TestImportCancel(unittest.TestCase):
     def test_close_event_does_not_call_cancel(self):
         src = inspect.getsource(MainWindow.closeEvent)
         self.assertNotIn(".cancel(", src)
-        self.assertIn("_scanner.stop()", src)
+        # Sprint R: sken a démon se zastavují ve společné smyčce (stop + wait, jinak úschova)
+        self.assertRegex(src, r"for thread in \([^)]*self\._scanner[^)]*\):")
+        self.assertIn("thread.stop()", src)
 
 
 if __name__ == "__main__":

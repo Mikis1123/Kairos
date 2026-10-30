@@ -1,54 +1,60 @@
+"""Zarovnání obličejů a modely OpenCV (YuNet / SFace) – samostatné, deterministické testy.
+
+Dříve to byl ruční skript, který při importu stahoval model a četl pevně zadanou
+miniaturu .cache/thumbnails/thumb_15.jpg (v čisté instalaci neexistuje → pytest padal
+už při sběru testů). Teď nic nestahuje a nepotřebuje knihovnu fotek.
+"""
 import os
-import urllib.request
+import unittest
+
 import cv2
 import numpy as np
 
-MODEL_DIR = os.path.join(os.getcwd(), "models")
-os.makedirs(MODEL_DIR, exist_ok=True)
+import face_engine
 
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 YUNET_PATH = os.path.join(MODEL_DIR, "face_detection_yunet_2023mar.onnx")
 SFACE_PATH = os.path.join(MODEL_DIR, "face_recognition_sface_2021dec.onnx")
-SFACE_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 
-# 1. Stažení modelu pro biometrický otisk (SFace ~ 1.2 MB)
-if not os.path.exists(SFACE_PATH):
-    print("Stahuji model SFace pro biometrii (cca 1.2 MB)...")
-    urllib.request.urlretrieve(SFACE_URL, SFACE_PATH)
-    print("Model SFace stažen.")
 
-# 2. Inicializace modelů
-recognizer = cv2.FaceRecognizerSF.create(model=SFACE_PATH, config="")
+class TestAlignment(unittest.TestCase):
+    def test_umeyama_recovers_known_similarity(self):
+        rng = np.random.default_rng(7)
+        src = rng.uniform(0, 100, (5, 2))
+        angle, scale, t = 0.3, 1.7, np.array([12.0, -4.0])
+        R = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        dst = (scale * (R @ src.T)).T + t
+        M = face_engine.umeyama_similarity(src, dst)
+        np.testing.assert_allclose(M[:, :2], scale * R, atol=1e-9)
+        np.testing.assert_allclose(M[:, 2], t, atol=1e-9)
 
-# 3. Načtení fotky s tváří
-img_path = os.path.join(os.getcwd(), ".cache", "thumbnails", "thumb_15.jpg")
-img = cv2.imread(img_path)
-h, w, _ = img.shape
+    def test_arcface_landmarks_map_to_identity(self):
+        M = face_engine.estimate_norm(face_engine.ARCFACE_DST, 112)
+        np.testing.assert_allclose(M, [[1, 0, 0], [0, 1, 0]], atol=1e-9)
 
-detector = cv2.FaceDetectorYN.create(
-    model=YUNET_PATH,
-    config="",
-    input_size=(w, h),
-    score_threshold=0.55,
-    nms_threshold=0.3
-)
+    def test_norm_crop_shape(self):
+        img = np.full((300, 400, 3), 128, np.uint8)
+        crop = face_engine.norm_crop(img, face_engine.ARCFACE_DST * 2 + 50, 112)
+        self.assertEqual(crop.shape, (112, 112, 3))
 
-_, faces = detector.detect(img)
 
-if faces is not None and len(faces) > 0:
-    face = faces[0]
-    
-    # 4. Afinní zarovnání (Face Alignment podle očí a úst)
-    aligned_face = recognizer.alignCrop(img, face)
-    cv2.imwrite("test_face_aligned.jpg", aligned_face)
-    print("-> Zarovnaná tvář podle očí uložena: 'test_face_aligned.jpg'")
+@unittest.skipUnless(os.path.exists(YUNET_PATH) and os.path.exists(SFACE_PATH), "chybí modely v models/")
+class TestOpenCvModels(unittest.TestCase):
+    def test_detector_runs_on_blank_image(self):
+        img = np.zeros((240, 320, 3), np.uint8)
+        det = cv2.FaceDetectorYN.create(YUNET_PATH, "", (320, 240), 0.55, 0.3)
+        _, faces = det.detect(img)
+        self.assertTrue(faces is None or len(faces) == 0)
 
-    # 5. Extrakce biometrického vektoru (128 čísel)
-    feature = recognizer.feature(aligned_face)
-    feature_norm = feature / np.linalg.norm(feature)
-    
-    print(f"Biometrický vektor úspěšně vytvořen! Rozměr: {feature.shape}")
-    print(f"Prvních 5 hodnot otisku: {feature_norm[0][:5].round(4)}")
+    def test_sface_feature_is_128d_and_self_match_is_one(self):
+        rec = cv2.FaceRecognizerSF.create(SFACE_PATH, "")
+        rng = np.random.default_rng(3)
+        crop = rng.integers(0, 255, (112, 112, 3), dtype=np.uint8)
+        feat = rec.feature(crop)
+        self.assertEqual(feat.shape, (1, 128))
+        score = rec.match(feat, feat, cv2.FaceRecognizerSF_FR_COSINE)
+        self.assertAlmostEqual(score, 1.0, places=4)
 
-    # 6. Test kosínové podobnosti (tvář sama se sebou musí mít shodu 1.00)
-    score = recognizer.match(aligned_face, aligned_face, cv2.FaceRecognizerSF_FR_COSINE)
-    print(f"Ověření matematické shody: {score:.4f} (1.00 = identický člověk)")
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

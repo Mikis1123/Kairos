@@ -41,14 +41,62 @@ PROFILE_DIR = os.path.join(tempfile.gettempdir(), "kairos_bench_profile")
 
 # Měřák vložený do stránky: _render, snímky pohybu bez načtených dlaždic, čekání v cíli
 PROBE = r"""
-window.__b = {ren: [], moving: 0, holes: 0, base: 0, src: {}};
+window.__b = {ren: [], moving: 0, holes: 0, base: 0, src: {}, vecVoidFrames: 0, voidFrames: 0,
+              vecVoidArea: 0, voidArea: 0};
 (function () {
+  // Sprint 1 – skutečná díra: ideální dlaždice vektorového zdroje (ty, které MapLibre pro záběr
+  // chce), pro kterou není načtená ona, předek ani potomek = na obrazovce není nic z podkladu.
+  // „voidArea“ navíc odečte místa, která kryje načtený rastrový podklad (underlay).
+  var tms = map.style.tileManagers || map.style.sourceCaches || {};
+  Object.keys(tms).forEach(function (id) {
+    var tm = tms[id];
+    if (!tm || tm.__hooked || typeof tm._updateRetainedTiles !== 'function') return;
+    tm.__hooked = true;
+    var o = tm._updateRetainedTiles.bind(tm);
+    tm._updateRetainedTiles = function (ideal, z) { var ret = o(ideal, z); tm.__ideal = ideal; tm.__ret = ret; return ret; };
+  });
+  function loadedTiles(tm) {
+    var out = [];
+    Object.keys(tm.__ret || {}).forEach(function (k) {
+      var t = tm.getTileByID ? tm.getTileByID(k) : (tm._inViewTiles && tm._inViewTiles.getTileById(k));
+      if (t && t.hasData && t.hasData()) out.push(t.tileID);
+    });
+    return out;
+  }
+  function contains(a, b) {           // a (předek nebo stejná) obsahuje b
+    var A = a.canonical, B = b.canonical;
+    if (a.wrap !== b.wrap || A.z > B.z) return false;
+    var d = B.z - A.z;
+    return (B.x >> d) === A.x && (B.y >> d) === A.y;
+  }
+  function voidStats() {
+    var vec = null, under = tms.underlay;
+    Object.keys(tms).forEach(function (id) { if (!vec && tms[id].getSource && tms[id].getSource().type === 'vector') vec = tms[id]; });
+    if (!vec || !vec.__ideal || !vec.__ideal.length) return null;
+    var have = loadedTiles(vec), lay = under && under.used !== false ? loadedTiles(under) : [];
+    var vecMiss = 0, miss = 0;
+    vec.__ideal.forEach(function (t) {
+      if (have.some(function (h) { return contains(h, t) || contains(t, h); })) return;
+      vecMiss++;
+      if (!lay.some(function (h) { return contains(h, t); })) miss++;
+    });
+    return { n: vec.__ideal.length, vecMiss: vecMiss, miss: miss };
+  }
   var orig = map._render.bind(map);
   map._render = function (t) {
     var a = performance.now(), r = orig(t);
     __b.ren.push(performance.now() - a);
     if (director.directing && journey.active && !journey.paused) {
       __b.moving++;
+      try {
+        var v = voidStats();
+        if (v) {
+          if (v.vecMiss) __b.vecVoidFrames++;
+          if (v.miss) __b.voidFrames++;
+          __b.vecVoidArea += v.vecMiss / v.n;
+          __b.voidArea += v.miss / v.n;
+        }
+      } catch (e) { __b.err = String(e); }
       try {
         if (!map.areTilesLoaded()) {
           __b.holes++;
@@ -181,12 +229,17 @@ def play(page, trip, label, timeout_s, tick=None):
     arrivals = js(page, "window.__arrivals || []") or []
     js(page, "window.endJourney(true); 0")
     holes = probe["holes"] / max(1, probe["moving"])
+    mv = max(1, probe["moving"])
     ren = probe["ren"]
     line = (f"{label:6s} {wall:5.1f} s  snímky {stats.get('frames', 0):5d}  p50 {stats.get('p50', 0):5.1f}  "
             f"p95 {stats.get('p95', 0):5.1f}  p99 {stats.get('p99', 0):5.1f}  vynechané {stats.get('dropped', 0):4d} "
             f"({100 * stats.get('dropped', 0) / max(1, stats.get('frames', 1)):4.1f} %)  "
             f"render p50 {pct(ren, 50):5.1f} p95 {pct(ren, 95):5.1f}  díry {100 * holes:4.1f} %  "
-            f"podklad {100 * probe.get('base', 0) / max(1, probe['moving']):4.1f} %")
+            f"podklad {100 * probe.get('base', 0) / max(1, probe['moving']):4.1f} %  "
+            f"DÍRY vektor {100 * probe.get('vecVoidFrames', 0) / mv:4.1f} % snímků / {100 * probe.get('vecVoidArea', 0) / mv:4.2f} % plochy, "
+            f"s podkladem {100 * probe.get('voidFrames', 0) / mv:4.1f} % / {100 * probe.get('voidArea', 0) / mv:4.2f} %")
+    if probe.get("err"):
+        line += f"  [chyba měřáku: {probe['err']}]"
     if probe.get("src"):
         line += "  zdroje děr " + ", ".join(f"{k} {100 * v / max(1, probe['moving']):.1f} %"
                                            for k, v in sorted(probe["src"].items(), key=lambda kv: -kv[1]))

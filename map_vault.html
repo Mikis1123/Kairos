@@ -585,6 +585,32 @@
       layout: { visibility: 'none' } });
   }
 
+  // ── Sprint 1: rastrový podklad pod vektory (nulové „díry“) ──
+  // Zbylé díry Cesty (~5 %) nejsou síť, ale dekódování vektorových dlaždic ve workerech při
+  // přechodu úrovní zoomu: dokud dlaždice ani její předek nejsou hotové, byla vidět holá barva
+  // pozadí. Pod vektorové vrstvy jde měkký předkreslený rastr (Esri Light Gray Base, z0–9,
+  // MapLibre ho nad z9 jen zvětší – rastr se nedekóduje ve workeru a pokrytí obrazovky je pár
+  // dlaždic). Průhlednost je spočtená tak, aby pevnina splynula s pozadím Liberty (#F8F4F0 vs
+  // šedá 239: rozdíl ≤ 5 úrovní), ale voda a pobřeží byly v díře vidět jako jemný náhled.
+  // Mimo film mizí od z10 (pobřeží z9 by v detailu prosvítalo), ve filmu drží ve všech zoomech.
+  var UNDERLAY_MAX_ZOOM = 9, UNDERLAY_OPACITY = 0.55;
+  var UNDERLAY_TILES = ESRI + 'Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}';
+  var UNDERLAY_REST = ['interpolate', ['linear'], ['zoom'], 10, UNDERLAY_OPACITY, 12.5, 0];
+  function addUnderlay(style) {
+    if (PERF.map_underlay === false) return;
+    // tileSize 512 u 256px obrázků: 4× méně dlaždic na obrazovce (kreslení i dekódování),
+    // obraz je o úroveň měkčí – pro náhled v díře přesně to, co má být
+    style.sources.underlay = { type: 'raster', tiles: [UNDERLAY_TILES], tileSize: 512, maxzoom: UNDERLAY_MAX_ZOOM,
+                               attribution: 'Podklad &copy; Esri, HERE, Garmin, ' + OSM };
+    var at = style.layers.findIndex(function (l) { return l.type !== 'background' && l.type !== 'raster'; });
+    style.layers.splice(at < 0 ? style.layers.length : at, 0, {
+      id: 'underlay', type: 'raster', source: 'underlay',
+      paint: { 'raster-opacity': UNDERLAY_REST, 'raster-fade-duration': 0, 'raster-resampling': 'linear' } });
+  }
+  function underlayFilm(on) {         // konstantní paint = bez přenačtení zdroje
+    if (map && map.getLayer('underlay')) map.setPaintProperty('underlay', 'raster-opacity', on ? UNDERLAY_OPACITY : UNDERLAY_REST);
+  }
+
   // ── Zeměkoule, atmosféra, světlo ────────────────────────────────────────────
   // Obloha v zastávkách Cesty podle výšky slunce (°); mezi klíči se plynule míchá
   var SKY_KEYS = [
@@ -690,6 +716,7 @@
     var s = vector ? window.buildVectorStyle(name) : rasterStyle(name);
     if (vector && name !== 'satellite') {
       Object.keys(s.sources).forEach(function (k) { s.sources[k].attribution = OFM_ATTRIBUTION; });
+      addUnderlay(s);
       addHillshade(s);
       addGlobeDark(s);
     }
@@ -861,7 +888,7 @@
     syncTerrain();
     addPinLayers();
     render();
-    if (journey.active) { addRouteLayers(); journey.hidden = []; filmLook(true); }
+    if (journey.active) { addRouteLayers(); journey.hidden = []; journey.faded = {}; reliefSpec = null; filmLook(true); }
   }
 
   // Cesta 3.0 (C7): MapLibre 5 tu běžel s JEDNÍM workerem (getWorkerCount() = 1 na 16 vláknech) –
@@ -2531,13 +2558,37 @@
   function smoothCamera(f) {
     var cam = {};
     CAM_KEYS.forEach(function (key) {
-      cam[key] = smoothChannel(f.camRaw.map(function (s) { return s[key]; }), CAM_TAU[key]);
+      var raw = f.camRaw.map(function (s) { return s[key]; });
+      if (key === 'z') raw = detentZoom(raw);     // před vyhlazením: křivka zůstane C2
+      cam[key] = smoothChannel(raw, CAM_TAU[key]);
     });
     // začátek a konec drží přesně: první snímek = kamera před filmem (žádný skok), konec = přehled
     var first = f.camRaw[0], last = f.camRaw[f.camRaw.length - 1];
     CAM_KEYS.forEach(function (key) { cam[key][0] = first[key]; cam[key][cam[key].length - 1] = last[key]; });
     f.cam = cam;
   }
+  // ── Sprint 1: zpomalení na hranicích úrovní dlaždic ──
+  // Vektorové dlaždice (512 px) mění úroveň, když zoom kamery překročí celé číslo; v tu chvíli
+  // se celé zorné pole musí znovu dekódovat ve workerech (zbylé díry Cesty 3.0). Zoom za letu
+  // se proto přemapuje monotónní funkcí z - A·sin(2πz)/2π: na hranici úrovně se zoom mění
+  // (1 - A)× pomaleji, mezi hranicemi o tolik rychleji – průměrná rychlost a cíle se nemění
+  // (f(z) = z v celých i polovičních hodnotách). Váha podle rychlosti zoomu: v okamžiku
+  // (kamera stojí) je zoom přesně podle plánu, rampa je hladká (C2 zůstane).
+  // Naměřeno (bench_journey_live, výlet 21, teplá + restart): díry vektorů 2,5 % s i bez zpomalení,
+  // vynechané snímky beze změny -> výchozí VYPNUTO (mění tempo kamery bez přínosu). Rastrový
+  // podklad díry zakrývá sám. Hodnota 0.6 = zapnuto (pokusy, slabší stroje).
+  var ZOOM_DETENT = 0, ZOOM_DETENT_ON = 0.6, ZOOM_DETENT_FULL = 0.5;   // A; rychlost zoomu pro plnou váhu
+  function detentZoom(z) {
+    var n = z.length, out = z.slice(), TWO_PI = 2 * Math.PI;
+    if (!ZOOM_DETENT || n < 3) return out;
+    for (var k = 1; k < n - 1; k++) {
+      var rate = Math.abs(z[k + 1] - z[k - 1]) / (2 * CAM_DT);
+      var w = smoothstep(rate / ZOOM_DETENT_FULL);
+      out[k] = z[k] - w * ZOOM_DETENT * Math.sin(TWO_PI * z[k]) / TWO_PI;
+    }
+    return out;
+  }
+  window.detentZoom = detentZoom;
   function resampleCamera(f, t0, t1) {   // úsek se změnil (trasa po cestách dorazila později)
     if (!f.camRaw) return;
     var raw = f.camRaw, k0 = Math.max(1, Math.floor(t0 / CAM_DT)), k1 = Math.min(raw.length - 1, Math.ceil(t1 / CAM_DT));
@@ -3033,20 +3084,47 @@
   window.bakeFilm = bakeFilm;
 
   // ── Mapa ve filmu: bez terénu, bez šumu popisků, výchozí LOD ───────────────
+  // Sprint 1: žádné přenačtení zdroje při startu filmu. setLayoutProperty (visibility) volá
+  // ve MapLibre Style._updateLayer -> „reload“ CELÉHO zdroje vrstvy: každá vektorová dlaždice
+  // v paměti se znovu parsovala ve workerech přesně v úvodu filmu, kdy kamera nejvíc potřebuje
+  // nové dlaždice (naměřený zbytek „děr“). Konstantní setPaintProperty zdroj nepřenačítá a
+  // vrstvy s nulovou průhledností MapLibre nekreslí (fillExtrusion / text-opacity === 0).
+  // Reliéf: removeLayer zdroj nepřenačítá; viditelnost relief-film přenačte jen prázdný dem-film.
+  var FILM_FADE_PROPS = { symbol: ['text-opacity', 'icon-opacity'], 'fill-extrusion': ['fill-extrusion-opacity'] };
+  var reliefSpec = null;              // vrstva 'relief' sundaná na dobu filmu (vrací se na konci)
+  function dataDriven(v) {
+    return Array.isArray(v) && JSON.stringify(v).indexOf('["get"') >= 0;
+  }
   function filmLook(on) {
     if (!map || !styleReady) return;
     try {
       if (on) { journey.hadTerrain = !!map.getTerrain(); if (journey.hadTerrain) map.setTerrain(null); }
-      (map.getStyle().layers || []).forEach(function (l) {
-        var hide = l.type === 'fill-extrusion' || (l.type === 'symbol' && FILM_HIDDEN_LAYERS.test(l.id) && l.id.indexOf('pins') !== 0);
-        if (!hide) return;
-        if (on) {
-          if (map.getLayoutProperty(l.id, 'visibility') === 'none') return;
-          (journey.hidden = journey.hidden || []).push(l.id);
-          map.setLayoutProperty(l.id, 'visibility', 'none');
-        }
-      });
-      if (!on) {
+      if (on) {
+        journey.faded = journey.faded || {};
+        (map.getStyle().layers || []).forEach(function (l) {
+          var hide = l.type === 'fill-extrusion' || (l.type === 'symbol' && FILM_HIDDEN_LAYERS.test(l.id) && l.id.indexOf('pins') !== 0);
+          if (!hide || journey.faded[l.id] || map.getLayoutProperty(l.id, 'visibility') === 'none') return;
+          var saved = {};
+          FILM_FADE_PROPS[l.type].forEach(function (k) {
+            var v = map.getPaintProperty(l.id, k);
+            if (dataDriven(v)) { saved = null; return; }
+            if (saved) saved[k] = v;
+          });
+          if (saved) {
+            journey.faded[l.id] = saved;
+            Object.keys(saved).forEach(function (k) { map.setPaintProperty(l.id, k, 0); });
+          } else {                     // výraz z vlastností prvku – průhlednost nejde přepsat konstantou
+            (journey.hidden = journey.hidden || []).push(l.id);
+            map.setLayoutProperty(l.id, 'visibility', 'none');
+          }
+        });
+      } else {
+        Object.keys(journey.faded || {}).forEach(function (id) {
+          if (!map.getLayer(id)) return;
+          var saved = journey.faded[id];
+          Object.keys(saved).forEach(function (k) { map.setPaintProperty(id, k, saved[k]); });
+        });
+        journey.faded = {};
         (journey.hidden || []).forEach(function (id) { if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', 'visible'); });
         journey.hidden = [];
       }
@@ -3055,13 +3133,27 @@
         else applyTileLod();
       }
       // C7b: reliéf z výšek ≤ z11 (relief-film), mimo film zase plné rozlišení
-      if (map.getLayer('relief-film') && PERF.map_hillshade !== false) {
-        map.setLayoutProperty('relief', 'visibility', on ? 'none' : 'visible');
-        map.setLayoutProperty('relief-film', 'visibility', on ? 'visible' : 'none');
-      }
+      if (map.getLayer('relief-film') && PERF.map_hillshade !== false) swapRelief(on);
+      underlayFilm(on);
       if (!on) reliefLight(null);
     } catch (e) { /* styl se právě mění – onStyleLoad zavolá znovu */ }
   }
+  function swapRelief(film) {
+    if (film && map.getLayer('relief')) {
+      var l = map.getStyle().layers.filter(function (x) { return x.id === 'relief'; })[0];
+      reliefSpec = l ? clone(l) : null;
+      map.removeLayer('relief');                          // bez přenačtení dem-shade
+      map.setLayoutProperty('relief-film', 'visibility', 'visible');
+    } else if (!film && reliefSpec && !map.getLayer('relief')) {
+      map.setLayoutProperty('relief-film', 'visibility', 'none');
+      reliefSpec.layout = Object.assign({}, reliefSpec.layout, { visibility: 'visible' });
+      map.addLayer(reliefSpec, 'relief-film');
+      reliefSpec = null;
+    } else if (!film) {
+      map.setLayoutProperty('relief-film', 'visibility', 'none');
+    }
+  }
+  window.filmFaded = function () { return Object.keys(journey.faded || {}); };
 
   // ── C4: reliéf nasvícený skutečným sluncem zastávky ──
   // Stínování krajiny svítí odkud svítilo slunce v čase fotek (azimut), barvy podle výšky slunce:

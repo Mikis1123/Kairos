@@ -197,7 +197,8 @@ class TestCesta3(unittest.TestCase):
         self.assertEqual(self.js("map.getSource('dem-film').maxzoom"), 11)
         self.play()
         self.assertEqual(self.js("map.getLayoutProperty('relief-film', 'visibility')"), "visible")
-        self.assertEqual(self.js("map.getLayoutProperty('relief', 'visibility')"), "none")
+        # Sprint 1: 'relief' se na film sundá (removeLayer nepřenačítá dem-shade), na konci vrátí
+        self.assertFalse(self.js("!!map.getLayer('relief')"))
         self.js("window.endJourney(true); 0")
         self.assertEqual(self.js("map.getLayoutProperty('relief', 'visibility')"), "visible")
         self.assertEqual(self.js("map.getLayoutProperty('relief-film', 'visibility')"), "none")
