@@ -131,13 +131,44 @@ def migrate_legacy_embeddings():
         conn.close()
 
 
+# Sprint 3: modely hledání v ONNX Runtime (ai_onnx, models/clip_b32_*.onnx z tools/export_onnx.py) –
+# aplikace bez torch (~1 GB paměti a ~2 GB balíčku méně). sentence-transformers zůstává jen jako
+# záloha vývojového stroje bez exportovaných modelů (KAIROS_TORCH=1 ho vynutí pro srovnání).
+def onnx_models_dir():
+    import paths
+    return os.path.join(paths.RESOURCE_DIR, "models")
+
+
+def _use_onnx():
+    if os.environ.get("KAIROS_TORCH") == "1":
+        return False
+    import ai_onnx
+    return ai_onnx.available(onnx_models_dir())
+
+
+def _quantized_text():
+    """int8 textový model (-385 MB, golden set P@10 0,844 -> 0,834) jen na nejslabším profilu."""
+    env = os.environ.get("KAIROS_TEXT_MODEL")
+    if env in ("int8", "fp32"):
+        return env == "int8"
+    try:
+        import perf_profile
+        return perf_profile.current().tier == "baseline"
+    except Exception:
+        return False
+
+
 def get_text_model():
     """Textový model (vyhledávání) - načítá se samostatně a jen jednou."""
     global _text_model
     with _model_lock:
         if _text_model is None:
-            from sentence_transformers import SentenceTransformer
-            _text_model = SentenceTransformer(TEXT_MODEL_NAME)
+            if _use_onnx():
+                import ai_onnx
+                _text_model = ai_onnx.TextEncoder(onnx_models_dir(), quantized=_quantized_text())
+            else:
+                from sentence_transformers import SentenceTransformer
+                _text_model = SentenceTransformer(TEXT_MODEL_NAME)
         return _text_model
 
 
@@ -146,8 +177,13 @@ def get_image_model():
     global _image_model
     with _model_lock:
         if _image_model is None:
-            from sentence_transformers import SentenceTransformer
-            _image_model = SentenceTransformer(IMAGE_MODEL_NAME)
+            if _use_onnx():
+                import ai_onnx
+                _image_model = ai_onnx.ImageEncoder(onnx_models_dir())
+                print(f"[AI] obrazový model ONNX: {_image_model.provider}")
+            else:
+                from sentence_transformers import SentenceTransformer
+                _image_model = SentenceTransformer(IMAGE_MODEL_NAME)
         return _image_model
 
 

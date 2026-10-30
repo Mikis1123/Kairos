@@ -2073,7 +2073,7 @@ SEARCH_WARMUP_DELAY_MS = 5000   # textový model hledání se načte v klidu po 
 
 
 class SearchModelWarmup(QThread):
-    """Načte textový model (sentence-transformers, ~5 s) dřív, než ho uživatel potřebuje."""
+    """Načte textový model (ONNX, ~1 s; dřív sentence-transformers ~15 s) dřív, než ho uživatel potřebuje."""
 
     def run(self):
         try:

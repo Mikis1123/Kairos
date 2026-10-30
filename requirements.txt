@@ -1,3 +1,11 @@
 PyQt6>=6.6.0
 pillow>=10.0.0
-pillow-heif>=0.14.0
+pillow-heif>=0.14.0numpy>=2.0
+opencv-python>=4.10
+# Sprint 3: hledání a tváře v ONNX Runtime s DirectML (bez torch); tokenizer bez transformers
+onnxruntime-directml>=1.24
+tokenizers>=0.20
+insightface>=0.7
+reverse_geocoder
+# jen vývoj: tools/export_onnx.py (převod modelů) – aplikace je nepotřebuje
+# torch, sentence-transformers

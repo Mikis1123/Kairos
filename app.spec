@@ -45,6 +45,12 @@ if os.path.isdir(os.path.join('vendor', 'maplibre')):
 if os.path.isdir(os.path.join('assets', 'music')):
     datas.append((os.path.join('assets', 'music'), os.path.join('assets', 'music')))
 
+# Sprint 3: modely hledání v ONNX (tools/export_onnx.py) – ai_engine.onnx_models_dir() = RESOURCE_DIR/models
+for f in ('clip_b32_vision.onnx', 'clip_b32_text_multi.onnx', 'clip_b32_text_multi_int8.onnx',
+          'clip_b32_text_tokenizer.json'):
+    if os.path.exists(os.path.join('models', f)):
+        datas.append((os.path.join('models', f), 'models'))
+
 # Kairos dávka 5: ikona .exe (16–256 px) – vygeneruje `python brand.py` do assets/.
 # Okno a hlavní panel si ikonu kreslí za běhu (brand.app_icon), do balíčku se nic nepřidává.
 APP_ICON = os.path.join('assets', 'kairos.ico')
@@ -78,7 +84,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'matplotlib'],
+    # Sprint 3: hledání běží v ONNX Runtime (ai_onnx) – torch a spol. do balíčku nepatří
+    # (ai_engine je importuje jen jako zálohu vývojového stroje bez models/clip_b32_*.onnx)
+    excludes=['tkinter', 'matplotlib', 'torch', 'torchvision', 'sentence_transformers', 'transformers',
+              'triton', 'sympy'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
