@@ -193,6 +193,17 @@ def init_db():
         );
         """)
 
+        # Sprint 4.0: přesné hledání – vektory SigLIP 2 (768 rozměrů) vedle CLIP. Vlastní tabulka:
+        # vypnutí / zapnutí modelu nic nepřepočítává a CLIP index zůstává nedotčený.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS siglip_embeddings (
+            media_id INTEGER PRIMARY KEY,
+            embedding BLOB NOT NULL,
+            source_sig TEXT,
+            FOREIGN KEY (media_id) REFERENCES media_items (id) ON DELETE CASCADE
+        );
+        """)
+
         # Vícesnímkový index videí (video_frames): CLIP vektory snímků z celého klipu, plakát
         # zůstává v image_embeddings. source_sig = EMBEDDING_SIG_SQL videa, ze kterého vznikly.
         cursor.execute("""
@@ -581,6 +592,62 @@ def get_media_needing_embedding():
               AND (e.media_id IS NULL OR e.source_sig IS NULL OR e.source_sig != {EMBEDDING_SIG_SQL})
             ORDER BY m.date_taken DESC, m.id DESC
         """).fetchall()
+    finally:
+        conn.close()
+
+
+def get_media_needing_siglip():
+    """[(id, file_path, thumbnail_path, media_type, podpis)] položek bez platného vektoru SigLIP 2
+    (stejný výběr jako get_media_needing_embedding – stejné položky, jiný model)."""
+    conn = get_connection()
+    try:
+        return conn.execute(f"""
+            SELECT m.id, m.file_path, m.thumbnail_path, m.media_type, {EMBEDDING_SIG_SQL}
+            FROM media_items m LEFT JOIN siglip_embeddings e ON e.media_id = m.id
+            WHERE NOT EXISTS (SELECT 1 FROM media_items lp WHERE lp.paired_video_path = m.file_path)
+              AND (e.media_id IS NULL OR e.source_sig IS NULL OR e.source_sig != {EMBEDDING_SIG_SQL})
+            ORDER BY m.date_taken DESC, m.id DESC
+        """).fetchall()
+    finally:
+        conn.close()
+
+
+def save_siglip_embeddings(rows):
+    """rows = [(media_id, bytes, podpis)]"""
+    if not rows:
+        return
+    with db_transaction() as conn:
+        conn.executemany("INSERT OR REPLACE INTO siglip_embeddings (media_id, embedding, source_sig) "
+                         "VALUES (?, ?, ?)", rows)
+
+
+def siglip_coverage():
+    """(položek s platným vektorem SigLIP, položek, které ho mají mít) – kdy přepnout hledání."""
+    conn = get_connection()
+    try:
+        # měřítko = položky, které má CLIP (fotka bez miniatury / rozbité video nemá ani jeden)
+        need = conn.execute(f"""SELECT COUNT(*) FROM image_embeddings e JOIN media_items m ON m.id = e.media_id
+            WHERE e.source_sig = {EMBEDDING_SIG_SQL}""").fetchone()[0]
+        have = conn.execute(f"""SELECT COUNT(*) FROM siglip_embeddings e JOIN media_items m ON m.id = e.media_id
+            WHERE e.source_sig = {EMBEDDING_SIG_SQL}""").fetchone()[0]
+        return int(have), int(need)
+    finally:
+        conn.close()
+
+
+def get_siglip_vectors(ids=None):
+    """{id: bytes} vektorů SigLIP 2 (videa jen plakátem – snímky klipů zatím indexuje jen CLIP)."""
+    conn = get_connection()
+    try:
+        if ids is None:
+            rows = conn.execute("SELECT media_id, embedding FROM siglip_embeddings").fetchall()
+        else:
+            ids = [int(i) for i in ids]
+            if not ids:
+                return {}
+            rows = conn.execute(f"SELECT media_id, embedding FROM siglip_embeddings "
+                                f"WHERE media_id IN ({','.join('?' * len(ids))})", ids).fetchall()
+        return {r[0]: r[1] for r in rows}
     finally:
         conn.close()
 

@@ -27,9 +27,12 @@ IMAGE_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"
 
 EMBED_DIM = 512                 # CLIP ViT-B/32
 EMBED_BYTES = EMBED_DIM * 4     # float32
+SIGLIP_DIM = 768                # Sprint 4.0: SigLIP 2 (přesné hledání, siglip_engine) – vlastní tabulka
 
 _text_model = None
 _image_model = None
+_siglip_text = None
+_siglip_image = None
 _model_lock = threading.Lock()
 _index_lock = threading.RLock()
 
@@ -51,7 +54,7 @@ _cached_index_state = {
 def encode_embedding(vec):
     """ndarray -> bytes (float32, normalizovaný, little-endian)."""
     arr = np.asarray(vec, dtype=np.float32).flatten()
-    if arr.size != EMBED_DIM:
+    if arr.size not in _dims():
         raise ValueError(f"Embedding má {arr.size} dimenzí, očekáváno {EMBED_DIM}")
     norm = float(np.linalg.norm(arr))
     if norm > 0:
@@ -75,20 +78,24 @@ class _RestrictedUnpickler(pickle.Unpickler):
         raise pickle.UnpicklingError(f"Zakázaný objekt v pickle: {module}.{name}")
 
 
+def _dims():
+    return {EMBED_DIM, SIGLIP_DIM}
+
+
 def decode_embedding(raw):
-    """bytes -> float32 ndarray (EMBED_DIM,), nebo None při neplatných datech."""
+    """bytes -> float32 ndarray (EMBED_DIM nebo SIGLIP_DIM,), nebo None při neplatných datech."""
     if not raw:
         return None
     try:
         raw = bytes(raw)
-        if len(raw) == EMBED_BYTES:
+        if len(raw) in {d * 4 for d in _dims()}:
             vec = np.frombuffer(raw, dtype="<f4").astype(np.float32)
         elif raw[:1] == b"\x80":   # starý formát (pickle)
             vec = _RestrictedUnpickler(io.BytesIO(raw)).load()
             vec = np.asarray(vec, dtype=np.float32).flatten()
         else:
             return None
-        if vec.size != EMBED_DIM or not np.all(np.isfinite(vec)):
+        if vec.size not in _dims() or not np.all(np.isfinite(vec)):
             return None
         return vec
     except Exception:
@@ -187,6 +194,55 @@ def get_image_model():
         return _image_model
 
 
+# ── Sprint 4.0: přesné hledání (SigLIP 2) ──
+def siglip_available():
+    import siglip_engine
+    return siglip_engine.installed()
+
+
+def get_siglip_text_model():
+    global _siglip_text
+    with _model_lock:
+        if _siglip_text is None:
+            import siglip_engine
+            _siglip_text = siglip_engine.TextEncoder()
+        return _siglip_text
+
+
+def get_siglip_image_model():
+    global _siglip_image
+    with _model_lock:
+        if _siglip_image is None:
+            import siglip_engine
+            _siglip_image = siglip_engine.ImageEncoder()
+            print(f"[AI] SigLIP 2 obrazový model: {_siglip_image.provider}")
+        return _siglip_image
+
+
+def release_siglip():
+    """Vypnuté přesné hledání: modely z paměti (~1,6 GB)."""
+    global _siglip_text, _siglip_image
+    with _model_lock:
+        _siglip_text = _siglip_image = None
+
+
+def text_model_for_dim(dim):
+    """Textový model ke stejnému prostoru jako index: 768 = SigLIP 2, jinak CLIP. Index tak určuje
+    model a dotaz CLIP se nikdy neporovná s vektory SigLIP (ani naopak)."""
+    if dim == SIGLIP_DIM and EMBED_DIM != SIGLIP_DIM:
+        return get_siglip_text_model()
+    return get_text_model()
+
+
+def siglip_embed_pil(images):
+    """PIL obrázky -> [bytes 768 float32] pro siglip_embeddings."""
+    batch = list(images)
+    if not batch:
+        return []
+    vecs = np.asarray(get_siglip_image_model().encode(batch), dtype=np.float32).reshape(len(batch), -1)
+    return [encode_embedding(v) for v in vecs]
+
+
 def get_models():
     """Zpětná kompatibilita: vrací (text_model, image_model)."""
     return get_text_model(), get_image_model()
@@ -230,7 +286,7 @@ def _rebuild_vector_index(photo_embeddings_dict):
         rows = []
         for raw_bytes in (raw if isinstance(raw, (tuple, list)) else (raw,)):
             vec = decode_embedding(raw_bytes)
-            if vec is None:
+            if vec is None or (vectors and vec.size != vectors[0].size):   # jeden index = jeden model
                 continue
             norm = np.linalg.norm(vec)
             if norm > 0:
@@ -292,6 +348,21 @@ SEARCH_MIN_STATS = 24            # pod tolik položkami je rozptyl knihovny nesp
 # (maximum šumu roste s počtem) -> prahy mírně rostou s log10 velikosti (10 000 fotek: +0,38).
 SEARCH_CALIBRATED_N = 300
 SEARCH_Z_PER_DECADE = 0.25
+# Sprint 4.0: SigLIP 2 má jiné rozložení podobností k bance pojmů -> vlastní prahy (CLIP čte
+# konstanty výše). Kalibrace: python eval/sweep_siglip_z.py (zlatá sada, mřížka prahů):
+# aplikace R@20 0,909 -> 0,920, P@10 0,850 -> 0,859, jisté shody u nepřítomných pojmů 1/8 -> 0/8
+# (CLIP na téže sadě: R@20 0,885, P@10 0,839). Jisté 3,4–4,2 vychází stejně, bere se nejnižší.
+Z_PROFILES = {
+    SIGLIP_DIM: {"confident": 3.4, "lib": 1.0, "possible": 0.8, "show": 1.8},
+}
+
+
+def z_profile(dim):
+    """Prahy pro index dané dimenze: {confident, lib, possible, show}."""
+    if dim in Z_PROFILES and dim != EMBED_DIM:
+        return Z_PROFILES[dim]
+    return {"confident": SEARCH_Z_CONFIDENT, "lib": SEARCH_Z_LIB_CONFIDENT,
+            "possible": SEARCH_Z_POSSIBLE, "show": SEARCH_Z_SHOW}
 # z za zdvojnásobení počtu vektorů videa (frame_penalty). Kalibrace eval/eval_search.py --frames --videos:
 # 0 = 2 nepřítomné pojmy s jistou shodou; 0,25 = žádná, videa R@3 0,40 -> 0,79, MRR 0,48 -> 0,87
 SEARCH_FRAME_Z_PENALTY = 0.25
@@ -334,22 +405,23 @@ def image_concept_stats(matrix, bank):
     return mu.astype(np.float32), sd.astype(np.float32)
 
 
-def tier_scores(zi, zl, key, n_library):
+def tier_scores(zi, zl, key, n_library, profile=None):
     """Indexy (jisté, možné) od nejlepšího. zi = z vůči bance pojmů fotky, zl = z v knihovně
     (None u malé knihovny), key = pořadí. Prázdné obojí = nic nevyčnívá (viz SEARCH_Z_SHOW)."""
     zi = np.asarray(zi, dtype=np.float32)
     if zi.size == 0 or not np.all(np.isfinite(zi)):
         return [], []
+    zp = profile or z_profile(EMBED_DIM)
     grow = SEARCH_Z_PER_DECADE * max(0.0, math.log10(max(1, n_library) / SEARCH_CALIBRATED_N))
-    if float(zi.max()) < SEARCH_Z_SHOW + grow:
+    if float(zi.max()) < zp["show"] + grow:
         return [], []
-    lib_ok = np.ones_like(zi, dtype=bool) if zl is None else zl >= SEARCH_Z_LIB_CONFIDENT
+    lib_ok = np.ones_like(zi, dtype=bool) if zl is None else zl >= zp["lib"]
     possible_ok = np.ones_like(zi, dtype=bool) if zl is None else zl >= 0.0
     order = np.argsort(-np.asarray(key, dtype=np.float32), kind="stable")
-    confident = [int(i) for i in order if zi[i] >= SEARCH_Z_CONFIDENT + grow and lib_ok[i]]
+    confident = [int(i) for i in order if zi[i] >= zp["confident"] + grow and lib_ok[i]]
     taken = set(confident)
     possible = [int(i) for i in order
-                if i not in taken and zi[i] >= SEARCH_Z_POSSIBLE + grow and possible_ok[i]]
+                if i not in taken and zi[i] >= zp["possible"] + grow and possible_ok[i]]
     return confident, possible[:SEARCH_POSSIBLE_MAX]
 
 
@@ -398,7 +470,7 @@ def rank_semantic(text, pool_ids, photo_embeddings_dict, face_ids=None):
     matrix, media_ids = state["matrix"], state["media_ids"]
     if matrix is None or not media_ids:
         return [], []
-    text_model = get_text_model()
+    text_model = text_model_for_dim(matrix.shape[1])
     q_vec = query_vector(text, text_model)
     if q_vec is None or q_vec.size != matrix.shape[1]:
         return [], []                   # jiný model / poškozený výstup: žádné NaN skóre ani pád np.dot
@@ -437,7 +509,7 @@ def rank_semantic(text, pool_ids, photo_embeddings_dict, face_ids=None):
     key = zi + (SEARCH_LIB_WEIGHT * zl if zl is not None else 0.0)
     if face_ids:
         key = key + SEARCH_FACE_BONUS * np.array([media_ids[i] in face_ids for i in rows], dtype=np.float32)
-    confident, possible = tier_scores(zi, zl, key, n)
+    confident, possible = tier_scores(zi, zl, key, n, z_profile(matrix.shape[1]))
     return [media_ids[rows[i]] for i in confident], [media_ids[rows[i]] for i in possible]
 
 

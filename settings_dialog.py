@@ -451,6 +451,19 @@ class SettingsDialog(QDialog):
         self._row(g, "Kopie se na pozadí vytvoří znovu, když je potřeba", self.btn_clear_proxies)
         self._update_proxy_impact(self.slider_proxy_mb.value())
 
+        # Sprint 4.0: přesné hledání (SigLIP 2) – volitelné, výchozí lehký CLIP
+        g = self._group(layout, "Přesné hledání")
+        import siglip_engine
+        self.chk_precise = ToggleSwitch("Přesné hledání (SigLIP 2)")
+        self.chk_precise.setChecked(bool(self.config.get("search_precise", False)))
+        self._row(g, stacked=self.chk_precise)
+        state = ("Model je stažený." if siglip_engine.installed()
+                 else f"Po zapnutí se jednou stáhne model (~{siglip_engine.DOWNLOAD_MB / 1000:.1f} GB).")
+        self._row(g, stacked=_hint(
+            "Přesnější hledání popisem: na zkušební sadě je správná fotka mezi prvními 20 v 94 % případů "
+            "místo 82 % (výsledky aplikace 92 % místo 89 %). Knihovna se na pozadí přeindexuje – do té doby hledá dosavadní "
+            "model. Potřebuje asi o 1,6 GB paměti víc; doporučeno od 16 GB RAM. " + state))
+
         g = self._group(layout, "Obnovení")
         self.lbl_factory = _hint("")
         self.btn_factory_reset = KButton("Obnovit tovární nastavení…", compact=True)
@@ -688,6 +701,7 @@ class SettingsDialog(QDialog):
         self.chk_xmp.setChecked(DEFAULT_CONFIG.get("xmp_sidecars", True))
         self.chk_borrow.setChecked(DEFAULT_CONFIG.get("borrow_location", True))
         self.chk_ocr.setChecked(DEFAULT_CONFIG.get("ocr_text", True))
+        self.chk_precise.setChecked(DEFAULT_CONFIG.get("search_precise", False))
         self.chk_memories.setChecked(DEFAULT_CONFIG.get("show_memories", True))
         self.chk_adaptive.setChecked(DEFAULT_CONFIG.get("adaptive_accent", True))
         self.combo_default_sort.setCurrentText(DEFAULT_CONFIG.get("default_sort_order", "Datum pořízení (Nejnovější)"))
@@ -711,6 +725,7 @@ class SettingsDialog(QDialog):
         self.config["xmp_sidecars"] = self.chk_xmp.isChecked()
         self.config["borrow_location"] = self.chk_borrow.isChecked()
         self.config["ocr_text"] = self.chk_ocr.isChecked()
+        self.config["search_precise"] = self.chk_precise.isChecked()
         self.config["show_memories"] = self.chk_memories.isChecked()
         self.config["adaptive_accent"] = self.chk_adaptive.isChecked()
         self.config["default_sort_order"] = self.combo_default_sort.currentText()

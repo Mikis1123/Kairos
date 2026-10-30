@@ -108,6 +108,7 @@ def evaluate(label, conn, universe, gold, dim):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="google/siglip2-base-patch16-256")
+    ap.add_argument("--onnx", choices=["fp32", "int8"], help="Sprint 4.0: aplikační ONNX (siglip_engine), text fp32/int8")
     args = ap.parse_args()
     import ai_engine
     from database import visible_media_sql
@@ -116,6 +117,19 @@ def main():
         f"SELECT m.id FROM media_items m WHERE {visible_media_sql('m')} ORDER BY m.date_taken DESC, m.id DESC")]
     gold = json.load(open(os.path.join(HERE, "search_golden.json"), encoding="utf-8"))["queries"]
     evaluate("CLIP ViT-B/32 multilingual (ONNX)", conn, universe, gold, 512)
+    if args.onnx:
+        import siglip_engine
+        t0 = time.time()
+        img = siglip_engine.ImageEncoder()
+        text = siglip_engine.TextEncoder(text_file="text_model_int8.onnx" if args.onnx == "int8" else siglip_engine.TEXT_FILE)
+        print(f"načtení modelů {time.time() - t0:.1f} s ({img.provider})")
+        ai_engine._image_model, ai_engine._text_model = img, text
+        evaluate(f"SigLIP 2 ONNX ({args.onnx} text)", conn, universe, gold, siglip_engine.DIM)
+        t0 = time.time()
+        for q in ("pes na pláži", "západ slunce nad horami", "kostel ve městě"):
+            text.encode([q])
+        print(f"dotaz textu {(time.time() - t0) / 3 * 1000:.0f} ms")
+        return
     img = SiglipImage(args.model)
     ai_engine._image_model, ai_engine._text_model = img, SiglipText(img)
     dim = int(np.atleast_2d(img.encode([__import__("PIL.Image").Image.new("RGB", (64, 64))])).shape[1])

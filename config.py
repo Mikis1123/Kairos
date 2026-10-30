@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
     "tile_store_mb": 1024,
     # Cesta 3.0 (C6) – hudební podkres Cesty (ambient_music.py); volitelný, výchozí vypnutý
     "cesta_music": False,
+    # Sprint 4.0 – přesné hledání: SigLIP 2 (stáhne se ~1,5 GB, přeindexuje na pozadí); výchozí CLIP
+    "search_precise": False,
     # Sprint 2 – XMP sidecary vedle originálů (oblíbené, jména tváří, opravená poloha)
     "xmp_sidecars": True,
     # Sprint 2 – poloha vypůjčená z telefonu ve stejné události pro fotky bez GPS

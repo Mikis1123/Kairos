@@ -61,6 +61,7 @@ from database import (
     dismiss_duplicate_pair, undismiss_duplicate_pair, purge_orphan_test_rows,
     get_search_vectors, get_videos_needing_frames, save_video_frame_embeddings, db_transaction,
     get_media_needing_ocr, save_ocr_results,
+    get_media_needing_siglip, save_siglip_embeddings, siglip_coverage, get_siglip_vectors,
 )
 from scanner import MediaScannerThread, repair_missing_thumbnails
 from face_cluster import (
@@ -2071,15 +2072,50 @@ class AISearchWorker(QThread):
 
 
 SEARCH_WARMUP_DELAY_MS = 5000   # textový model hledání se načte v klidu po startu, ne při 1. dotazu
+SIGLIP_READY_SHARE = 0.98       # přesné hledání se zapne, až má SigLIP 2 vektor ≥ 98 % knihovny
+SIGLIP_BATCH = 8
+
+
+class SiglipDownload(QThread):
+    """Sprint 4.0: stažení modelu přesného hledání (~1,5 GB) na pozadí, s pokračováním po přerušení."""
+    progress = pyqtSignal(float, float)     # MB hotovo, MB celkem
+    done = pyqtSignal(bool, str)            # úspěch, chyba
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        import siglip_engine
+        last = [0.0]
+
+        def report(got, total):
+            now = time.monotonic()
+            if now - last[0] >= 0.5:
+                last[0] = now
+                self.progress.emit(got / 1e6, total / 1e6)
+        try:
+            ok = siglip_engine.download(report, should_stop=lambda: not self._running)
+            self.done.emit(bool(ok), "" if ok else "přerušeno")
+        except Exception as e:
+            self.done.emit(False, str(e))
 
 
 class SearchModelWarmup(QThread):
     """Načte textový model (ONNX, ~1 s; dřív sentence-transformers ~15 s) dřív, než ho uživatel potřebuje."""
 
+    def __init__(self, precise=False, parent=None):
+        super().__init__(parent)
+        self.precise = precise              # Sprint 4.0: přesné hledání = textový model SigLIP 2
+
     def run(self):
         try:
-            from ai_engine import get_text_model, concept_bank_vectors
-            concept_bank_vectors(get_text_model())    # i banka pojmů kalibrace hledání
+            from ai_engine import get_text_model, get_siglip_text_model, concept_bank_vectors
+            # i banka pojmů kalibrace hledání
+            concept_bank_vectors(get_siglip_text_model() if self.precise else get_text_model())
         except Exception as e:          # bez modelu hledání vrátí prázdný výsledek, nespadne
             print(f"[AI Hledání] Model se nenačetl: {type(e).__name__}: {e}")
 
@@ -2165,6 +2201,8 @@ class BackgroundAIDaemon(QThread):
     thumbs_repaired    = pyqtSignal()
     face_crops_repaired = pyqtSignal(int)
     status_changed     = pyqtSignal(str)
+    siglip_added       = pyqtSignal(list)      # Sprint 4.0: nové vektory přesného hledání
+    siglip_progress    = pyqtSignal(int, int)  # (hotovo, celkem) – kdy přepnout hledání
 
     def __init__(self, face_threshold: float = 0.62, parent=None, merge_threshold=None):
         super().__init__(parent)
@@ -2175,6 +2213,7 @@ class BackgroundAIDaemon(QThread):
         self.preview_budget_mb = preview_cache.DEFAULT_BUDGET_MB
         self.proxy_budget_mb = video_proxy.DEFAULT_BUDGET_MB
         self.ocr_enabled = True                    # Sprint 3: text na fotkách (Předvolby › ocr_text)
+        self.siglip_enabled = False                # Sprint 4.0: přesné hledání (Předvolby › search_precise)
 
     def stop(self):
         self._running = False
@@ -2231,6 +2270,8 @@ class BackgroundAIDaemon(QThread):
                 self._improve_person_covers()
             if self._running:
                 self._index_ocr()
+            if self._running:
+                self._index_siglip()
         except Exception as e:
             print(f"AI Daemon error: {e}")
         self.status_changed.emit("")
@@ -2482,6 +2523,50 @@ class BackgroundAIDaemon(QThread):
                 save_ocr_results(batch)
                 batch = []
         save_ocr_results(batch)
+
+    def _index_siglip(self):
+        """Sprint 4.0: přesné hledání – vektory SigLIP 2 pro celou knihovnu (stejné zdroje jako CLIP).
+        Poslední krok: ~8× pomalejší než CLIP, a do dokončení hledá CLIP. Každá dávka čeká na klid
+        (governor) – během videa, gest a Cesty indexování stojí."""
+        import ai_engine
+        from PIL import Image
+        if not self.siglip_enabled or not ai_engine.siglip_available():
+            return
+        try:
+            rows = get_media_needing_siglip()
+        except Exception as e:
+            print(f"[SigLIP] {e}")
+            return
+        total = len(rows)
+        for k in range(0, total, SIGLIP_BATCH):
+            if self._yield():
+                return
+            self._status(f"Zpřesňuji hledání ({min(total, k + SIGLIP_BATCH)}/{total})...")
+            images, meta = [], []
+            for media_id, file_path, thumb_path, media_type, sig in rows[k:k + SIGLIP_BATCH]:
+                src = thumb_path if thumb_path and os.path.exists(thumb_path) else (
+                    file_path if media_type != "video" else None)
+                if not src:
+                    continue
+                try:
+                    with Image.open(src) as im:
+                        images.append(im.convert("RGB"))
+                    meta.append((media_id, sig))
+                except Exception:
+                    continue
+            if not images:
+                continue
+            try:
+                vecs = ai_engine.siglip_embed_pil(images)
+                save_siglip_embeddings([(mid, v, sig) for (mid, sig), v in zip(meta, vecs)])
+            except Exception as e:
+                print(f"[SigLIP] {e}")
+                return
+            self.siglip_added.emit([mid for mid, _ in meta])
+            if (k // SIGLIP_BATCH) % 8 == 0:
+                self.siglip_progress.emit(*siglip_coverage())
+        self.siglip_progress.emit(*siglip_coverage())
+        self._status("", force=True)
 
     def _apply_sidecar_faces(self, media_ids):
         """Sprint 2: jména tváří z XMP sidecarů (knihovna po ztrátě databáze) a pak zápis
@@ -3549,6 +3634,7 @@ class MainWindow(QMainWindow):
         self._load_photos()
         self._load_people()
         self._load_events()
+        self._check_siglip_ready()          # Sprint 4.0: přesné hledání, je-li zapnuté a index hotový
         self._load_embeddings()
         self._refresh_memory()
         self._start_ai_daemon()
@@ -3979,9 +4065,84 @@ class MainWindow(QMainWindow):
             if card.cover_path() == path:
                 card.set_cover(QPixmap.fromImage(image), full_res=True)
 
+    # ── Sprint 4.0: přesné hledání (SigLIP 2, volitelné) ──
+    def _precise_wanted(self):
+        return bool(self.config.get("search_precise", False))
+
+    def _precise_active(self):
+        """Hledá se SigLIP 2: volba zapnutá, model stažený a index téměř úplný (jinak CLIP)."""
+        return self._precise_wanted() and getattr(self, "_siglip_ready", False)
+
+    def _check_siglip_ready(self):
+        import ai_engine
+        ready = False
+        if self._precise_wanted() and ai_engine.siglip_available():
+            try:
+                have, need = siglip_coverage()
+                ready = need > 0 and have >= SIGLIP_READY_SHARE * need
+            except Exception as e:
+                print(f"[SigLIP] {e}")
+        changed = ready != getattr(self, "_siglip_ready", False)
+        self._siglip_ready = ready
+        return changed
+
+    def _on_siglip_progress(self, have, need):
+        if getattr(self, "_siglip_ready", False) or not self._precise_wanted():
+            return
+        if need > 0 and have >= SIGLIP_READY_SHARE * need:
+            self._siglip_ready = True
+            self._load_embeddings()
+            show_toast(self, "Přesné hledání je připravené", "success")
+
+    def _merge_siglip(self, ids):
+        if self._precise_active():
+            self._merge_embeddings(ids)
+
+    def _apply_precise_setting(self, was_on):
+        """Po Předvolbách: zapnuto -> stáhnout model (je-li třeba), indexovat; vypnuto -> zpět na CLIP."""
+        import ai_engine
+        now_on = self._precise_wanted()
+        if now_on and not ai_engine.siglip_available():
+            self._start_siglip_download()
+        if was_on and not now_on:
+            dl = getattr(self, "_siglip_download", None)
+            if dl is not None and dl.isRunning():
+                dl.stop()
+            ai_engine.release_siglip()
+        if self._check_siglip_ready() or was_on != now_on:
+            self._load_embeddings()
+
+    def _start_siglip_download(self):
+        import siglip_engine
+        dl = getattr(self, "_siglip_download", None)
+        if dl is not None and dl.isRunning():
+            return
+        dl = SiglipDownload(self)
+        dl.progress.connect(lambda got, total: self.lbl_status.set_task(
+            "siglip", f"Stahuji model přesného hledání ({got:.0f} / {total:.0f} MB)…"))
+        dl.done.connect(self._on_siglip_downloaded)
+        self._siglip_download = dl
+        self.lbl_status.set_task("siglip", f"Stahuji model přesného hledání (0 / {siglip_engine.DOWNLOAD_MB} MB)…")
+        dl.start()
+
+    def _on_siglip_downloaded(self, ok, error):
+        self.lbl_status.set_task("siglip", "")
+        if not ok:
+            if error != "přerušeno":
+                show_toast(self, f"Model přesného hledání se nepodařilo stáhnout: {error}", "error")
+            return
+        show_toast(self, "Model přesného hledání stažen – knihovna se na pozadí přeindexuje", "info")
+        if self._ai_daemon and self._ai_daemon.isRunning():
+            self._ai_daemon_rerun = True
+        else:
+            self._start_ai_daemon()
+
+    def _search_vectors(self, ids=None):
+        return get_siglip_vectors(ids) if self._precise_active() else get_search_vectors(ids)
+
     def _load_embeddings(self):
         try:
-            self._embeddings_cache = get_search_vectors()       # videa: plakát + snímky celého klipu
+            self._embeddings_cache = self._search_vectors()     # videa: plakát + snímky celého klipu
         except Exception as e:
             print(f"[Embeddings] {e}")
             self._embeddings_cache = {}
@@ -3993,7 +4154,7 @@ class MainWindow(QMainWindow):
         """Démon doplnil vektory těchto položek: jen je přidat do cache. Dřív se každých 25
         položek načítala celá knihovna v GUI vlákně (desítky MB, sekundové záseky)."""
         try:
-            fresh = get_search_vectors(ids)
+            fresh = self._search_vectors(ids)
         except Exception as e:
             print(f"[Embeddings] {e}")
             return
@@ -4021,6 +4182,9 @@ class MainWindow(QMainWindow):
         self._ai_daemon.preview_budget_mb = int(self.config.get("preview_cache_mb", preview_cache.DEFAULT_BUDGET_MB))
         self._ai_daemon.proxy_budget_mb = int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB))
         self._ai_daemon.ocr_enabled = bool(self.config.get("ocr_text", True))
+        self._ai_daemon.siglip_enabled = self._precise_wanted()
+        self._ai_daemon.siglip_added.connect(self._merge_siglip)
+        self._ai_daemon.siglip_progress.connect(self._on_siglip_progress)
         self._ai_daemon.people_updated.connect(self._load_people)
         self._ai_daemon.embeddings_updated.connect(self._load_embeddings)
         self._ai_daemon.embeddings_added.connect(self._merge_embeddings)
@@ -4290,9 +4454,11 @@ class MainWindow(QMainWindow):
 
     def _warm_search_model(self):
         import ai_engine
-        if self._search_warmup is not None or not self._embeddings_cache or ai_engine._text_model is not None:
+        precise = self._precise_active()
+        loaded = ai_engine._siglip_text if precise else ai_engine._text_model
+        if self._search_warmup is not None or not self._embeddings_cache or loaded is not None:
             return
-        self._search_warmup = SearchModelWarmup()
+        self._search_warmup = SearchModelWarmup(precise)
         self.lbl_status.set_task("search_model", "Připravuji chytré hledání…")
         self._search_warmup.finished.connect(lambda: self.lbl_status.set_task("search_model", ""))
         self._search_warmup.start()
@@ -5417,6 +5583,7 @@ class MainWindow(QMainWindow):
         old_theme = self.config.get("theme", theme.DEFAULT_THEME)
         old_accent = (self.config.get("accent"), self.config.get("accent_custom"))
         old_memories = self.config.get("show_memories", True)
+        old_precise = self._precise_wanted()
         dlg = SettingsDialog(self)
         accepted = dlg.exec()
         if dlg.trash_emptied:                  # proběhlo i při Zrušit – knihovna musí sedět s DB
@@ -5458,6 +5625,7 @@ class MainWindow(QMainWindow):
             self._ai_daemon.stop()
         # snížený limit kopií videí platí hned (jen mazání nejdéle nepoužitých souborů)
         video_proxy.enforce_budget(int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB)))
+        self._apply_precise_setting(old_precise)     # Sprint 4.0: přesné hledání zapnuto / vypnuto
         self._start_ai_daemon()
 
     # ── Vzpomínky (Polish P2) ─────────────────────────────────────────────────
