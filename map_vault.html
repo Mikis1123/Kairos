@@ -59,6 +59,37 @@
   .seg { display: inline-flex; align-items: center; gap: 6px; }
   .seg svg { width: 14px; height: 14px; }
 
+
+  /* Sprint 4: Atlas – celoživotní mapa cest (zářící oblouky, hustota, časová osa let) */
+  #atlas { display: none; }
+  body.atlas #atlas { display: block; }
+  body.atlas #hud, body.atlas #jlist, body.atlas #card { display: none !important; }
+  #ahead { position: absolute; top: 16px; left: 16px; z-index: 12; padding: 14px 16px 12px; border-radius: 16px;
+           min-width: 230px; max-width: 320px; animation: sheet-in .3s var(--ease); }
+  #ahead .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+  #ahead h1 { margin: 2px 0 8px; font-size: 20px; font-weight: 700; }
+  #astats { display: grid; grid-template-columns: repeat(2, auto); gap: 6px 18px; font-size: 12px; color: var(--text-2); }
+  #astats b { display: block; font-size: 17px; color: var(--text); font-weight: 700; }
+  #aclose { all: unset; position: absolute; top: 10px; right: 10px; width: 26px; height: 26px; border-radius: 8px;
+            cursor: pointer; text-align: center; line-height: 26px; color: var(--text-2); }
+  #aclose:hover { background: rgba(255,255,255,0.1); color: var(--text); }
+  #atl { position: absolute; left: 50%; bottom: 26px; transform: translateX(-50%); z-index: 12; display: flex;
+         align-items: center; gap: 2px; padding: 4px; border-radius: 14px; max-width: calc(100% - 60px); overflow-x: auto; }
+  #atl button { all: unset; cursor: pointer; padding: 6px 11px; border-radius: 10px; font-size: 12px; font-weight: 600;
+                color: #EBEBF0; white-space: nowrap; }
+  #atl button:hover { background: rgba(255,255,255,0.10); }
+  #atl button[aria-pressed="true"] { background: rgba(255,255,255,0.92); color: #1C1C1E; }
+  #atl button:focus-visible { outline: 2px solid var(--accent); }
+  #atl #aplay { padding: 6px 9px; }
+  #atl #aplay svg { width: 12px; height: 12px; display: block; fill: currentColor; }
+  #atl .n { font-weight: 400; opacity: .6; margin-left: 4px; font-size: 11px; }
+  #atip { position: absolute; z-index: 13; pointer-events: none; padding: 10px 12px; border-radius: 12px; font-size: 12px;
+          min-width: 180px; opacity: 0; transform: translateY(4px); transition: opacity .12s ease, transform .12s ease; }
+  #atip.show { opacity: 1; transform: none; }
+  #atip .t { font-size: 13px; font-weight: 700; }
+  #atip .s { color: var(--text-2); margin-top: 2px; }
+  #atip .go { margin-top: 6px; color: var(--accent); font-weight: 600; }
+
   /* Výběr Cesty */
   #jlist { position: absolute; top: 60px; left: 16px; z-index: 11; width: 300px; max-height: calc(100% - 180px);
            overflow-y: auto; border-radius: 14px; padding: 6px; display: none; }
@@ -234,8 +265,17 @@
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6.3"/><path d="M1.8 8h12.4M8 1.7c2 2 2 10.6 0 12.6M8 1.7c-2 2-2 10.6 0 12.6"/></svg>Zeměkoule</button>
   <button type="button" class="seg" id="btn-journeys" aria-expanded="false" aria-controls="jlist" hidden title="Přehrát cestu z události">
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="3.5" cy="12" r="1.6"/><circle cx="12.5" cy="4" r="1.6"/><path d="M5 11.2c3-1 1.5-4.6 4.5-5.8 1-.4 1.6-.8 1.6-.8" stroke-dasharray="1.6 1.8"/></svg>Cesty</button>
+  <button type="button" class="seg" id="btn-atlas" title="Atlas – všechny vaše cesty na zeměkouli">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="6"/><path d="M3.6 10.6c2-4 6-5.4 8.8-4.4"/></svg>Atlas</button>
 </div>
 <div id="jlist" class="glass" role="dialog" aria-label="Cesty"></div>
+<div id="atlas" aria-live="polite">
+  <div id="ahead" class="glass" role="dialog" aria-label="Atlas"><div class="eyebrow">Atlas</div>
+    <h1 id="atitle">Vaše cesty</h1><div id="astats"></div>
+    <button type="button" id="aclose" aria-label="Zavřít Atlas (Esc)" title="Zavřít Atlas (Esc)">✕</button></div>
+  <div id="atl" class="glass" role="toolbar" aria-label="Roky"></div>
+  <div id="atip" class="glass"></div>
+</div>
 <div id="card" class="glass"></div>
 <div id="empty" class="notice"><div><b>Žádné fotografie s polohou</b>Fotky s GPS souřadnicemi se tu objeví po importu.</div></div>
 <div id="nogl" class="notice"><div><b>Mapa potřebuje grafickou akceleraci</b>Zeměkouli kreslí WebGL, které tu není k dispozici. Fotky ani jejich polohy se tím nemění.</div></div>
@@ -890,6 +930,7 @@
     addPinLayers();
     render();
     if (journey.active) { addRouteLayers(); journey.hidden = []; journey.faded = {}; reliefSpec = null; filmLook(true); }
+    if (atlas.on) { addAtlasLayers(); setPinsVisible(false); }   // nový podklad zahodil vrstvy Atlasu
   }
 
   // Cesta 3.0 (C7): MapLibre 5 tu běžel s JEDNÍM workerem (getWorkerCount() = 1 na 16 vláknech) –
@@ -3164,6 +3205,7 @@
 
   window.playJourney = function (data) {
     if (!validJourney(data)) return false;
+    if (atlas.on) window.atlasMode(false, true);   // Atlas -> Cesta: kamera letí z pohledu Atlasu
     if (journey.active) stopJourney(true);
     toggleList(false);
     stopSpin(); hideCard();
@@ -3489,10 +3531,244 @@
       else if (e.key === 'Escape') stopJourney(false);
       return;
     }
+    if (e.key === 'Escape' && atlas.on) { window.atlasMode(false); return; }
     if (e.key === 'Escape') {
       if (document.getElementById('jlist').classList.contains('open')) toggleList(false);
       else window.pullBack();
     }
+  });
+
+
+  // ── Sprint 4: Atlas – celoživotní mapa cest (atlas.py -> window.setAtlas) ──
+  // Zářící oblouky po hlavních kružnicích (domov -> výlet a nit z výletu na výlet), hustota fotek
+  // v šestiúhelnících (tři úrovně podle zoomu), časová osa let s přehráním. Klik na oblouk nebo
+  // výlet = Cesta téže události; kamera z Atlasu plynule přeletí do úvodu filmu.
+  var ATLAS_DRAW_MS = 1600, ATLAS_YEAR_MS = 2600;
+  var ATLAS_LAYERS = ['a-hex-0', 'a-hex-1', 'a-hex-2', 'a-arc-glow', 'a-arc', 'a-arc-hit', 'a-trip-glow', 'a-trip', 'a-home'];
+  var atlas = { on: false, data: null, year: null, anim: 0, play: 0, hover: null };
+  function atlasFeatures() {
+    var d = atlas.data;
+    return { type: 'FeatureCollection', features: (d ? d.trips : []).map(function (t) {
+      return { type: 'Feature', geometry: { type: 'Point', coordinates: [t.lon, t.lat] },
+               properties: { id: t.id, year: t.year, count: t.count, far: t.far, playable: t.playable } };
+    }) };
+  }
+  function yearFilter(extra) {
+    var f = atlas.year === null ? ['all'] : ['==', ['get', 'year'], atlas.year];
+    return extra ? ['all', f, extra] : f;
+  }
+  function hexFilter(lvl) {
+    return ['all', ['==', ['get', 'lvl'], lvl], atlas.year === null ? ['==', ['get', 'first'], true] : ['==', ['get', 'year'], atlas.year]];
+  }
+  function arcGradient(p) {
+    var c = accent();
+    if (p >= 1) return ['interpolate', ['linear'], ['line-progress'], 0, hexA(c, 0.25), 1, hexA('#FFFFFF', 0.95)];
+    var a = Math.max(0.0001, Math.min(0.9998, p));
+    return ['interpolate', ['linear'], ['line-progress'], 0, hexA(c, 0.25), a, hexA('#FFFFFF', 0.95), Math.min(0.9999, a + 0.0001), hexA(c, 0)];
+  }
+  function addAtlasLayers() {
+    if (!map || !styleReady || !atlas.data) return;
+    removeAtlasLayers();
+    var d = atlas.data, c = accent();
+    map.addSource('a-hex', { type: 'geojson', data: d.hex });
+    map.addSource('a-arcs', { type: 'geojson', data: d.arcs, lineMetrics: true });
+    map.addSource('a-trips', { type: 'geojson', data: atlasFeatures() });
+    map.addSource('a-home', { type: 'geojson', data: { type: 'FeatureCollection', features: d.home ?
+      [{ type: 'Feature', geometry: { type: 'Point', coordinates: [d.home.lon, d.home.lat] }, properties: {} }] : [] } });
+    var levels = (d.hexLevels || [[0, 3.2, 180], [3.2, 6, 40], [6, 24, 8]]);
+    levels.forEach(function (lv, k) {
+      map.addLayer({ id: 'a-hex-' + k, type: 'fill', source: 'a-hex', minzoom: lv[0], maxzoom: lv[1], filter: hexFilter(lv[2]),
+                     paint: { 'fill-color': ['interpolate', ['linear'], ['ln', ['+', 1, ['get', atlas.year === null ? 'all' : 'n']]],
+                                             0, hexA(c, 0.18), 3, hexA(c, 0.42), 7, hexA('#FFD9A8', 0.7)],
+                              'fill-outline-color': hexA('#FFFFFF', 0.18) } });
+    });
+    map.addLayer({ id: 'a-arc-glow', type: 'line', source: 'a-arcs', filter: yearFilter(),
+                   layout: { 'line-cap': 'round', 'line-join': 'round' },
+                   paint: { 'line-color': c, 'line-width': ['interpolate', ['linear'], ['zoom'], 1, 6, 8, 12],
+                            'line-blur': 6, 'line-opacity': 0.45 } });
+    map.addLayer({ id: 'a-arc', type: 'line', source: 'a-arcs', filter: yearFilter(),
+                   layout: { 'line-cap': 'round', 'line-join': 'round' },
+                   paint: { 'line-width': ['interpolate', ['linear'], ['zoom'], 1, 1.6, 8, 3], 'line-gradient': arcGradient(1) } });
+    map.addLayer({ id: 'a-arc-hit', type: 'line', source: 'a-arcs', filter: yearFilter(),
+                   paint: { 'line-width': 16, 'line-color': '#000', 'line-opacity': 0.001 } });
+    map.addLayer({ id: 'a-trip-glow', type: 'circle', source: 'a-trips', filter: yearFilter(),
+                   paint: { 'circle-radius': ['+', 8, ['*', 1.6, ['sqrt', ['get', 'count']]]], 'circle-color': c,
+                            'circle-blur': 0.9, 'circle-opacity': 0.55, 'circle-pitch-alignment': 'map' } });
+    map.addLayer({ id: 'a-trip', type: 'circle', source: 'a-trips', filter: yearFilter(),
+                   paint: { 'circle-radius': ['+', 3, ['*', 0.35, ['sqrt', ['get', 'count']]]], 'circle-color': '#FFFFFF',
+                            'circle-stroke-color': c, 'circle-stroke-width': 1.5 } });
+    map.addLayer({ id: 'a-home', type: 'circle', source: 'a-home',
+                   paint: { 'circle-radius': 5, 'circle-color': '#FFD9A8', 'circle-stroke-color': '#FFFFFF', 'circle-stroke-width': 2 } });
+    drawArcsIn();
+  }
+  function removeAtlasLayers() {
+    if (!map) return;
+    ATLAS_LAYERS.forEach(function (id) { if (map.getLayer(id)) map.removeLayer(id); });
+    ['a-hex', 'a-arcs', 'a-trips', 'a-home'].forEach(function (id) { if (map.getSource(id)) map.removeSource(id); });
+  }
+  // Náběh oblouků: jen průhlednost s přechodem MapLibre (uniforma na GPU, jedno volání). Dřív
+  // line-gradient po snímcích (kreslení od začátku do cíle) – každá změna přestaví vrstvu:
+  // naměřeno 17/100 vynechaných snímků při přeletu proti 2/130 bez animace (eval/bench_atlas.py).
+  function drawArcsIn() {
+    if (!map || !map.getLayer('a-arc')) return;
+    var ms = reduceMotion ? 0 : ATLAS_DRAW_MS;
+    [['a-arc', 'line-opacity', 1], ['a-arc-glow', 'line-opacity', 0.45], ['a-trip-glow', 'circle-opacity', 0.55]].forEach(function (l) {
+      map.setPaintProperty(l[0], l[1] + '-transition', { duration: 0, delay: 0 });
+      map.setPaintProperty(l[0], l[1], 0);
+      map.setPaintProperty(l[0], l[1] + '-transition', { duration: ms, delay: l[0] === 'a-trip-glow' ? ms * 0.4 : 0 });
+      map.setPaintProperty(l[0], l[1], l[2]);
+    });
+  }
+  function atlasStats() {
+    var s = atlas.data.stats, el = document.getElementById('astats');
+    var trips = atlas.year === null ? atlas.data.trips : atlas.data.trips.filter(function (t) { return t.year === atlas.year; });
+    var far = trips.filter(function (t) { return t.far; });
+    var km = atlas.year === null ? s.km : Math.round(far.reduce(function (a, t) { return a + 2 * t.km; }, 0));
+    var cells = [[trips.length, trips.length === 1 ? 'událost' : trips.length >= 2 && trips.length <= 4 ? 'události' : 'událostí'],
+                 [far.length, far.length === 1 ? 'výlet' : far.length >= 2 && far.length <= 4 ? 'výlety' : 'výletů'],
+                 [s.countries, s.countries === 1 ? 'země' : 'zemí'], [km.toLocaleString('cs-CZ') + ' km', 'na cestách']];
+    if (atlas.year !== null) cells[2] = [atlas.year, 'rok'];
+    el.innerHTML = cells.map(function (c) { return '<div><b>' + esc(c[0]) + '</b>' + esc(c[1]) + '</div>'; }).join('');
+    document.getElementById('atitle').textContent = atlas.year === null ? 'Vaše cesty' : 'Rok ' + atlas.year;
+  }
+  function atlasYears() {
+    var box = document.getElementById('atl'), years = atlas.data.years || [];
+    box.innerHTML = (years.length > 1 ? '<button type="button" id="aplay" aria-label="Přehrát roky" title="Přehrát roky">'
+      + '<svg viewBox="0 0 12 12"><path d="M2.5 1.5v9l7.5-4.5z"/></svg></button>' : '')
+      + '<button type="button" data-y="" aria-pressed="' + (atlas.year === null) + '">Vše</button>'
+      + years.map(function (y) {
+        return '<button type="button" data-y="' + y.year + '" aria-pressed="' + (atlas.year === y.year) + '">' + y.year
+             + '<span class="n">' + y.count + '</span></button>';
+      }).join('');
+    box.querySelectorAll('button[data-y]').forEach(function (b) {
+      b.addEventListener('click', function () { stopYearPlay(); setAtlasYear(b.dataset.y ? +b.dataset.y : null); });
+    });
+    var play = document.getElementById('aplay');
+    if (play) play.addEventListener('click', function () { atlas.play ? stopYearPlay() : startYearPlay(); });
+  }
+  function setAtlasYear(y, noFly) {
+    atlas.year = y;
+    if (map && map.getLayer('a-arc')) {
+      ['a-arc-glow', 'a-arc', 'a-arc-hit', 'a-trip-glow', 'a-trip'].forEach(function (id) { map.setFilter(id, yearFilter()); });
+      var levels = (atlas.data.hexLevels || [[0, 3.2, 180], [3.2, 6, 40], [6, 24, 8]]);
+      levels.forEach(function (lv, k) {
+        map.setFilter('a-hex-' + k, hexFilter(lv[2]));
+        map.setPaintProperty('a-hex-' + k, 'fill-color', ['interpolate', ['linear'], ['ln', ['+', 1, ['get', y === null ? 'all' : 'n']]],
+                             0, hexA(accent(), 0.18), 3, hexA(accent(), 0.42), 7, hexA('#FFD9A8', 0.7)]);
+      });
+      drawArcsIn();
+    }
+    document.querySelectorAll('#atl button[data-y]').forEach(function (b) {
+      b.setAttribute('aria-pressed', String((b.dataset.y ? +b.dataset.y : null) === y));
+    });
+    atlasStats();
+    if (!noFly) atlasFit();
+  }
+  function startYearPlay() {
+    var years = (atlas.data.years || []).map(function (y) { return y.year; });
+    if (!years.length) return;
+    var k = atlas.year === null ? 0 : (years.indexOf(atlas.year) + 1) % years.length;
+    atlas.play = setInterval(function () {
+      if (!atlas.on) { stopYearPlay(); return; }
+      setAtlasYear(years[k]);
+      k++;
+      if (k >= years.length) { stopYearPlay(); setTimeout(function () { if (atlas.on && !atlas.play) setAtlasYear(null); }, ATLAS_YEAR_MS); }
+    }, ATLAS_YEAR_MS);
+    setAtlasYear(years[k]); k++;
+    var b = document.getElementById('aplay');
+    if (b) b.setAttribute('aria-pressed', 'true');
+  }
+  function stopYearPlay() {
+    clearInterval(atlas.play); atlas.play = 0;
+    var b = document.getElementById('aplay');
+    if (b) b.setAttribute('aria-pressed', 'false');
+  }
+  function atlasFit() {
+    if (!map || !hasSize()) return;
+    var pts = atlas.data.trips.filter(function (t) { return atlas.year === null || t.year === atlas.year; })
+      .map(function (t) { return { lat: t.lat, lon: t.lon }; });
+    if (atlas.data.home && atlas.year === null) pts.push(atlas.data.home);
+    if (!pts.length) return;
+    var lats = pts.map(function (p) { return p.lat; }), lons = pts.map(function (p) { return p.lon; });
+    var b = new maplibregl.LngLatBounds([Math.min.apply(null, lons), Math.min.apply(null, lats)],
+                                        [Math.max.apply(null, lons), Math.max.apply(null, lats)]);
+    var cam = map.cameraForBounds(b, { padding: { top: 120, bottom: 110, left: 340, right: 80 }, maxZoom: 9 }) || {};
+    var zoom = Math.min(9, cam.zoom === undefined ? GLOBE_ZOOM : cam.zoom);
+    var opts = { center: cam.center || b.getCenter(), zoom: Math.max(GLOBE_ZOOM, zoom), pitch: 0, bearing: 0 };
+    stopSpin();
+    if (reduceMotion) map.jumpTo(opts); else map.flyTo(Object.assign(opts, { duration: 2200, curve: 1.4, essential: true }));
+  }
+  function tripById(id) { return (atlas.data ? atlas.data.trips : []).filter(function (t) { return t.id === id; })[0]; }
+  function atlasHit(e) {
+    var f = map.queryRenderedFeatures(e.point, { layers: ['a-trip', 'a-trip-glow', 'a-arc-hit'].filter(function (id) { return map.getLayer(id); }) });
+    return f.length ? tripById(f[0].properties.id) : null;
+  }
+  function atlasTip(t, pt) {
+    var tip = document.getElementById('atip');
+    if (!t) { tip.classList.remove('show'); map.getCanvas().style.cursor = ''; return; }
+    tip.innerHTML = '<div class="t">' + esc(t.title) + '</div><div class="s">' + esc(dateRange([{ date: t.start }, { date: t.end }]))
+      + ' · ' + esc(czCount(t.count)) + (t.far ? ' · ' + Math.round(t.km).toLocaleString('cs-CZ') + ' km od domova' : '') + '</div>'
+      + (t.playable ? '<div class="go">▶ Přehrát Cestu</div>' : '');
+    tip.style.left = Math.min(pt.x + 14, mapEl.clientWidth - 250) + 'px';
+    tip.style.top = Math.max(10, pt.y - 70) + 'px';
+    tip.classList.add('show');
+    map.getCanvas().style.cursor = t.playable ? 'pointer' : '';
+  }
+  function onAtlasMove(e) { if (atlas.on) atlasTip(atlasHit(e), e.point); }
+  function onAtlasClick(e) {
+    if (!atlas.on) return;
+    var t = atlasHit(e);
+    if (t && t.playable) window.atlasPlayTrip(t.id);
+  }
+  window.atlasPlayTrip = function (id) {     // Cesta z Atlasu: kamera letí z aktuálního pohledu
+    if (!tripById(id)) return false;
+    window.atlasMode(false, true);
+    if (bridge && bridge.requestJourney) bridge.requestJourney(id);
+    return true;
+  };
+  window.setAtlas = function (data) {
+    atlas.data = data && Array.isArray(data.trips) ? data : null;
+    if (atlas.on) { if (atlas.data) { addAtlasLayers(); atlasYears(); atlasStats(); } else window.atlasMode(false); }
+    return !!atlas.data;
+  };
+  window.atlasMode = function (on, keepCamera) {
+    on = !!on && !!atlas.data;
+    if (on === atlas.on) return atlas.on;
+    atlas.on = on;
+    document.getElementById('atip').classList.remove('show');
+    if (on) {
+      if (journey.active) stopJourney(true);
+      toggleList(false); hideCard(); stopSpin();
+      document.body.classList.add('atlas');
+      setPinsVisible(false);
+      atlas.year = null;
+      addAtlasLayers(); atlasYears(); atlasStats(); atlasFit();
+      if (!atlas.bound && map) {
+        atlas.bound = true;
+        map.on('mousemove', onAtlasMove);
+        map.on('click', onAtlasClick);
+      }
+    } else {
+      stopYearPlay();
+      removeAtlasLayers();
+      document.body.classList.remove('atlas');
+      if (map) map.getCanvas().style.cursor = '';
+      if (!journey.active) setPinsVisible(true);
+      if (!keepCamera && bridge && bridge.atlasClosed) bridge.atlasClosed();
+    }
+    return atlas.on;
+  };
+  window.getAtlasState = function () {
+    return { on: atlas.on, year: atlas.year, trips: atlas.data ? atlas.data.trips.length : 0,
+             arcs: atlas.data ? atlas.data.arcs.features.length : 0, hex: atlas.data ? atlas.data.hex.features.length : 0,
+             layers: map ? ATLAS_LAYERS.filter(function (id) { return !!map.getLayer(id); }).length : 0, playing: !!atlas.play };
+  };
+  // (ne window.setAtlasYear – deklarace funkce v hlavním skriptu JE window.setAtlasYear, přepsání = rekurze)
+  window.atlasYear = function (y) { setAtlasYear(y === null || y === undefined ? null : +y, true); return atlas.year; };
+  document.getElementById('aclose').addEventListener('click', function () { window.atlasMode(false); });
+  document.getElementById('btn-atlas').addEventListener('click', function () {
+    if (atlas.data) window.atlasMode(true);
+    else if (bridge && bridge.requestAtlas) bridge.requestAtlas();
   });
 
   // ── Velikost stránky ────────────────────────────────────────────────────────

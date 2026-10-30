@@ -2175,6 +2175,17 @@ class MapBridge(QObject):
             QTimer.singleShot(0, lambda: self.main_window.play_journey(int(event_id)))
 
     @pyqtSlot()
+    def requestAtlas(self):
+        """Tlačítko Atlas v mapě -> data Atlasu (atlas.py) a přepnutí do režimu Atlas."""
+        if hasattr(self.main_window, "open_atlas"):
+            QTimer.singleShot(0, lambda: self.main_window.open_atlas(switch=False))
+
+    @pyqtSlot()
+    def atlasClosed(self):
+        if hasattr(self.main_window, "atlas_closed"):
+            QTimer.singleShot(0, self.main_window.atlas_closed)
+
+    @pyqtSlot()
     def journeyClosed(self):
         """Uživatel Cestu ukončil (×, Hotovo, Esc) -> případný návrat na stránku, odkud ji spustil."""
         if hasattr(self.main_window, "journey_closed"):
@@ -3153,6 +3164,8 @@ class MainWindow(QMainWindow):
         self._filtered_records = []
         self._map_loaded = False
         self._pending_journey = None     # data Cesty čekající na načtení mapy
+        self._pending_atlas = None       # Sprint 4: data Atlasu čekající na načtení mapy
+        self._atlas_on = False
         self._journey_return = False     # mapa s Cestou vložená nad událost (návrat po konci)
         self._tint_job = None            # tint.TintJob – odstíny obálek událostí na pozadí
         self._current_filter = "all"
@@ -3286,7 +3299,7 @@ class MainWindow(QMainWindow):
             ("favorites", "Oblíbené", "heart"), ("videos", "Videa", "video"), ("albums", "Alba", "album"),
             ("trash", "Smazané", "trash"),
             NavSection("Objevy"),
-            ("echoes", "Ozvěny", "echo"), ("reels", "Sestřihy", "reel"),
+            ("echoes", "Ozvěny", "echo"), ("reels", "Sestřihy", "reel"), ("atlas", "Atlas", "atlas"),
         ])
         # Kairos Spark: kliknutí na hlavní záložku vyšle z jiskry loga světelný puls (~180 ms);
         # spojení před přepnutím stránky, ať animace startuje bez čekání na novou stránku
@@ -4312,6 +4325,13 @@ class MainWindow(QMainWindow):
         if key == "reels":
             self.open_reels()
             return
+        if key == "atlas":
+            self.open_atlas()
+            return
+        if key == "map" and self._atlas_on:
+            self._atlas_on = False                     # Mapa = piny, ne Atlas
+            if self._map_loaded:
+                self.map_view.page().runJavaScript("window.atlasMode && window.atlasMode(false, true);")
         if key == "albums":
             self.open_albums()
             return
@@ -4337,6 +4357,8 @@ class MainWindow(QMainWindow):
             key = next((k for k, f in self.COLLECTION_FILTERS.items() if f == self._current_filter), "photos")
         elif 0 <= idx < len(self.SIDEBAR_PAGES):
             key = self.SIDEBAR_PAGES[idx]
+            if key == "map" and getattr(self, "_atlas_on", False):
+                key = "atlas"
         else:
             return
         self.sidebar_nav.set_current(key)
@@ -4554,6 +4576,9 @@ class MainWindow(QMainWindow):
         self._sync_accent()
         self._sync_map_active()
         self._refresh_map()
+        atlas_data, self._pending_atlas = self._pending_atlas, None
+        if atlas_data is not None:
+            page.runJavaScript(f"window.setAtlas({json.dumps(atlas_data)}); window.atlasMode(true);")
         data, self._pending_journey = self._pending_journey, None
         if data is not None:                # Cesta vyžádaná z Událostí dřív, než se mapa načetla
             page.runJavaScript(f"window.playJourney && window.playJourney({json.dumps(data)});")
@@ -5114,6 +5139,8 @@ class MainWindow(QMainWindow):
             Command("Alba", lambda: nav("albums"), "page", icon="album", keywords="kolekce výběry"),
             Command("Smazané", lambda: nav("trash"), "page", icon="trash", keywords="koš"),
             Command("Ozvěny", lambda: nav("echoes"), "page", icon="echo", keywords="tehdy teď návrat"),
+            Command("Atlas", lambda: nav("atlas"), "page", icon="atlas",
+                    keywords="mapa cesty výlety zeměkoule cestování roky"),
             Command("Sestřihy", lambda: nav("reels"), "page", icon="reel",
                     keywords="reels video film throwback vzpomínky hudba export mp4"),
             Command("Importovat fotky…", self._start_import, "action", icon="import", keywords="přidat složka"),
@@ -5612,6 +5639,40 @@ class MainWindow(QMainWindow):
         job.failed.connect(failed)
         self._reel_export = job
         job.start()
+
+    # ── Atlas (Sprint 4) ──────────────────────────────────────────────────────
+
+    def open_atlas(self, switch=True):
+        """Objevy › Atlas: všechny cesty na zeměkouli (atlas.py) v mapě; klik na oblouk = Cesta."""
+        import atlas
+        if getattr(self, "map_view", None) is None:
+            return False
+        try:
+            conn = get_connection()
+            try:
+                data = atlas.build(conn)
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[Atlas] {e}")
+            data = None
+        if data is None:
+            show_toast(self, "Atlas potřebuje fotky s polohou", "info")
+            self._sync_sidebar()
+            return False
+        self._atlas_on = True
+        if switch and self.stack.currentWidget() is not self.page_map:
+            self._switch_page(3)
+        self._sync_sidebar()
+        if not self._map_loaded:
+            self._pending_atlas = data
+            return True
+        self.map_view.page().runJavaScript(f"window.setAtlas({json.dumps(data)}); window.atlasMode(true);")
+        return True
+
+    def atlas_closed(self):
+        self._atlas_on = False
+        self._sync_sidebar()
 
     def _open_echo_photo(self, echo, media_id):
         ids = [it["id"] for it in echo["items"]]
