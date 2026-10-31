@@ -30,7 +30,7 @@ DIM = 512
 SCHEMA = """
 CREATE TABLE media_items (id INTEGER PRIMARY KEY, latitude REAL, longitude REAL, date_taken TEXT,
     thumbnail_path TEXT, file_path TEXT, place_city TEXT, phash TEXT, is_favorite INTEGER DEFAULT 0,
-    media_type TEXT DEFAULT 'photo', is_trashed INTEGER DEFAULT 0, paired_video_path TEXT);
+    media_type TEXT DEFAULT 'photo', is_trashed INTEGER DEFAULT 0, is_hidden INTEGER DEFAULT 0, paired_video_path TEXT);
 CREATE TABLE image_embeddings (media_id INTEGER PRIMARY KEY, embedding BLOB NOT NULL);
 CREATE INDEX idx_media_paired ON media_items(paired_video_path);   -- jako database.init_db (visible_media_sql)
 """

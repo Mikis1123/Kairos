@@ -104,10 +104,10 @@ def get_album(conn, album_id):
 
 
 def item_ids(conn, album_id):
-    """Viditelné položky ručního alba (bez koše), nejstarší první podle data pořízení."""
+    """Viditelné položky ručního alba (bez koše a Skrytých), nejstarší první podle data pořízení."""
     return [r[0] for r in conn.execute("""
         SELECT a.media_id FROM album_items a JOIN media_items m ON m.id = a.media_id
-        WHERE a.album_id = ? AND COALESCE(m.is_trashed, 0) = 0
+        WHERE a.album_id = ? AND COALESCE(m.is_trashed, 0) = 0 AND COALESCE(m.is_hidden, 0) = 0
         ORDER BY m.date_taken, m.id""", (album_id,))]
 
 
@@ -120,14 +120,14 @@ def list_albums(conn):
         count, cover = None, None
         if kind == "manual":
             count = conn.execute("""SELECT COUNT(*) FROM album_items a JOIN media_items m ON m.id = a.media_id
-                                    WHERE a.album_id = ? AND COALESCE(m.is_trashed, 0) = 0""", (aid,)).fetchone()[0]
+                                    WHERE a.album_id = ? AND COALESCE(m.is_trashed, 0) = 0 AND COALESCE(m.is_hidden, 0) = 0""", (aid,)).fetchone()[0]
             row = None
             if cover_id is not None:
-                row = conn.execute("SELECT thumbnail_path FROM media_items WHERE id = ? AND COALESCE(is_trashed, 0) = 0",
+                row = conn.execute("SELECT thumbnail_path FROM media_items WHERE id = ? AND COALESCE(is_trashed, 0) = 0 AND COALESCE(is_hidden, 0) = 0",
                                    (cover_id,)).fetchone()
             if not row:
                 row = conn.execute("""SELECT m.thumbnail_path FROM album_items a JOIN media_items m ON m.id = a.media_id
-                                      WHERE a.album_id = ? AND COALESCE(m.is_trashed, 0) = 0
+                                      WHERE a.album_id = ? AND COALESCE(m.is_trashed, 0) = 0 AND COALESCE(m.is_hidden, 0) = 0
                                       ORDER BY m.date_taken DESC, m.id DESC LIMIT 1""", (aid,)).fetchone()
             cover = row[0] if row else None
         out.append({"id": aid, "name": name, "kind": kind, "query": query, "filter": flt or "all",

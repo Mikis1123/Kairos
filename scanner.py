@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 import subprocess
@@ -170,6 +171,43 @@ def make_thumbnail(file_path, thumb_path, m_type, paired_video, ffmpeg_path=DEFA
     return False
 
 
+def render_thumbnail_bytes(file_path, m_type, paired_video, ffmpeg_path=DEFAULT_FFMPEG):
+    """Stejná miniatura jako make_thumbnail(), ale jen v paměti (JPEG bajty, nebo None) – pro
+    složku Skryté, kde nešifrovaná miniatura nesmí na disk ani dočasně."""
+    if not file_path or not os.path.exists(file_path):
+        return None
+    if not (m_type == 'video' and not paired_video):
+        try:
+            with Image.open(file_path) as img:
+                icc = color_manage.source_profile(img)
+                box = _thumb_box(*img.size)
+                try:
+                    img.draft("RGB", (box[0] * 2, box[1] * 2))
+                except Exception:
+                    pass
+                img.thumbnail((box[0] * 2, box[1] * 2))
+                rgb = ImageOps.exif_transpose(img).convert("RGB")
+                rgb.thumbnail(_thumb_box(*rgb.size), Image.Resampling.LANCZOS)
+                rgb = color_manage.pil_to_output(rgb, icc)
+                buf = io.BytesIO()
+                rgb.save(buf, "JPEG", quality=THUMB_QUALITY)
+                return buf.getvalue()
+        except Exception:
+            pass
+    if not os.path.exists(ffmpeg_path):
+        return None
+    seek = ["-ss", "00:00:00.200"] if m_type == 'video' and not paired_video else []
+    cmd = [ffmpeg_path, "-loglevel", "quiet"] + seek + [
+        "-i", file_path, "-map", "0:v:0", "-frames:v", "1",
+        "-vf", _video_thumb_filter(file_path, ffmpeg_path),
+        "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, startupinfo=_hidden_startupinfo(), timeout=60).stdout
+    except Exception:
+        return None
+    return out or None
+
+
 def _thumb_version_path():
     return os.path.join(CACHE_DIR, THUMB_VERSION_FILE)
 
@@ -221,7 +259,9 @@ def repair_missing_thumbnails(should_stop=None, progress=None, flush_every=50):
     stopped = False
     try:
         c = conn.cursor()
-        c.execute("SELECT id, file_path, media_type, paired_video_path, thumbnail_path FROM media_items")
+        # skryté (Stage 3) ne: jejich miniatura existuje jen šifrovaně (locked_folder)
+        c.execute("SELECT id, file_path, media_type, paired_video_path, thumbnail_path FROM media_items "
+                  "WHERE COALESCE(is_hidden, 0) = 0")
         todo = []
         for item_id, fp, m_type, paired, thumb in c.fetchall():
             if thumb == "":
@@ -701,6 +741,7 @@ class MediaScannerThread(QThread):
                 SELECT id, date_taken, latitude, longitude, place_city 
                 FROM media_items 
                 WHERE date_taken IS NOT NULL AND date_taken != ''
+                  AND COALESCE(is_hidden, 0) = 0
                 ORDER BY date_taken ASC
             """)
             items = cursor.fetchall()

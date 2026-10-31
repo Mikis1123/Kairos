@@ -17,3 +17,6 @@ winrt-Windows.Globalization
 winrt-Windows.Foundation
 winrt-Windows.Foundation.Collections
 winrt-Windows.Storage.Streams
+# Stage 3: složka Skryté – AES-GCM miniatury, scrypt hesla, Windows Hello
+cryptography>=42
+winrt-Windows.Security.Credentials.UI

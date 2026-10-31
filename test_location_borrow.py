@@ -8,7 +8,7 @@ import location_borrow as lb
 def db(rows):
     conn = sqlite3.connect(":memory:")
     conn.execute("""CREATE TABLE media_items (id INTEGER PRIMARY KEY, event_id INTEGER, date_taken TEXT,
-                    latitude REAL, longitude REAL, is_trashed INTEGER DEFAULT 0,
+                    latitude REAL, longitude REAL, is_trashed INTEGER DEFAULT 0, is_hidden INTEGER DEFAULT 0,
                     place_city TEXT, place_country TEXT)""")
     conn.executemany("INSERT INTO media_items (id, event_id, date_taken, latitude, longitude) VALUES (?,?,?,?,?)", rows)
     return conn

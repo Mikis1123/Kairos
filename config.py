@@ -53,6 +53,8 @@ DEFAULT_CONFIG = {
     "ocr_text": True,
     # Stage 2 – barvy fotek: "auto" = do profilu displeje (color_manage), "srgb" = vždy sRGB
     "color_output": "auto",
+    # Stage 3 – složka Skryté v postranním panelu (vypnuto = jen z Předvoleb)
+    "show_hidden_folder": True,
 }
 
 

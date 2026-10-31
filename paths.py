@@ -47,6 +47,10 @@ FACE_DIR = os.path.join(CACHE_ROOT, "faces")
 # kterou smí uživatel kdykoli vymazat.
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
 
+# NEZAHAZOVAT: složka Skryté (Stage 3, locked_folder.py) – vault.json se zabaleným klíčem
+# a šifrované miniatury (t/<id>.kvt). Mimo .cache: bez vault.json se skryté neodemknou.
+VAULT_DIR = os.path.join(BASE_DIR, "vault")
+
 
 def resolve_face_path(path, face_dir=None):
     """Vrátí existující cestu k ořezu obličeje, nebo None.

@@ -35,6 +35,15 @@ VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".avi", ".mkv"}
 _lock = threading.Lock()
 
 
+def _is_hidden(source):
+    """Originál ve složce Skryté (locked_folder): žádné náhledy na disku."""
+    try:
+        import locked_folder
+    except ImportError:          # pragma: no cover
+        return False
+    return locked_folder.is_hidden_path(source)
+
+
 def preview_dir():
     return paths.PREVIEW_DIR
 
@@ -105,6 +114,8 @@ def save_preview(source, image):
     """Uloží (zmenšený) QImage jako náhled originálu. Atomicky (tmp + replace)."""
     if image is None or image.isNull() or not source:
         return None
+    if _is_hidden(source):                   # Skryté: na disk nikdy nešifrovaně
+        return None
     if image.width() > PREVIEW_EDGE or image.height() > PREVIEW_EDGE:
         from PyQt6.QtCore import Qt
         image = image.scaled(QSize(PREVIEW_EDGE, PREVIEW_EDGE), Qt.AspectRatioMode.KeepAspectRatio,
@@ -162,7 +173,7 @@ def _video_poster(source, target, ffmpeg_path=None):
 def build_preview(source, media_type=None):
     """Vytvoří náhled (fotka) nebo plakát (video). Vrací cestu nebo None. Existující platný
     náhled se nepřepočítává."""
-    if not source or not os.path.exists(source):
+    if not source or not os.path.exists(source) or _is_hidden(source):
         return None
     existing = get_preview(source, touch=False)
     if existing:

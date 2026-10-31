@@ -133,6 +133,7 @@ class SettingsDialog(QDialog):
         self.recluster_requested = False
         self.factory_reset_done = False
         self.guide_requested = False
+        self.hidden_requested = False       # Předvolby › Skryté › Otevřít
         self._stats = self._read_library_stats()
         self.init_ui()
 
@@ -349,6 +350,21 @@ class SettingsDialog(QDialog):
         layout.addWidget(_hint("Soubory se přesunou do Koše Windows – dají se odtamtud obnovit."))
         self.refresh_trash_label()
 
+        # Stage 3: složka Skryté
+        g = self._group(layout, "Skryté 🔒")
+        self.chk_hidden_entry = ToggleSwitch("Zobrazit Skryté v postranním panelu")
+        self.chk_hidden_entry.setChecked(bool(self.config.get("show_hidden_folder", True)))
+        self._row(g, stacked=self.chk_hidden_entry)
+        self.btn_open_hidden = KButton("Otevřít…", compact=True, icon="lock")
+        self.btn_open_hidden.clicked.connect(self.open_hidden)
+        self._row(g, "Fotky mimo knihovnu, hledání, tváře, mapu a sestřihy", self.btn_open_hidden)
+        self.btn_hidden_pass = KButton("Změnit heslo…", compact=True)
+        self.btn_hidden_pass.clicked.connect(self.change_hidden_passcode)
+        self._row(g, "Heslo ke Skrytým (záloha k Windows Hello)", self.btn_hidden_pass)
+        layout.addWidget(_hint("Skryté se zamknou po 2 minutách nečinnosti, při minimalizaci okna, zamčení "
+                               "počítače a při odchodu ze složky. Dokud jsou odemčené, okno se neukáže ve "
+                               "snímcích obrazovky, sdílení ani v náhledech Alt+Tab."))
+
         # Nápověda (Polish P2) – otevře stránku Tipy a průvodce v hlavním okně
         g = self._group(layout, "Nápověda")
         self.btn_guide = KButton("Otevřít…", compact=True, icon="sparkle")
@@ -361,6 +377,18 @@ class SettingsDialog(QDialog):
     def open_guide(self):
         self.guide_requested = True
         self.reject()
+
+    def open_hidden(self):
+        self.hidden_requested = True
+        self.reject()
+
+    def change_hidden_passcode(self):
+        locked = getattr(self.parent(), "locked", None)
+        if locked is None:
+            return
+        from ui_toast import show_toast
+        if locked.change_passcode(self):
+            show_toast(self.parent(), "Heslo ke Skrytým je nastavené.", "success")
 
     def create_advanced_tab(self):
         tab = QWidget()
@@ -716,6 +744,7 @@ class SettingsDialog(QDialog):
         self.chk_color_display.setChecked(DEFAULT_CONFIG.get("color_output", "auto") != "srgb")
         self.chk_memories.setChecked(DEFAULT_CONFIG.get("show_memories", True))
         self.chk_adaptive.setChecked(DEFAULT_CONFIG.get("adaptive_accent", True))
+        self.chk_hidden_entry.setChecked(DEFAULT_CONFIG.get("show_hidden_folder", True))
         self.combo_default_sort.setCurrentText(DEFAULT_CONFIG.get("default_sort_order", "Datum pořízení (Nejnovější)"))
         self.slider_threshold.setValue(int(round(float(DEFAULT_CONFIG.get("face_similarity_threshold", 0.62)) * 100)))
         self.slider_lru.setValue(int(DEFAULT_CONFIG.get("thumbnail_lru_capacity", 1200)))
@@ -741,6 +770,7 @@ class SettingsDialog(QDialog):
         self.config["color_output"] = "auto" if self.chk_color_display.isChecked() else "srgb"
         self.config["show_memories"] = self.chk_memories.isChecked()
         self.config["adaptive_accent"] = self.chk_adaptive.isChecked()
+        self.config["show_hidden_folder"] = self.chk_hidden_entry.isChecked()
         self.config["default_sort_order"] = self.combo_default_sort.currentText()
         self.config["accent"], self.config["accent_custom"] = self.accent_picker.value()
         self.config["face_similarity_threshold"] = round(self.slider_threshold.value() / 100.0, 2)

@@ -61,6 +61,8 @@ ICONS = {
     "chevron_down": '<path d="M7 10l5 5 5-5"/>',
     "sparkle":'<path d="M12 3.5q1 7.5 8.5 8.5q-7.5 1-8.5 8.5q-1-7.5-8.5-8.5q7.5-1 8.5-8.5z"/>',
     # Sprint 4: Sestřihy (filmový pás s přehráním)
+    # Stage 3: složka Skryté
+    "lock": '<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3M12 14.5v2"/>',
     "reel": '<rect x="3.5" y="5.5" width="17" height="13" rx="2.5"/><path d="M3.5 9h17M3.5 15h17M10.5 10.6v2.8l2.6-1.4z"/>',
 }
 FILLED = {

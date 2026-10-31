@@ -95,16 +95,19 @@ def load_vocab(conn=None):
                    replace(substr(COALESCE(m.date_taken, ''), 1, 10), ':', '-'),
                    m.media_type, COALESCE(m.is_favorite, 0)
             FROM media_items m LEFT JOIN events e ON e.id = m.event_id
-        """).fetchall()          # i koš: hledá se v aktuální kolekci, kterou určuje universe
+            WHERE COALESCE(m.is_hidden, 0) = 0
+        """).fetchall()          # i koš: hledá se v aktuální kolekci, kterou určuje universe; Skryté nikdy
         faces = {}
         for media_id, person_id in conn.execute(
-                "SELECT media_id, person_id FROM face_instances WHERE COALESCE(is_valid, 1) = 1"):
+                "SELECT media_id, person_id FROM face_instances WHERE COALESCE(is_valid, 1) = 1 "
+                "AND media_id NOT IN (SELECT id FROM media_items WHERE is_hidden = 1)"):
             faces.setdefault(media_id, set())
             if person_id is not None:
                 faces[media_id].add(person_id)
         ocr = {}
         try:
-            for mid, text in conn.execute("SELECT media_id, text FROM media_ocr WHERE text != ''"):
+            for mid, text in conn.execute("SELECT media_id, text FROM media_ocr WHERE text != '' "
+                                          "AND media_id NOT IN (SELECT id FROM media_items WHERE is_hidden = 1)"):
                 ocr[mid] = tuple(tokens(text))
         except Exception:                        # starší DB bez tabulky
             ocr = {}

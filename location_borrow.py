@@ -60,7 +60,7 @@ def borrow(conn, media_ids=None):
     rows = conn.execute("""
         SELECT id, event_id, date_taken, latitude, longitude, gps_source FROM media_items
         WHERE event_id IS NOT NULL AND date_taken IS NOT NULL AND date_taken != ''
-          AND COALESCE(is_trashed, 0) = 0""").fetchall()
+          AND COALESCE(is_trashed, 0) = 0 AND COALESCE(is_hidden, 0) = 0""").fetchall()
     wanted = set(int(i) for i in media_ids) if media_ids is not None else None
     donors, targets = {}, []
     for mid, ev, dt, lat, lon, src in rows:

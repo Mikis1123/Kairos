@@ -114,6 +114,8 @@ import video_proxy
 import video_frames
 import xmp_sync
 import albums
+import locked_folder
+from locked_ui import LockedFolderController
 import command_palette
 from command_palette import Command
 HOVER_PRELOAD_MS = 350      # setrvání kurzoru nad videem v mřížce před přednačtením
@@ -157,11 +159,14 @@ NOT_MOTION_CLIP = ("NOT EXISTS (SELECT 1 FROM media_items lp "
 
 
 def fetch_media_records(where="", params=(), order_by="m.date_taken DESC, m.id DESC",
-                        trashed=False):
+                        trashed=False, hidden=False):
     """Vrátí záznamy ve tvaru MEDIA_COLUMNS bez pohybových videí Live Photos.
-    trashed=False: knihovna (bez koše), trashed=True: jen položky v koši."""
+    trashed=False: knihovna (bez koše), trashed=True: jen položky v koši.
+    hidden=True: jen obsah složky Skryté (Stage 3) – jinak se skryté nevracejí nikdy."""
     trash_cond = "COALESCE(m.is_trashed, 0) = 1" if trashed else "COALESCE(m.is_trashed, 0) = 0"
-    sql = f"SELECT {MEDIA_COLUMNS} FROM media_items m WHERE {NOT_MOTION_CLIP} AND {trash_cond}"
+    hidden_cond = "COALESCE(m.is_hidden, 0) = 1" if hidden else "COALESCE(m.is_hidden, 0) = 0"
+    sql = (f"SELECT {MEDIA_COLUMNS} FROM media_items m WHERE {NOT_MOTION_CLIP} AND {trash_cond} "
+           f"AND {hidden_cond}")
     if where:
         sql += f" AND ({where})"
     sql += f" ORDER BY {order_by}"
@@ -481,6 +486,11 @@ class LRUCache:
         self._sizes.clear()
         self.bytes = 0
 
+    def discard(self, keys):
+        for key in keys:
+            if self.cache.pop(key, None) is not None:
+                self.bytes -= self._sizes.pop(key, 0)
+
     def resize(self, new_capacity: int):
         self.capacity = max(64, int(new_capacity))
         self._evict()
@@ -577,6 +587,33 @@ class ThumbnailWorker(QRunnable):
         return img
 
 
+class VaultThumbnailWorker(ThumbnailWorker):
+    """Miniatura položky ze složky Skryté: dešifruje se z trezoru (locked_folder) jen do RAM;
+    chybí-li, vytvoří se v paměti z originálu a rovnou zašifruje. Zamčeno = žádný obraz."""
+
+    def __init__(self, item_id, rec, tier, vault):
+        super().__init__(item_id, None, rec[2], tier)
+        self.media_type, self.paired = rec[3], rec[4]
+        self.vault = vault
+
+    def run(self):
+        try:
+            data = self.vault.open_thumbnail(self.item_id)
+            if data is None:
+                data = locked_folder.render_sealed_thumbnail(self.item_id, self.fallback_path, self.media_type,
+                                                             self.paired, self.vault)
+        except locked_folder.VaultError:
+            data = None
+        img = QImage.fromData(data) if data else QImage()
+        if img.isNull():
+            original = self.fallback_path
+            self.signals.failed.emit(self.item_id, THUMB_UNAVAILABLE if original and os.path.exists(original)
+                                     else THUMB_MISSING_FILE)
+            return
+        self.signals.source_short.emit(self.item_id, min(img.width(), img.height()))
+        self.signals.loaded.emit(self.item_id, _shrink_short_edge(img, self.tier))
+
+
 # ── ApplePhotoModel ───────────────────────────────────────────────────────────
 
 class ApplePhotoModel(QAbstractListModel):
@@ -597,6 +634,8 @@ class ApplePhotoModel(QAbstractListModel):
         self._meta = {}           # řádek -> slovník MetaRole (delegát ho čte při každém snímku)
         self.tier = THUMB_TIERS[1]                # kratší strana v RAM (podle velikosti dlaždic)
         self._src_short = {}      # item_id -> kratší strana miniatury na disku (strop zlepšení)
+        self.vault = None         # Stage 3: mřížka složky Skryté (miniatury z trezoru)
+        self._vault_ids = set()   # id, jejichž (dešifrované) miniatury drží ram_cache
 
     def set_tier(self, tier: int):
         """Velikost dlaždic se změnila: větší úroveň se dotáhne líně (data() vrací dosavadní
@@ -609,7 +648,11 @@ class ApplePhotoModel(QAbstractListModel):
 
     def _start_worker(self, item_id, rec):
         self.loading_ids.add(item_id)
-        w = ThumbnailWorker(item_id, rec[5], rec[2], self.tier)
+        if self.vault is not None:
+            self._vault_ids.add(item_id)
+            w = VaultThumbnailWorker(item_id, rec, self.tier, self.vault)
+        else:
+            w = ThumbnailWorker(item_id, rec[5], rec[2], self.tier)
         w.signals.source_short.connect(self._on_source_short)
         w.signals.loaded.connect(self._on_thumb_loaded)
         w.signals.failed.connect(self._on_thumb_failed)
@@ -634,6 +677,18 @@ class ApplePhotoModel(QAbstractListModel):
         self.loading_ids.clear()
         self.failed.clear()
         self._src_short.clear()
+        self._vault_ids.clear()
+
+    def purge_vault(self):
+        """Zamčení: dešifrované miniatury Skrytých pryč z RAM, model bez trezoru."""
+        self.vault = None
+        ids = self._vault_ids
+        self.ram_cache.discard(ids)
+        for item_id in ids:
+            self.failed.pop(item_id, None)
+            self._src_short.pop(item_id, None)
+        self.loading_ids.difference_update(ids)
+        self._vault_ids = set()
 
     def thumb_state(self, item_id: int):
         if self.ram_cache.get(item_id) is not None:
@@ -695,6 +750,9 @@ class ApplePhotoModel(QAbstractListModel):
             self.dataChanged.emit(idx, idx, roles)
 
     def _on_thumb_loaded(self, item_id: int, image: QImage):
+        if item_id in self._vault_ids and self.vault is None:
+            self.loading_ids.discard(item_id)       # dorazilo až po zamčení: zahodit
+            return
         old = self.ram_cache.get(item_id)
         if old is not None and min(old.width(), old.height()) >= min(image.width(), image.height()):
             # zlepšení nepřišlo (menší zdroj): zapamatovat strop, ať se to nezkouší pořád
@@ -3219,6 +3277,8 @@ class MainWindow(QMainWindow):
         # State
         self._all_records = []
         self._trash_records = []
+        self._hidden_records = []        # Stage 3: obsah Skrytých – jen po dobu odemčení
+        self._vault_seen = set()         # id Skrytých zobrazená od odemčení (úklid prohlížeče)
         self._filtered_records = []
         self._map_loaded = False
         self._pending_journey = None     # data Cesty čekající na načtení mapy
@@ -3283,7 +3343,14 @@ class MainWindow(QMainWindow):
         self.folder_watcher.set_roots(self._watched_roots())
         self._apply_stylesheet()
         self._refresh_theme_icons()
+        # Stage 3: složka Skryté – odemčení, auto-zamčení, ochrana obrazovky
+        self.locked = LockedFolderController(self)
+        self.locked.locked.connect(self._on_hidden_locked)
+        self.locked.unlocked.connect(self._on_hidden_unlocked)
+        self.stack.currentChanged.connect(self._check_hidden_context)
+        self._sync_hidden_entry()
         self._init_db_and_load()
+        QTimer.singleShot(0, self._hidden_startup_sweep)
         QTimer.singleShot(SEARCH_WARMUP_DELAY_MS, self._warm_search_model)
 
     def _nav_back(self):
@@ -3329,9 +3396,9 @@ class MainWindow(QMainWindow):
 
     # Postranní panel (Kairos dávka 3): stránky stacku a kolekce = filtry mřížky Fotografie
     SIDEBAR_PAGES = ("photos", "people", "events", "map")
-    COLLECTION_FILTERS = {"favorites": "favorites", "videos": "video", "trash": "trash"}
+    COLLECTION_FILTERS = {"favorites": "favorites", "videos": "video", "trash": "trash", "hidden": "hidden"}
     FILTER_TITLES = {"all": "Fotografie", "favorites": "Oblíbené", "photo": "Fotografie",
-                     "video": "Videa", "trash": "Smazané"}
+                     "video": "Videa", "trash": "Smazané", "hidden": "Skryté"}
 
     def _build_sidebar(self):
         sidebar = QWidget()
@@ -3354,6 +3421,7 @@ class MainWindow(QMainWindow):
             NavSection("Kolekce"),
             ("favorites", "Oblíbené", "heart"), ("videos", "Videa", "video"), ("albums", "Alba", "album"),
             ("trash", "Smazané", "trash"),
+            ("hidden", "Skryté 🔒", "lock"),
             NavSection("Pro vás"),
             ("reels", "Sestřihy", "reel"), ("echoes", "Ozvěny", "echo"),
         ])
@@ -3860,6 +3928,9 @@ class MainWindow(QMainWindow):
 
     def changeEvent(self, event):
         super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized() \
+                and getattr(self, "locked", None) is not None and self.locked.is_unlocked:
+            self.locked.lock("minimize")
         if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow() \
                 and getattr(self, "folder_watcher", None) is not None:
             self.folder_watcher.window_activated()
@@ -3868,10 +3939,12 @@ class MainWindow(QMainWindow):
         try:
             self._all_records = fetch_media_records()
             self._trash_records = fetch_media_records(trashed=True)
+            self._hidden_records = fetch_media_records(hidden=True) if self.locked.is_unlocked else []
         except Exception as e:
             print(f"[Load] {e}")
             self._all_records = []
             self._trash_records = []
+            self._hidden_records = []
         self._apply_filter_and_sort()
 
     def _load_people(self):
@@ -3883,8 +3956,10 @@ class MainWindow(QMainWindow):
                        COUNT(f.id) as face_count
                 FROM people p
                 LEFT JOIN face_instances f ON f.person_id = p.id AND COALESCE(f.is_valid, 1) = 1
-                     AND f.media_id IN (SELECT id FROM media_items WHERE COALESCE(is_trashed, 0) = 0)
+                     AND f.media_id IN (SELECT id FROM media_items WHERE COALESCE(is_trashed, 0) = 0
+                                        AND COALESCE(is_hidden, 0) = 0)
                 GROUP BY p.id
+                HAVING COUNT(f.id) > 0             -- osoba jen ze Skrytých / z koše se neukáže
                 ORDER BY p.name COLLATE NOCASE
             """)
             people = c.fetchall()
@@ -4299,6 +4374,8 @@ class MainWindow(QMainWindow):
     def _collection_records(self):
         """Záznamy aktuální kolekce (knihovna / oblíbené / fotky / videa / koš) v pořadí mřížky."""
         f = self._current_filter
+        if f == "hidden":
+            return list(self._hidden_records) if self.locked.is_unlocked else []
         records = list(self._trash_records if f == "trash" else self._all_records)
         if f == "favorites":
             records = [r for r in records if r[7]]
@@ -4324,7 +4401,7 @@ class MainWindow(QMainWindow):
         f = self._current_filter
         records = self._collection_records()
         possible = ()
-        if self._search_query.strip():
+        if self._search_query.strip() and f != "hidden":     # Skryté nejsou v indexu hledání
             result = self._search_result
             if result is None or result.query != self._search_query.strip():
                 self._sync_memory_card()   # hledání běží: mřížka drží předchozí stav (žádné
@@ -4359,10 +4436,19 @@ class MainWindow(QMainWindow):
             return f"{_czech_result_count(sure)} · {possible} možných pro „{query}“"
         if self._current_filter == "trash":
             return f"{_czech_item_count(count)} · obnovíte je pravým tlačítkem" if count else ""
+        if self._current_filter == "hidden":
+            return f"{_czech_item_count(count)} · zamkne se samo po 2 minutách" if count else ""
         return _czech_item_count(count)
 
     def _set_filter(self, key: str):
+        if self._current_filter == "hidden" and key != "hidden":
+            self.locked.lock("navigation")           # odchod ze Skrytých = zamknout
         self._current_filter = key
+        model = self.grid_view.photo_model
+        if key == "hidden":
+            model.vault = self.locked.vault if self.locked.is_unlocked else None
+        elif model.vault is not None:
+            model.purge_vault()
         self.lbl_photos_title.setText(self.FILTER_TITLES.get(key, "Fotografie"))
         if self._search_query.strip():
             self._search_result = None       # jiná kolekce = jiné prostředí hledání
@@ -4389,7 +4475,11 @@ class MainWindow(QMainWindow):
         self._switch_page(self.SIDEBAR_PAGES.index(key))
 
     def _open_collection(self, key):
-        """Kolekce = mřížka Fotografie s filtrem (Oblíbené, Videa, Smazané)."""
+        """Kolekce = mřížka Fotografie s filtrem (Oblíbené, Videa, Smazané, Skryté)."""
+        if key == "hidden" and not self.locked.is_unlocked:
+            if not self.locked.request_unlock(self):
+                self._sync_sidebar()                 # zrušeno: jezdec zpět na předchozí položku
+                return
         self._set_filter(self.COLLECTION_FILTERS[key])
         self._switch_page(0)
 
@@ -4424,6 +4514,14 @@ class MainWindow(QMainWindow):
         elif f == "trash":
             content = ("trash", "Koš je prázdný",
                        "Smazané fotky a videa tu počkají, dokud koš nevysypete v Předvolbách.")
+        elif f == "hidden" and not self.locked.is_unlocked:
+            content = ("lock", "Skryté jsou zamčené",
+                       "Odemkněte je přes Windows Hello nebo heslem.")
+            action = ("unlock", "Odemknout")
+        elif f == "hidden":
+            content = ("lock", "Ve Skrytých nic není",
+                       "Fotku sem přesunete pravým tlačítkem v mřížce › Přesunout do Skrytých. "
+                       "Zmizí z knihovny, hledání, tváří, mapy i sestřihů.")
         elif f == "favorites":
             content = ("heart", "Zatím žádné oblíbené",
                        "Označte fotku srdíčkem – klávesou F v mřížce nebo v prohlížeči – a najdete ji tady.")
@@ -4488,7 +4586,10 @@ class MainWindow(QMainWindow):
                 self.day_capsule.show_sticky(text)
 
     def _on_photos_empty_action(self):
-        if self._photos_empty_action == "clear":
+        if self._photos_empty_action == "unlock":
+            if self.locked.request_unlock(self):
+                self._set_filter("hidden")
+        elif self._photos_empty_action == "clear":
             self._clear_search()
         elif self._photos_empty_action == "import":
             self._start_import()
@@ -5034,19 +5135,27 @@ class MainWindow(QMainWindow):
         rows = self.grid_view.selected_row_indices()
         if not rows:
             return
+        if self._current_filter == "hidden":
+            self._show_hidden_context_menu(rows, pos)
+            return
         menu = QMenu(self)
         act_fav = menu.addAction("Přidat/odebrat oblíbené (F)")
         act_open = menu.addAction("Otevřít")
         ids = [int(self._filtered_records[r][0]) for r in rows if 0 <= r < len(self._filtered_records)]
+        act_hide = None
         if self._current_filter != "trash":
             self._add_album_menu(menu, ids)
         menu.addSeparator()
         act_info = menu.addAction("Informace o souboru")
         menu.addSeparator()
         in_trash = self._current_filter == "trash"
+        if not in_trash:
+            act_hide = menu.addAction("Přesunout do Skrytých 🔒")
         act_trash = menu.addAction("Obnovit" if in_trash else "Přesunout do koše")
         action = menu.exec(self.grid_view.mapToGlobal(pos))
-        if action == act_trash:
+        if action is not None and action == act_hide:
+            self.hide_media_ids(ids)
+        elif action == act_trash:
             self._set_trashed_for_rows(rows, not in_trash)
         elif action == act_fav:
             self.toggle_favorite_on_selection()
@@ -5090,6 +5199,126 @@ class MainWindow(QMainWindow):
     def _show_trash(self):
         self._switch_page(0)
         self._open_collection("trash")
+
+    # ── Stage 3: složka Skryté ───────────────────────────────────────────────
+
+    def _show_hidden_context_menu(self, rows, pos):
+        ids = [int(self._filtered_records[r][0]) for r in rows if 0 <= r < len(self._filtered_records)]
+        menu = QMenu(self)
+        act_open = menu.addAction("Otevřít")
+        act_info = menu.addAction("Informace o souboru")
+        menu.addSeparator()
+        act_unhide = menu.addAction("Vrátit do knihovny")
+        menu.addSeparator()
+        act_lock = menu.addAction("Zamknout")
+        action = menu.exec(self.grid_view.mapToGlobal(pos))
+        if action == act_unhide:
+            self.unhide_media_ids(ids)
+        elif action == act_open and rows:
+            self._on_photo_activated(rows[0])
+        elif action == act_info and rows:
+            self._show_file_info(rows[0])
+        elif action == act_lock:
+            self.locked.lock("manual")
+
+    def hide_media_ids(self, ids):
+        """Přesune položky do Skrytých (poprvé nejdřív nastavení hesla)."""
+        ids = [int(i) for i in ids]
+        if not ids or not self.locked.ensure_configured(self):
+            return 0
+        try:
+            n = locked_folder.hide_items(ids, self.locked.vault)
+        except locked_folder.VaultLocked:
+            if not self.locked.request_unlock(self):        # bez klíče účtu Windows: heslem
+                return 0
+            n = locked_folder.hide_items(ids, self.locked.vault)
+        except Exception as e:
+            show_toast(self, f"Skrytí se nepodařilo: {e}", "error")
+            return 0
+        self.grid_view.photo_model.ram_cache.discard(ids)    # nešifrované miniatury z RAM pryč
+        self._embeddings_cache = {k: v for k, v in (self._embeddings_cache or {}).items() if k not in set(ids)}
+        self._search_result = None
+        self._on_library_changed()
+        if n:
+            show_toast(self, f"Přesunuto do Skrytých: {_czech_item_count(n)}", "success")
+        return n
+
+    def unhide_media_ids(self, ids):
+        try:
+            n = locked_folder.unhide_items(ids, self.locked.vault)
+        except locked_folder.VaultLocked:
+            show_toast(self, "Skryté jsou zamčené – odemkněte je.", "error")
+            return 0
+        except Exception as e:
+            show_toast(self, f"Vrácení se nepodařilo: {e}", "error")
+            return 0
+        self.grid_view.photo_model.ram_cache.discard(int(i) for i in ids)
+        self._on_library_changed()
+        if n:
+            show_toast(self, f"Vráceno do knihovny: {_czech_item_count(n)}", "success")
+        return n
+
+    def _in_hidden_context(self):
+        """Je vidět obsah Skrytých? Mřížka Skryté, prohlížeč nebo prezentace otevřené z ní."""
+        if self._current_filter != "hidden":
+            return False
+        w = self.stack.currentWidget()
+        if w is self.page_photos:
+            return True
+        return (self.nav.root() is self.page_photos and isinstance(w, (MediaViewerWidget, SlideshowView))
+                and self._viewer_model is self.grid_view.photo_model)
+
+    def _check_hidden_context(self, *_):
+        # až po doběhnutí přepnutí: nav.reset() při vstupu do Skrytých krátce ukáže jinou stránku
+        QTimer.singleShot(0, self._enforce_hidden_context)
+
+    def _enforce_hidden_context(self):
+        if self.locked.is_unlocked and not self._in_hidden_context():
+            self.locked.lock("navigation")
+
+    def _on_hidden_unlocked(self):
+        try:
+            self._hidden_records = fetch_media_records(hidden=True)
+            self._vault_seen = {int(r[0]) for r in self._hidden_records}
+        except Exception as e:
+            print(f"[Skryté] {e}")
+            self._hidden_records = []
+        if self._current_filter == "hidden":
+            self.grid_view.photo_model.vault = self.locked.vault
+            self._apply_filter_and_sort()
+
+    def _on_hidden_locked(self, reason):
+        self._hidden_records = []
+        self.grid_view.photo_model.purge_vault()
+        viewer = self._viewer
+        if self._current_filter == "hidden" and self.nav.depth() > 0 and self.nav.root() is self.page_photos:
+            if viewer is not None:
+                viewer.cleanup_playback()
+            self.nav.reset()                        # prohlížeč / prezentaci skryté fotky zavřít
+        if viewer is not None and viewer.media_list and self._viewer_model is self.grid_view.photo_model                 and any(r[0] in self._vault_seen for r in viewer.media_list):
+            viewer.forget_media()                   # dekódovaný obraz ani seznam v paměti nezůstanou
+        self._vault_seen = set()
+        if self._current_filter == "hidden":
+            self._apply_filter_and_sort()           # mřížka prázdná, stav „zamčeno“
+            if reason in ("idle", "session", "minimize"):
+                show_toast(self, "Skryté se zamkly.", "info")
+
+    def _hidden_startup_sweep(self):
+        try:
+            locked_folder.startup_sweep(self.locked.vault)
+        except Exception as e:
+            print(f"[Skryté] úklid při startu: {e}")
+
+    def _sync_hidden_entry(self):
+        """Předvolby › Zobrazit Skryté v postranním panelu."""
+        item = self.sidebar_nav.item("hidden")
+        if item is not None:
+            item.setVisible(bool(self.config.get("show_hidden_folder", True)))
+
+    def open_hidden(self):
+        self.nav.reset()
+        self.sidebar_nav.set_current("hidden")
+        self._on_sidebar("hidden")
 
     def toggle_favorite_on_selection(self, grid=None):
         """F v mřížce: přepne srdíčko u výběru – v hlavní mřížce i v mřížce osoby / události."""
@@ -5182,6 +5411,8 @@ class MainWindow(QMainWindow):
             Command("Videa", lambda: nav("videos"), "page", icon="video", keywords="klipy filmy"),
             Command("Alba", lambda: nav("albums"), "page", icon="album", keywords="kolekce výběry"),
             Command("Smazané", lambda: nav("trash"), "page", icon="trash", keywords="koš"),
+        ] + ([Command("Skryté", lambda: nav("hidden"), "page", icon="lock", keywords="zamčené soukromé")]
+             if self.config.get("show_hidden_folder", True) else []) + [
             Command("Ozvěny", lambda: nav("echoes"), "page", icon="echo", keywords="tehdy teď návrat"),
             Command("Sestřihy", lambda: nav("reels"), "page", icon="reel",
                     keywords="reels video film throwback vzpomínky hudba export mp4"),
@@ -5763,12 +5994,15 @@ class MainWindow(QMainWindow):
         accepted = dlg.exec()
         if dlg.trash_emptied:                  # proběhlo i při Zrušit – knihovna musí sedět s DB
             self._on_library_changed()
+        if getattr(dlg, "hidden_requested", False) is True:   # Předvolby › Skryté › Otevřít
+            QTimer.singleShot(0, self.open_hidden)
         if getattr(dlg, "guide_requested", False) is True:   # Předvolby › Nápověda › Tipy a průvodce
             QTimer.singleShot(0, self.open_guide)
         if not accepted:
             return
         self.config = load_config()
         motion.configure(self.config)       # Omezit animace (Předvolby)
+        self._sync_hidden_entry()
         if bool(self.config.get("adaptive_accent", True)) != tokens.adaptive():
             tokens.set_adaptive(self.config.get("adaptive_accent", True))    # Přizpůsobit obsahu
             for card in getattr(self, "event_cards", []):
@@ -5890,6 +6124,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._shutting_down = True           # démon se už znovu nespustí (_start_ai_daemon)
+        self.locked.shutdown()               # klíč Skrytých pryč z paměti, štít dolů
         self.drop_router.detach()            # filtr tažení je na celé aplikaci
         self.folder_watcher.set_roots([])
         self._background_import = []         # rozpracovaný sken doběhne, další se už nespustí

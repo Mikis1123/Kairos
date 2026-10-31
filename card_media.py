@@ -121,6 +121,9 @@ def build(item, should_stop=None, threads=2, ffmpeg_path=None):
     """Vyrobí klip pro položku z plan(): Live Photo celý (≤ 3 s), video HIGHLIGHT_S kolem
     centre_ms (jinak ve 30 % délky). Vrací cestu, nebo None (chyba / zrušeno)."""
     source = item["source"]
+    import locked_folder
+    if locked_folder.is_hidden_path(source):
+        return None                          # Skryté: žádný klip na disku
     done = get_highlight(source)
     if done:
         return done

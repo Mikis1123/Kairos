@@ -608,6 +608,16 @@ class MediaViewerWidget(QWidget):
         self.current_index = start_index
         self.load_current_item()
 
+    def forget_media(self):
+        """Stage 3 (zamčení Skrytých): zapomenout seznam i všechny dekódované snímky v paměti."""
+        self.cleanup_playback()
+        self.media_list = []
+        self.current_index = 0
+        self._current_photo_path = None
+        self._images._cache.clear()
+        self._full_pool.clear()
+        self.canvas.clear_image()           # i pyramida originálu (zoom.set_photo)
+
     def request_close(self):
         self.canvas.zoom.reset(animate=False)       # zavření (hero do dlaždice) z vešlé fotky
         self.cleanup_playback()

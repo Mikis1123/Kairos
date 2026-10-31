@@ -23,10 +23,25 @@ def _check_test_guard(path):
             f"Test přistupuje ke skutečné knihovně {REAL_DB_PATH} – přesměrujte database.DB_PATH")
 
 
+def not_hidden_sql(alias="m"):
+    """Stage 3: položka není ve složce Skryté (locked_folder). Platí všude mimo samotnou složku."""
+    return f"COALESCE({alias}.is_hidden, 0) = 0"
+
+
+# Poddotaz id skrytých položek – pro tabulky odvozených dat (tváře, vektory, OCR) bez joinu
+HIDDEN_IDS_SQL = "SELECT id FROM media_items WHERE is_hidden = 1"
+
+
 def visible_media_sql(alias="m"):
     """SQL podmínka pro položky, které uživatel vidí: bez pohybových videí Live Photos
-    (patří k fotce) a bez položek v koši."""
-    return (f"COALESCE({alias}.is_trashed, 0) = 0 AND NOT EXISTS ("
+    (patří k fotce), bez položek v koši a bez položek ve složce Skryté."""
+    return (f"COALESCE({alias}.is_trashed, 0) = 0 AND {not_hidden_sql(alias)} AND NOT EXISTS ("
+            f"SELECT 1 FROM media_items lp WHERE lp.paired_video_path = {alias}.file_path)")
+
+
+def hidden_media_sql(alias="m"):
+    """Obsah složky Skryté: skryté položky mimo koš, bez pohybových videí Live Photos."""
+    return (f"COALESCE({alias}.is_hidden, 0) = 1 AND COALESCE({alias}.is_trashed, 0) = 0 AND NOT EXISTS ("
             f"SELECT 1 FROM media_items lp WHERE lp.paired_video_path = {alias}.file_path)")
 
 
@@ -262,6 +277,9 @@ def init_db():
             # Sprint 2: původ polohy – NULL/'exif' = ze souboru, 'borrowed' = z telefonu ve stejné
             # chvíli (location_borrow), 'manual' = oprava uživatelem; opravy jdou i do XMP sidecaru
             ("gps_source", "TEXT"),
+            # Stage 3: složka Skryté (locked_folder) – mimo knihovnu, hledání, tváře, mapu i sestřihy
+            ("is_hidden", "INTEGER DEFAULT 0"),
+            ("hidden_at", "TEXT"),
         ])
         if "faces_scanned" in added_media:
             # Fotky, které už mají nalezené obličeje, se znovu analyzovat nemusí.
@@ -370,6 +388,7 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_face_person ON face_instances(person_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_face_media ON face_instances(media_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_event ON media_items(event_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_hidden ON media_items(id) WHERE is_hidden = 1;")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_paired ON media_items(paired_video_path);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_content_id ON media_items(content_identifier);")
         cursor.execute(
@@ -481,6 +500,7 @@ def query_geo_bounds(min_lat, max_lat, min_lon, max_lon):
                 JOIN media_items m ON g.id = m.id
                 WHERE g.min_lat >= ? AND g.max_lat <= ?
                   AND g.min_lon >= ? AND g.max_lon <= ?
+                  AND COALESCE(m.is_hidden, 0) = 0
             """, (min_lat, max_lat, min_lon, max_lon))
             return c.fetchall()
         except sqlite3.OperationalError:
@@ -508,7 +528,7 @@ def trash_media(media_ids):
     with db_transaction() as conn:
         c = conn.cursor()
         c.executemany("UPDATE media_items SET is_trashed = 1, trashed_at = datetime('now', 'localtime') "
-                      "WHERE id = ? AND COALESCE(is_trashed, 0) = 0", ids)
+                      "WHERE id = ? AND COALESCE(is_trashed, 0) = 0 AND COALESCE(is_hidden, 0) = 0", ids)
         changed = c.rowcount
         _sync_geo(conn)                  # mapa ve stejné transakci (atomicky), jen rozdíl
     return changed
@@ -526,6 +546,81 @@ def restore_media(media_ids):
         changed = c.rowcount
         _sync_geo(conn)                  # mapa ve stejné transakci (atomicky), jen rozdíl
     return changed
+
+
+# ==============================================================================
+# Stage 3: složka Skryté – příznak a úklid odvozených dat (soubory řeší locked_folder)
+# ==============================================================================
+
+def hide_media(media_ids):
+    """Přesune položky (mimo koš) do složky Skryté a ve stejné transakci smaže všechno, co se z nich
+    odvodilo: tváře, vektory hledání (CLIP, SigLIP, snímky videí), OCR, duplicity a bod na mapě.
+    Po odkrytí je démon spočítá znovu. Vrací [(id, file_path, paired_video_path, thumbnail_path,
+    media_type)] skutečně skrytých, cesty ořezů tváří ke smazání a osoby, kterým ubyly tváře:
+    {"rows": [...], "crops": [...], "people": {...}}."""
+    ids = sorted({int(i) for i in media_ids})
+    out = {"rows": [], "crops": [], "people": set()}
+    if not ids:
+        return out
+    with db_transaction() as conn:
+        c = conn.cursor()
+        marks = ",".join("?" * len(ids))
+        rows = c.execute(f"SELECT id, file_path, paired_video_path, thumbnail_path, media_type FROM media_items "
+                         f"WHERE id IN ({marks}) AND COALESCE(is_hidden, 0) = 0 "
+                         f"AND COALESCE(is_trashed, 0) = 0", ids).fetchall()
+        if not rows:
+            return out
+        hid = [r[0] for r in rows]
+        marks = ",".join("?" * len(hid))
+        crops = [p for (p,) in c.execute(f"SELECT face_crop_path FROM face_instances WHERE media_id IN ({marks}) "
+                                         f"AND face_crop_path IS NOT NULL", hid)]
+        people = {p for (p,) in c.execute(f"SELECT DISTINCT person_id FROM face_instances WHERE media_id IN ({marks}) "
+                                          f"AND person_id IS NOT NULL", hid)}
+        c.execute(f"UPDATE media_items SET is_hidden = 1, hidden_at = datetime('now', 'localtime'), "
+                  f"thumbnail_path = NULL, faces_scanned = 0, is_duplicate = 0, duplicate_group_id = NULL "
+                  f"WHERE id IN ({marks})", hid)
+        # osoby, jejichž portrét byl z těchto fotek: portrét se přepočítá (face_cluster) / zmizí
+        c.execute(f"UPDATE people SET cover_face_path = NULL, key_face_id = NULL WHERE key_face_id IN "
+                  f"(SELECT id FROM face_instances WHERE media_id IN ({marks}))", hid)
+        for table in ("face_instances", "image_embeddings", "siglip_embeddings", "video_frame_embeddings",
+                      "media_ocr"):
+            c.execute(f"DELETE FROM {table} WHERE media_id IN ({marks})", hid)
+        _sync_geo(conn)
+    out.update(rows=rows, crops=crops, people=people)
+    return out
+
+
+def unhide_media(media_ids):
+    """Vrátí položky ze složky Skryté do knihovny. Tváře, vektory a OCR dopočítá démon na pozadí
+    (faces_scanned = 0, vektory chybí). Vrací [(id, file_path, media_type)] odkrytých."""
+    ids = sorted({int(i) for i in media_ids})
+    if not ids:
+        return []
+    with db_transaction() as conn:
+        c = conn.cursor()
+        marks = ",".join("?" * len(ids))
+        rows = c.execute(f"SELECT id, file_path, media_type FROM media_items WHERE id IN ({marks}) "
+                         f"AND is_hidden = 1", ids).fetchall()
+        if rows:
+            c.execute(f"UPDATE media_items SET is_hidden = 0, hidden_at = NULL, faces_scanned = 0 "
+                      f"WHERE id IN ({','.join('?' * len(rows))})", [r[0] for r in rows])
+            _sync_geo(conn)
+    return rows
+
+
+def hidden_paths(conn=None):
+    """Cesty originálů skrytých položek včetně pohybových videí jejich Live Photos (pro stráže
+    diskových cache – náhledy, pásy, proxy se pro ně nevytvářejí)."""
+    own = conn is None
+    conn = conn or get_connection()
+    try:
+        out = set()
+        for fp, paired in conn.execute("SELECT file_path, paired_video_path FROM media_items WHERE is_hidden = 1"):
+            out.update(p for p in (fp, paired) if p)
+        return out
+    finally:
+        if own:
+            conn.close()
 
 
 def _pair_key(id_a, id_b):
@@ -577,7 +672,7 @@ def save_image_embedding(media_id, embedding_bytes, source_sig=None):
         c = conn.cursor()
         c.execute("""
             INSERT OR REPLACE INTO image_embeddings (media_id, embedding, source_sig)
-            VALUES (?, ?, ?)
+            SELECT ?1, ?2, ?3 WHERE ?1 NOT IN (SELECT id FROM media_items WHERE is_hidden = 1)
         """, (media_id, embedding_bytes, source_sig))
 
 
@@ -591,6 +686,7 @@ def get_media_needing_embedding():
             SELECT m.id, m.file_path, m.thumbnail_path, m.media_type, {EMBEDDING_SIG_SQL}
             FROM media_items m LEFT JOIN image_embeddings e ON e.media_id = m.id
             WHERE NOT EXISTS (SELECT 1 FROM media_items lp WHERE lp.paired_video_path = m.file_path)
+              AND {not_hidden_sql('m')}
               AND (e.media_id IS NULL OR e.source_sig IS NULL OR e.source_sig != {EMBEDDING_SIG_SQL})
             ORDER BY m.date_taken DESC, m.id DESC
         """).fetchall()
@@ -607,6 +703,7 @@ def get_media_needing_siglip():
             SELECT m.id, m.file_path, m.thumbnail_path, m.media_type, {EMBEDDING_SIG_SQL}
             FROM media_items m LEFT JOIN siglip_embeddings e ON e.media_id = m.id
             WHERE NOT EXISTS (SELECT 1 FROM media_items lp WHERE lp.paired_video_path = m.file_path)
+              AND {not_hidden_sql('m')}
               AND (e.media_id IS NULL OR e.source_sig IS NULL OR e.source_sig != {EMBEDDING_SIG_SQL})
             ORDER BY m.date_taken DESC, m.id DESC
         """).fetchall()
@@ -620,7 +717,7 @@ def save_siglip_embeddings(rows):
         return
     with db_transaction() as conn:
         conn.executemany("INSERT OR REPLACE INTO siglip_embeddings (media_id, embedding, source_sig) "
-                         "VALUES (?, ?, ?)", rows)
+                         f"SELECT ?1, ?2, ?3 WHERE ?1 NOT IN ({HIDDEN_IDS_SQL})", rows)
 
 
 def siglip_coverage():
@@ -629,9 +726,9 @@ def siglip_coverage():
     try:
         # měřítko = položky, které má CLIP (fotka bez miniatury / rozbité video nemá ani jeden)
         need = conn.execute(f"""SELECT COUNT(*) FROM image_embeddings e JOIN media_items m ON m.id = e.media_id
-            WHERE e.source_sig = {EMBEDDING_SIG_SQL}""").fetchone()[0]
+            WHERE e.source_sig = {EMBEDDING_SIG_SQL} AND {not_hidden_sql('m')}""").fetchone()[0]
         have = conn.execute(f"""SELECT COUNT(*) FROM siglip_embeddings e JOIN media_items m ON m.id = e.media_id
-            WHERE e.source_sig = {EMBEDDING_SIG_SQL}""").fetchone()[0]
+            WHERE e.source_sig = {EMBEDDING_SIG_SQL} AND {not_hidden_sql('m')}""").fetchone()[0]
         return int(have), int(need)
     finally:
         conn.close()
@@ -642,13 +739,15 @@ def get_siglip_vectors(ids=None):
     conn = get_connection()
     try:
         if ids is None:
-            rows = conn.execute("SELECT media_id, embedding FROM siglip_embeddings").fetchall()
+            rows = conn.execute(f"SELECT media_id, embedding FROM siglip_embeddings "
+                                f"WHERE media_id NOT IN ({HIDDEN_IDS_SQL})").fetchall()
         else:
             ids = [int(i) for i in ids]
             if not ids:
                 return {}
             rows = conn.execute(f"SELECT media_id, embedding FROM siglip_embeddings "
-                                f"WHERE media_id IN ({','.join('?' * len(ids))})", ids).fetchall()
+                                f"WHERE media_id IN ({','.join('?' * len(ids))}) "
+                                f"AND media_id NOT IN ({HIDDEN_IDS_SQL})", ids).fetchall()
         return {r[0]: r[1] for r in rows}
     finally:
         conn.close()
@@ -662,6 +761,7 @@ def get_media_needing_ocr():
             SELECT m.id, m.file_path, {EMBEDDING_SIG_SQL}
             FROM media_items m LEFT JOIN media_ocr o ON o.media_id = m.id
             WHERE m.media_type IN ('photo', 'live_photo') AND COALESCE(m.is_trashed, 0) = 0
+              AND {not_hidden_sql('m')}
               AND (o.media_id IS NULL OR o.source_sig IS NULL OR o.source_sig != {EMBEDDING_SIG_SQL})
             ORDER BY m.date_taken DESC, m.id DESC
         """).fetchall()
@@ -674,7 +774,8 @@ def save_ocr_results(rows):
     if not rows:
         return
     with db_transaction() as conn:
-        conn.executemany("INSERT OR REPLACE INTO media_ocr (media_id, text, source_sig) VALUES (?, ?, ?)", rows)
+        conn.executemany("INSERT OR REPLACE INTO media_ocr (media_id, text, source_sig) "
+                         f"SELECT ?1, ?2, ?3 WHERE ?1 NOT IN ({HIDDEN_IDS_SQL})", rows)
 
 
 def get_all_embeddings():
@@ -682,7 +783,7 @@ def get_all_embeddings():
     conn = get_connection()
     try:
         c = conn.cursor()
-        c.execute("SELECT media_id, embedding FROM image_embeddings")
+        c.execute(f"SELECT media_id, embedding FROM image_embeddings WHERE media_id NOT IN ({HIDDEN_IDS_SQL})")
         rows = c.fetchall()
         return {r[0]: r[1] for r in rows}
     finally:
@@ -697,6 +798,8 @@ def save_video_frame_embeddings(media_id, frames, source_sig):
     značka, že z videa snímky nejdou (rozbitý soubor) – další spuštění ho přeskočí."""
     with db_transaction() as conn:
         conn.execute("DELETE FROM video_frame_embeddings WHERE media_id = ?", (media_id,))
+        if conn.execute("SELECT 1 FROM media_items WHERE id = ? AND is_hidden = 1", (media_id,)).fetchone():
+            return                      # skryto během výpočtu: odvozená data skrytých se neukládají
         rows = [(media_id, int(ms), emb, source_sig) for ms, emb in frames] or \
                [(media_id, VIDEO_FRAME_MARKER_MS, b"", source_sig)]
         conn.executemany("INSERT INTO video_frame_embeddings (media_id, frame_ms, embedding, source_sig) "
@@ -736,9 +839,11 @@ def get_search_vectors(ids=None):
     try:
         if ids is not None:
             out = {r[0]: r[1] for r in conn.execute(
-                f"SELECT media_id, embedding FROM image_embeddings WHERE 1=1{where}", params)}
+                f"SELECT media_id, embedding FROM image_embeddings WHERE media_id NOT IN ({HIDDEN_IDS_SQL})"
+                f"{where}", params)}
         rows = conn.execute("SELECT media_id, embedding FROM video_frame_embeddings "
-                            f"WHERE frame_ms >= 0{where} ORDER BY media_id, frame_ms", params).fetchall()
+                            f"WHERE frame_ms >= 0 AND media_id NOT IN ({HIDDEN_IDS_SQL}){where} "
+                            "ORDER BY media_id, frame_ms", params).fetchall()
     finally:
         conn.close()
     frames = {}
@@ -842,6 +947,7 @@ def get_media_pending_face_scan():
         c.execute("""
             SELECT id, file_path FROM media_items
             WHERE faces_scanned = 0 AND file_path IS NOT NULL AND media_type != 'video'
+              AND COALESCE(is_hidden, 0) = 0
             ORDER BY id
         """)
         return c.fetchall()
@@ -854,6 +960,14 @@ def save_faces_for_media(media_id, faces):
     a označí fotku jako zpracovanou - i když žádný obličej nenašla."""
     with db_transaction() as conn:
         c = conn.cursor()
+        if c.execute("SELECT 1 FROM media_items WHERE id = ? AND is_hidden = 1", (media_id,)).fetchone():
+            for f in faces or []:       # skryto během detekce: tváře skrytých fotek se neukládají
+                if f.get("crop_path"):      # (ani jejich ořezy na disku)
+                    try:
+                        os.remove(f["crop_path"])
+                    except OSError:
+                        pass
+            return
         for f in faces or []:
             c.execute("""
                 INSERT INTO face_instances

@@ -166,6 +166,9 @@ class ScrubStrip:
 
     # ── disk ──
     def save(self, path=None):
+        import locked_folder
+        if locked_folder.is_hidden_path(self.source):
+            return None                      # Skryté: pás jen v paměti, na disk ne
         path = path or strip_path(self.source)
         with self._lock:
             frames, blobs, offset = [], [], 0

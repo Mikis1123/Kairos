@@ -20,8 +20,8 @@ except Exception:
 def make_db():
     conn = sqlite3.connect(":memory:")
     conn.execute("""CREATE TABLE media_items (id INTEGER PRIMARY KEY, date_taken TEXT, thumbnail_path TEXT,
-                    is_trashed INTEGER DEFAULT 0)""")
-    conn.executemany("INSERT INTO media_items VALUES (?, ?, ?, 0)",
+                    is_trashed INTEGER DEFAULT 0, is_hidden INTEGER DEFAULT 0)""")
+    conn.executemany("INSERT INTO media_items VALUES (?, ?, ?, 0, 0)",
                      [(i, f"2024-01-0{i} 10:00:00", f"t{i}.jpg") for i in range(1, 6)])
     albums.ensure_tables(conn)
     return conn

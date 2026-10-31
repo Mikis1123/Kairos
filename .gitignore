@@ -27,3 +27,6 @@ perf_logs/
 
 # Denní zálohy knihovny (database.backup_database)
 backups/
+
+# Locked folder (Skryté): wrapped key + sealed thumbnails, never versioned
+vault/

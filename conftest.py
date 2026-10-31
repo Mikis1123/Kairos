@@ -25,6 +25,7 @@ paths.PROXY_DIR = os.path.join(_preview_tmp, "proxies")      # proxy videí (Fá
 paths.BACKUP_DIR = os.path.join(_preview_tmp, "backups")     # denní zálohy DB (Sprint R)
 paths.TILE_STORE_PATH = os.path.join(_preview_tmp, "tiles.sqlite")   # úložiště dlaždic (C7e)
 paths.HIGHLIGHT_DIR = os.path.join(_preview_tmp, "highlights")       # klipy karet Cesty
+paths.VAULT_DIR = os.path.join(_preview_tmp, "vault")                # složka Skryté (Stage 3)
 atexit.register(shutil.rmtree, _preview_tmp, True)
 
 # Patch 11: ani config.json aplikace – load_config() jinak při chybějícím souboru sáhl na

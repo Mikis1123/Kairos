@@ -141,6 +141,9 @@ def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=
     z ffmpeg -progress (převod 4K HDR trvá minuty – uživatel má vidět, že se něco děje)."""
     if not source or not os.path.exists(source):
         return None
+    import locked_folder
+    if locked_folder.is_hidden_path(source):
+        return None                          # Skryté: žádná nešifrovaná kopie na disku
     if is_settled(source):
         return get_proxy(source)
     os.makedirs(paths.PROXY_DIR, exist_ok=True)
