@@ -5142,9 +5142,10 @@ class MainWindow(QMainWindow):
         act_fav = menu.addAction("Přidat/odebrat oblíbené (F)")
         act_open = menu.addAction("Otevřít")
         ids = [int(self._filtered_records[r][0]) for r in rows if 0 <= r < len(self._filtered_records)]
-        act_hide = None
+        act_hide = act_export = None
         if self._current_filter != "trash":
             self._add_album_menu(menu, ids)
+            act_export = menu.addAction("Exportovat…")
         menu.addSeparator()
         act_info = menu.addAction("Informace o souboru")
         menu.addSeparator()
@@ -5155,6 +5156,8 @@ class MainWindow(QMainWindow):
         action = menu.exec(self.grid_view.mapToGlobal(pos))
         if action is not None and action == act_hide:
             self.hide_media_ids(ids)
+        elif action is not None and action == act_export:
+            self.export_media_ids(ids, self._search_query.strip() or "Export")
         elif action == act_trash:
             self._set_trashed_for_rows(rows, not in_trash)
         elif action == act_fav:
@@ -5376,12 +5379,19 @@ class MainWindow(QMainWindow):
         grid = AppleGridView(self, parent)
         grid.set_cell_size(self.grid_view.cell_size)
         grid.photo_model.set_records(records)
-        grid.item_activated.connect(
-            lambda row, g=grid: self._open_viewer(g.photo_model.records, row, g.photo_model))
+        grid.item_activated.connect(lambda row, g=grid: self._on_collection_activated(g, row))
         grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         grid.customContextMenuRequested.connect(
             lambda pos, g=grid: self._collection_context_menu(g, pos, album_id))
         return grid
+
+    def _on_collection_activated(self, grid, row):
+        pick = getattr(grid, "_cover_pick_cb", None)     # Alba v2: režim výběru obálky
+        if pick is not None:
+            grid._cover_pick_cb = None
+            pick(row)
+            return
+        self._open_viewer(grid.photo_model.records, row, grid.photo_model)
 
     # ── Sprint 2: Paleta příkazů ──────────────────────────────────────────────
 
@@ -5473,6 +5483,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         act_fav = menu.addAction("Přidat/odebrat oblíbené (F)")
         self._add_album_menu(menu, ids, exclude=album_id)
+        act_export = menu.addAction("Exportovat…")
         act_remove = act_cover = None
         if album_id is not None:
             menu.addSeparator()
@@ -5483,6 +5494,8 @@ class MainWindow(QMainWindow):
             return
         if chosen == act_fav:
             self.toggle_favorite_on_selection(grid)
+        elif chosen == act_export:
+            self.export_media_ids(ids)
         elif chosen == act_remove:
             self._album_edit(lambda conn: albums.remove_items(conn, album_id, ids))
             gone = set(ids)
@@ -5494,7 +5507,7 @@ class MainWindow(QMainWindow):
             self._refresh_albums_panel()
 
     def _add_album_menu(self, menu, ids, exclude=None):
-        """Podnabídka „Přidat do alba“: existující ruční alba + nové album z výběru."""
+        """Podnabídka „Přidat do alba“: existující ruční alba (s cestou složek) + nové album z výběru."""
         sub = menu.addMenu("Přidat do alba")
         conn = get_connection()
         try:
@@ -5502,12 +5515,13 @@ class MainWindow(QMainWindow):
             manual = [a for a in albums.list_albums(conn) if a["kind"] == "manual" and a["id"] != exclude]
         finally:
             conn.close()
+        manual.sort(key=lambda a: a["path"].casefold())
         act_new = sub.addAction("Nové album…")
         act_new.triggered.connect(lambda: self._new_album(ids))
         if manual:
             sub.addSeparator()
         for a in manual:
-            act = sub.addAction(a["name"])
+            act = sub.addAction(a["path"])
             act.triggered.connect(lambda _=False, a=a: self._add_to_album(a, ids))
         return sub
 
@@ -5531,11 +5545,11 @@ class MainWindow(QMainWindow):
                    on_action=lambda: self._open_album_by_id(album["id"]))
         self._refresh_albums_panel()
 
-    def _new_album(self, ids=()):
+    def _new_album(self, ids=(), parent_id=None):
         name, ok = InWindowDialog.getText(self, "Nové album", "Název alba:", text="")
         if not ok or not name.strip():
             return None
-        aid = self._album_edit(lambda conn: albums.create_album(conn, name, ids))
+        aid = self._album_edit(lambda conn: albums.create_album(conn, name, ids, parent_id))
         if aid is None:
             return None
         if ids:
@@ -5543,6 +5557,16 @@ class MainWindow(QMainWindow):
                        action_text="Otevřít", on_action=lambda: self._open_album_by_id(aid))
         self._refresh_albums_panel()
         return aid
+
+    def _new_folder(self, parent_id=None):
+        name, ok = InWindowDialog.getText(self, "Nová složka", "Název složky alb:", text="", action_text="Vytvořit")
+        if not ok or not name.strip():
+            return None
+        fid = self._album_edit(lambda conn: albums.create_folder(conn, name, parent_id))
+        if fid is not None:
+            show_toast(self, f"Složka „{' '.join(name.split())}“ – alba do ní přetáhněte", "success")
+            self._refresh_albums_panel()
+        return fid
 
     def save_search_as_smart_album(self):
         """Aktuální hledání (a kolekce) jako chytré album – samo se doplňuje novými fotkami."""
@@ -5561,35 +5585,68 @@ class MainWindow(QMainWindow):
         return aid
 
     def _refresh_albums_panel(self):
-        panel = getattr(self, "_albums_panel", None)
-        if panel is None:
-            return
-        try:
-            panel.load()
-        except RuntimeError:                     # stránka už zavřená (C++ objekt smazán)
-            self._albums_panel = None
+        """Všechny otevřené úrovně Alb (kořen i podsložky v zásobníku stránek)."""
+        alive = []
+        for panel, page in getattr(self, "_albums_panels", []):
+            try:
+                n = panel.load()
+                if panel.folder_id is None:
+                    page.set_title("Alba", albums.czech_albums(n) if n else "Vaše výběry a uložená hledání")
+                alive.append((panel, page))
+            except RuntimeError:                 # stránka už zavřená (C++ objekt smazán)
+                pass
+        self._albums_panels = alive
 
-    def open_albums(self):
-        """Postranní panel Kolekce › Alba: ruční a chytrá alba (albums.py)."""
+    def open_albums(self, folder_id=None):
+        """Postranní panel Kolekce › Alba: složky, ruční a chytrá alba (albums.py). folder_id = podsložka."""
         import albums_view
-        self.nav.reset()
-        page = DetailPage("Alba", "Vaše výběry a uložená hledání")
+        name, subtitle = None, "Vaše výběry a uložená hledání"
+        if folder_id is None:
+            self.nav.reset()
+        else:
+            conn = get_connection()
+            try:
+                albums.ensure_tables(conn)
+                node = albums.get_album(conn, folder_id)
+                crumbs = albums.ancestors(conn, folder_id)
+            finally:
+                conn.close()
+            if not node:
+                return
+            name = node["name"]
+            subtitle = " › ".join(["Alba"] + [n for _i, n in crumbs[:-1]])
+        page = DetailPage(name or "Alba", subtitle)
         page.setProperty("sidebar_key", "albums")
-        panel = albums_view.AlbumsPanel(get_connection, page)
+        panel = albums_view.AlbumsPanel(get_connection, page, folder_id=folder_id, edit=self._album_edit)
         panel.opened.connect(self._open_album)
         panel.rename_requested.connect(self._rename_album)
         panel.delete_requested.connect(self._delete_album)
-        page.add_action("Nové album", lambda: self._new_album())
-        btn = page.add_action("Uložit hledání", self.save_search_as_smart_album,
-                              "Aktuální hledání jako chytré album (samo se doplňuje)")
-        btn.setEnabled(bool(self._search_query.strip()))
+        panel.export_requested.connect(self._export_album)
+        panel.cover_requested.connect(lambda a: self._open_album(a, pick_cover=True))
+        panel.cover_reset_requested.connect(self._reset_album_cover)
+        panel.changed.connect(self._refresh_albums_panel)
+        page.add_action("Nová složka", lambda: self._new_folder(folder_id), "Složka seskupí alba (přetáhněte je do ní)")
+        page.add_action("Nové album", lambda: self._new_album(parent_id=folder_id))
+        if folder_id is None:
+            btn = page.add_action("Uložit hledání", self.save_search_as_smart_album,
+                                  "Aktuální hledání jako chytré album (samo se doplňuje)")
+            btn.setEnabled(bool(self._search_query.strip()))
+        else:
+            page.add_action("Exportovat", lambda: self._export_album({"id": folder_id, "name": name}),
+                            "Všechna ruční alba ve složce – s volbami soukromí")
         page.set_content(panel)
-        self._albums_panel = panel
+        if folder_id is None:
+            self._albums_panels = []
+        self._albums_panels = getattr(self, "_albums_panels", []) + [(panel, page)]
         self.nav.push(page, on_pop=self._sync_sidebar)
         self._sync_sidebar()
         n = panel.load()
-        if n:
+        if n and folder_id is None:
             page.set_title("Alba", albums.czech_albums(n))
+
+    def _reset_album_cover(self, album):
+        if self._album_edit(lambda conn: albums.set_cover(conn, album["id"], None)) is not None:
+            self._refresh_albums_panel()
 
     def _open_album_by_id(self, album_id):
         conn = get_connection()
@@ -5601,7 +5658,10 @@ class MainWindow(QMainWindow):
         if album:
             self._open_album(album)
 
-    def _open_album(self, album):
+    def _open_album(self, album, pick_cover=False):
+        if album["kind"] == "folder":
+            self.open_albums(album["id"])
+            return
         if album["kind"] == "smart":             # chytré album = hledání v mřížce Fotografie
             self.nav.reset()
             self._set_filter(album.get("filter") or "all")
@@ -5609,20 +5669,74 @@ class MainWindow(QMainWindow):
             self.search_bar.setText(album["query"])
             self._sync_sidebar()
             return
+        import album_reorder
         conn = get_connection()
         try:
             ids = albums.item_ids(conn, album["id"])
+            info = albums.get_album(conn, album["id"]) or album
         finally:
             conn.close()
         records = fetch_media_records(f"m.id IN ({','.join('?' * len(ids))})", tuple(ids)) if ids else []
+        rank = {mid: i for i, mid in enumerate(ids)}
+        records.sort(key=lambda r: rank.get(int(r[0]), 1 << 30))   # pořadí alba (datum / vlastní)
         page = DetailPage(album["name"], _czech_photo_count(len(records)))
         page.setProperty("sidebar_key", "albums")
-        page.add_action("Přejmenovat", lambda: self._rename_album(album, page))
         grid = self._make_collection_grid(records, page, album_id=album["id"])
+        sort = SegmentedControl([("Podle data", "date"), ("Vlastní", "custom")], current=info.get("sort_mode", "date"))
+        sort.setToolTip("Vlastní pořadí: vybrané fotky přetáhněte na nové místo")
+        sort.changed.connect(lambda mode: self._set_album_sort(album["id"], grid, mode))
+        page.actions_layout.addWidget(sort)
+        page.add_action("Obálka…", lambda: self._begin_cover_pick(album, grid), "Vyberte fotku, která bude obálkou alba")
+        page.add_action("Exportovat", lambda: self._export_album(album), "Kopie bez polohy a jmen osob, ZIP nebo web")
+        page.add_action("Přejmenovat", lambda: self._rename_album(album, page))
+
+        def on_move(moved, before):
+            order = self._album_edit(lambda conn: albums.move_items(conn, album["id"], moved, before))
+            if not isinstance(order, list):
+                return
+            self._apply_album_order(grid, order)
+            sel = grid.selectionModel()
+            for mid in moved:
+                row = grid.photo_model.id_to_row.get(int(mid))
+                if row is not None:
+                    sel.select(grid.photo_model.index(row, 0), sel.SelectionFlag.Select)
+            sort.set_current("custom")
+        grid._reorder = album_reorder.GridReorder(grid, on_move)
         self._add_slideshow_action(page, grid)
         page.set_content(grid)
         self.nav.push(page, on_pop=self._sync_sidebar)
         self._sync_sidebar()
+        if pick_cover:
+            self._begin_cover_pick(album, grid)
+
+    @staticmethod
+    def _apply_album_order(grid, order):
+        pos = {mid: i for i, mid in enumerate(order)}
+        grid.photo_model.set_records(sorted(grid.photo_model.records, key=lambda r: pos.get(int(r[0]), 1 << 30)))
+
+    def _set_album_sort(self, album_id, grid, mode):
+        if self._album_edit(lambda conn: albums.set_sort_mode(conn, album_id, mode)) is None:
+            return
+        conn = get_connection()
+        try:
+            order = albums.item_ids(conn, album_id)
+        finally:
+            conn.close()
+        self._apply_album_order(grid, order)
+
+    def _begin_cover_pick(self, album, grid):
+        """Režim výběru obálky: další aktivace dlaždice (dvojklik / Enter) nastaví obálku místo otevření."""
+        def pick(row):
+            recs = grid.photo_model.records
+            if not (0 <= row < len(recs)):
+                return
+            if self._album_edit(lambda conn: albums.set_cover(conn, album["id"], int(recs[row][0]))) is None:
+                return
+            self._refresh_albums_panel()
+            show_toast(self, f"Obálka alba „{album['name']}“ nastavena", "success")
+        grid._cover_pick_cb = pick
+        show_toast(self, "Dvakrát klikněte na fotku, která bude obálkou alba", "info",
+                   action_text="Zrušit", on_action=lambda: setattr(grid, "_cover_pick_cb", None))
 
     def _rename_album(self, album, page=None):
         name, ok = InWindowDialog.getText(self, "Přejmenovat album", "Nový název:", text=album["name"])
@@ -5638,8 +5752,84 @@ class MainWindow(QMainWindow):
     def _delete_album(self, album):
         if self._album_edit(lambda conn: albums.delete_album(conn, album["id"])) is None:
             return
-        show_toast(self, f"Album „{album['name']}“ smazáno – fotky zůstaly v knihovně", "success")
+        text = (f"Složka „{album['name']}“ smazána – její alba jsou o úroveň výš" if album.get("kind") == "folder"
+                else f"Album „{album['name']}“ smazáno – fotky zůstaly v knihovně")
+        show_toast(self, text, "success")
         self._refresh_albums_panel()
+
+    # ── Stage 4: čistý soukromý export ────────────────────────────────────────
+
+    def export_media_ids(self, ids, title="Export"):
+        """List s volbami soukromí → cíl → export ve vlákně (privacy_export, export_sheet)."""
+        import export_sheet
+        import privacy_export as pe
+        job = getattr(self, "_privacy_export", None)
+        if job is not None and job.isRunning():
+            show_toast(self, "Export už běží", "info", action_text="Zrušit", on_action=job.stop)
+            return None
+        conn = get_connection()
+        try:
+            items, skipped = pe.collect(conn, ids)
+            names = pe.person_names(conn)
+        finally:
+            conn.close()
+        if not items:
+            show_toast(self, "Není co exportovat", "info")
+            return None
+        opts = export_sheet.ask_options(self, len(items), export_sheet.options_from_config(self.config, title),
+                                        pe.exiftool_available())
+        if opts is None:
+            return None
+        self.config["export_options"] = export_sheet.options_to_config(opts)
+        start_dir = self.config.get("export_last_dir") or os.path.join(os.path.expanduser("~"), "Pictures")
+        base = pe.default_name(title)
+        if opts.package == "zip":
+            dest, _ = QFileDialog.getSaveFileName(self, "Uložit export", os.path.join(start_dir, base + ".zip"),
+                                                  "Archiv ZIP (*.zip)")
+        else:
+            parent = QFileDialog.getExistingDirectory(self, "Kam export uložit (vytvoří se nová složka)", start_dir)
+            dest = os.path.join(parent, base) if parent else ""
+        if not dest:
+            return None
+        self.config["export_last_dir"] = os.path.dirname(dest)
+        save_config(self.config)
+        job = export_sheet.PrivacyExportJob(items, opts, dest, names, self)
+        job.progress.connect(lambda f: self.lbl_status.set_task("privacy_export", f"Exportuji… {f * 100:.0f} %"))
+
+        def done(res):
+            self.lbl_status.set_task("privacy_export", "")
+            for name, why in res.excluded + skipped:
+                print(f"[Export] vynecháno: {name} – {why}")
+            text = f"Exportováno: {res.summary()}"
+            if res.excluded:
+                text += " – vyřazené položky by prozradily polohu nebo jména"
+            show_toast(self, text, "success" if not res.excluded else "info", action_text="Zobrazit ve složce",
+                       on_action=lambda: subprocess.Popen(["explorer", "/select,", os.path.normpath(res.path)]))
+
+        def failed(err):
+            self.lbl_status.set_task("privacy_export", "")
+            show_toast(self, f"Export se nepodařil: {err}", "error")
+
+        def cancelled():
+            self.lbl_status.set_task("privacy_export", "")
+            show_toast(self, "Export zrušen – nic se neuložilo", "info")
+        job.finished_ok.connect(done)
+        job.failed.connect(failed)
+        job.cancelled.connect(cancelled)
+        self._privacy_export = job
+        job.start()
+        show_toast(self, f"Exportuji {_czech_item_count(len(items))}…", "info", action_text="Zrušit",
+                   on_action=job.stop)
+        return job
+
+    def _export_album(self, album):
+        conn = get_connection()
+        try:
+            albums.ensure_tables(conn)
+            ids = albums.export_item_ids(conn, album["id"])
+        finally:
+            conn.close()
+        self.export_media_ids(ids, album["name"])
 
     def _rename_person(self, person_id: int, current_name: str, page=None):
         new_name, ok = InWindowDialog.getText(
