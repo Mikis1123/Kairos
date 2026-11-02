@@ -12,8 +12,10 @@ import numpy as np
 import paths
 
 SMILE_PROMPTS = ["a photo of a smiling person", "a happy face with a big smile", "a person laughing",
+                 # i18n-ok: search vocabulary (CLIP prompts)
                  "usmívající se člověk", "šťastný úsměv"]
 NEUTRAL_PROMPTS = ["a photo of a person with a neutral face", "a serious face",
+                   # i18n-ok: search vocabulary (CLIP prompts)
                    "a person with closed mouth, not smiling", "vážný obličej", "neutrální výraz"]
 LOGIT_SCALE = 100.0
 BATCH = 32

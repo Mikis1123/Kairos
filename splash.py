@@ -6,6 +6,7 @@ kdy značka stojí – zamrznutí GUI vlákna během stavby okna tak není vidě
 Spouští se z main.py (boot()); bez animací (Předvolby / Windows) se ukáže rovnou výsledná
 značka. KAIROS_NO_SPLASH=1 spustí aplikaci bez úvodní obrazovky.
 """
+from i18n import tr
 import math
 import sys
 import threading
@@ -102,7 +103,7 @@ class KairosSplash(QWidget):
         def check():
             waited[0] += 30
             if self.intro_done() and not self._status and waited[0] > INTRO_MS + 400:
-                self.set_status("Připravuji knihovnu…")        # načítání trvá déle než úvod
+                self.set_status(tr("splash-preparing"))        # načítání trvá déle než úvod
             if (self.intro_done() and ready()) or waited[0] > timeout_ms:
                 loop.quit()
 
@@ -305,6 +306,8 @@ def boot():
     import theme
     from config import load_config
     cfg = load_config()
+    import i18n
+    i18n.init_from_config(cfg)            # Gate 1: úvodní obrazovka už v jazyce uživatele
     tokens.configure(cfg)
     motion.configure(cfg)
 

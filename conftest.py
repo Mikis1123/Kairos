@@ -42,3 +42,9 @@ atexit.register(shutil.rmtree, _config_tmp, True)
 import power  # noqa: E402
 
 power.get().override = power.PowerState()
+
+# Gate 1: angličtina je zdrojový jazyk, starší testy ale ověřují české texty rozhraní –
+# běží proto v češtině (test_gate1_i18n si jazyk nastavuje sám a vrací ho zpět)
+import i18n  # noqa: E402
+
+i18n.set_language("cs", retranslate=False)

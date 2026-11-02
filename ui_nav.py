@@ -5,6 +5,7 @@ duplicit, ...) do QStackedWidget hlavního okna nad aktuální stránku. Při n�
 (‹ Zpět, Esc, Alt+←) obnoví předchozí stránku včetně posunutí všech scrollovacích
 oblastí a fokusu – uživatel se vrátí přesně tam, kde byl.
 """
+from i18n import N_, tr
 import weakref
 
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
@@ -161,8 +162,9 @@ class DetailPage(QWidget):
     """Podstránka v okně: hlavička s ‹ Zpět, titulkem, podtitulkem a akcemi + obsah."""
     back_requested = pyqtSignal()
 
-    def __init__(self, title, subtitle="", back_text="‹ Zpět", parent=None):
+    def __init__(self, title, subtitle="", back_text=None, parent=None):
         super().__init__(parent)
+        back_text = back_text or tr("nav-back")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -178,7 +180,7 @@ class DetailPage(QWidget):
         hl.setSpacing(10)
         self.btn_back = KButton(back_text, variant="ghost")
         self.btn_back.setObjectName("btn_back")
-        self.btn_back.setToolTip("Zpět (Esc)")
+        self.btn_back.setToolTip(tr("nav-back-tooltip"))
         self.btn_back.setStyleSheet("QPushButton#btn_back { font-size:14px; font-weight:600; }")
         self.btn_back.clicked.connect(self.back_requested.emit)
         hl.addWidget(self.btn_back)

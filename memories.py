@@ -7,6 +7,7 @@ použije se okno ±WINDOW_DAYS dní („Tento týden před 3 lety“). Vyhrává
 Výpočet běží v MemoryJob (QThreadPool) včetně načtení náhledů do QImage; karta jen kreslí.
 Prolínání snímků tiká jen u viditelné karty v aktivním okně a bez omezených animací.
 """
+from i18n import tr
 import os
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -71,11 +72,7 @@ def anniversary(taken, today, window=WINDOW_DAYS):
 
 
 def years_ago_text(years, week=False):
-    if years == 1:
-        core = "před rokem"
-    else:
-        core = f"před {years} lety"
-    return ("Tento týden " + core) if week else core[0].upper() + core[1:]
+    return tr("memories-this-week-years-ago" if week else "memories-years-ago", years=years)
 
 
 def find_memory(conn, today=None, window=WINDOW_DAYS, min_photos=MIN_PHOTOS):
@@ -223,8 +220,8 @@ class MemoryCard(QWidget):
         self._scaled.clear()
         self._fade.set(1.0)
         if memory:
-            self.setAccessibleName(f"Vzpomínka: {memory['title']}, {memory['subtitle']}")
-            self.setToolTip("Otevřít vzpomínku")
+            self.setAccessibleName(tr("memories-a11y", title=memory['title'], subtitle=memory['subtitle']))
+            self.setToolTip(tr("memories-open-tooltip"))
         self._sync_timer()
         self.update()
 
@@ -362,7 +359,7 @@ class MemoryCard(QWidget):
         eb_h = p.fontMetrics().height()
         # tmavý stín i ve světlém motivu; Polish P4: štítek v odstínu vzpomínky (Přizpůsobit obsahu)
         p.setPen(tokens.qcolor(tokens.context_glow(self.memory.get("tint"), "dark")))
-        p.drawText(QRectF(x, title_y - eb_h - 2, text_w, eb_h), int(Qt.AlignmentFlag.AlignLeft), "VZPOMÍNKA")
+        p.drawText(QRectF(x, title_y - eb_h - 2, text_w, eb_h), int(Qt.AlignmentFlag.AlignLeft), tr("memories-eyebrow"))
         p.setFont(title_f)
         p.setPen(QColor("#FFFFFF"))
         p.drawText(QRectF(x, title_y, text_w, title_h), int(Qt.AlignmentFlag.AlignLeft),

@@ -173,7 +173,7 @@ class TestShellWindow(WindowEnv):
         nav.item("trash").click()
         self.assertEqual(self.w._current_filter, "trash")
         self.assertEqual(self.w.stack.currentIndex(), 0)
-        self.assertEqual(self.w.lbl_photos_title.text(), "Smazané")
+        self.assertEqual(self.w.lbl_photos_title.text(), "Koš")          # Gate 1: Smazané -> Koš
         nav.item("people").click()
         self.assertTrue(self.w._nav_buttons[1].isChecked())
         nav.item("photos").click()

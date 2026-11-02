@@ -13,6 +13,7 @@ ozvěna je řada „2019 → 2022 → 2026“, ne stovka sérií.
 align_pair() srovná dva snímky stejné scény (ORB + RANSAC, podobnostní transformace), aby
 posuvník tehdy / teď přecházel mezi záběry bez skoku.
 """
+from i18n import tr
 import math
 from collections import defaultdict
 from datetime import datetime
@@ -152,11 +153,7 @@ def _groups(n, pairs):
 
 
 def years_text(n):
-    if n == 1:
-        return "rok"
-    if 2 <= n <= 4:
-        return f"{n} roky"
-    return f"{n} let"
+    return tr("count-years-span", count=n)
 
 
 def find_echoes(conn, radius_m=ECHO_RADIUS_M, min_gap_days=MIN_GAP_DAYS, min_sim=MIN_SIMILARITY,
@@ -208,9 +205,9 @@ def find_echoes(conn, radius_m=ECHO_RADIUS_M, min_gap_days=MIN_GAP_DAYS, min_sim
 
 def subtitle(echo):
     years = [it["year"] for it in echo["items"]]
-    parts = [f"{years[0]} – {years[-1]}", years_text(echo["span_years"]) + " mezi snímky"]
+    parts = [f"{years[0]} – {years[-1]}", tr("echoes-span-between", span=years_text(echo["span_years"]))]
     if len(years) > 2:
-        parts.append(f"{len(years)} návraty" if len(years) <= 4 else f"{len(years)} návratů")
+        parts.append(tr("count-returns", count=len(years)))
     return " · ".join(parts)
 
 

@@ -9,6 +9,7 @@ Túra (fotky po stovkách metrů) dostane zastávku skoro u každé vyhlídky (n
 0,4 km) – kamera pak jede po skutečné stezce mezi nimi (map_vault.html trailLeg). Na každé
 zastávce se ukáže jediný nejlepší snímek (best_shot: oblíbená > série > ostrost).
 """
+from i18n import event_title, tr
 import math
 from collections import Counter
 
@@ -228,7 +229,7 @@ def list_journeys(conn):
         # rychlý filtr: všechny fotky na jednom místě (< nejmenší poloměr) = žádná cesta
         if haversine_km((la0, lo0), (la1, lo1)) < STOP_RADII_KM[0]:
             continue
-        out.append({"id": int(eid), "title": title or "Cesta", "location": location or "",
+        out.append({"id": int(eid), "title": event_title(title) if title else tr("journey"), "location": location or "",
                     "start": start or "", "end": end or "", "count": int(count)})
     return out
 
@@ -244,6 +245,6 @@ def build_journey(conn, event_id, thumb_url=lambda p: "", image_url=None):
     if len(stops) < MIN_STOPS:
         return None
     location = ev[2] or next((s["city"] for s in stops if s["city"]), "")
-    return {"id": int(ev[0]), "title": ev[1] or "Cesta", "location": location,
+    return {"id": int(ev[0]), "title": event_title(ev[1]) if ev[1] else tr("journey"), "location": location,
             "start": stops[0]["start"], "end": stops[-1]["end"],
             "count": sum(s["count"] for s in stops), "stops": stops}

@@ -2,7 +2,7 @@
 <html lang="cs">
 <head>
 <meta charset="utf-8">
-<title>Kairos – Mapa</title>
+<title>Kairos – Places</title>
 <!-- Batch 6: čistý MapLibre GL JS 5.24.0 (přibalený lokálně v vendor/, ověřené SHA-512 z npm) –
      skutečná 3D zeměkoule (projekce globe), atmosféra, 3D terén z AWS Terrain Tiles,
      piny fotek jako HTML značky, klidové otáčení, přelety a přehrávání Cesty.
@@ -224,48 +224,86 @@
 </head>
 <body>
 <div id="map" class="theme-standard"></div>
-<div id="layers" class="glass" role="group" aria-label="Mapový podklad">
-  <button type="button" data-layer="standard" aria-pressed="true" title="Světlá vektorová mapa s českými názvy (OpenFreeMap)">Základní</button>
-  <button type="button" data-layer="satellite" aria-pressed="false" title="Letecké snímky (Esri) s vektorovými cestami a názvy">Satelitní</button>
-  <button type="button" data-layer="outdoor" aria-pressed="false" title="Vrstevnice, stínování terénu a značené trasy">Turistická</button>
+<div id="layers" class="glass" role="group" aria-label="Map style" data-i18n-aria="layers-a11y">
+  <button type="button" data-layer="standard" aria-pressed="true" title="Light vector map with local place names (OpenFreeMap)" data-i18n="layer-standard" data-i18n-title="layer-standard-tip">Standard</button>
+  <button type="button" data-layer="satellite" aria-pressed="false" title="Aerial imagery (Esri) with vector roads and labels" data-i18n="layer-satellite" data-i18n-title="layer-satellite-tip">Satellite</button>
+  <button type="button" data-layer="outdoor" aria-pressed="false" title="Contours, hillshading, and marked trails" data-i18n="layer-outdoor" data-i18n-title="layer-outdoor-tip">Outdoor</button>
 </div>
 <div id="hud" class="glass" hidden>
   <span class="count" id="hudcount"></span>
-  <button type="button" class="seg" id="btn-globe" title="Zpět na zeměkouli (Esc)">
-    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6.3"/><path d="M1.8 8h12.4M8 1.7c2 2 2 10.6 0 12.6M8 1.7c-2 2-2 10.6 0 12.6"/></svg>Zeměkoule</button>
-  <button type="button" class="seg" id="btn-journeys" aria-expanded="false" aria-controls="jlist" hidden title="Přehrát cestu z události">
-    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="3.5" cy="12" r="1.6"/><circle cx="12.5" cy="4" r="1.6"/><path d="M5 11.2c3-1 1.5-4.6 4.5-5.8 1-.4 1.6-.8 1.6-.8" stroke-dasharray="1.6 1.8"/></svg>Cesty</button>
+  <button type="button" class="seg" id="btn-globe" title="Back to the globe (Esc)" data-i18n-title="globe-tip">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6.3"/><path d="M1.8 8h12.4M8 1.7c2 2 2 10.6 0 12.6M8 1.7c-2 2-2 10.6 0 12.6"/></svg><span data-i18n="globe">Globe</span></button>
+  <button type="button" class="seg" id="btn-journeys" aria-expanded="false" aria-controls="jlist" hidden title="Play an event’s Journey" data-i18n-title="journeys-tip">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="3.5" cy="12" r="1.6"/><circle cx="12.5" cy="4" r="1.6"/><path d="M5 11.2c3-1 1.5-4.6 4.5-5.8 1-.4 1.6-.8 1.6-.8" stroke-dasharray="1.6 1.8"/></svg><span data-i18n="journeys">Journeys</span></button>
 </div>
-<div id="jlist" class="glass" role="dialog" aria-label="Cesty"></div>
+<div id="jlist" class="glass" role="dialog" aria-label="Journeys" data-i18n-aria="journeys"></div>
 <div id="card" class="glass"></div>
-<div id="empty" class="notice"><div><b>Žádné fotografie s polohou</b>Fotky s GPS souřadnicemi se tu objeví po importu.</div></div>
-<div id="nogl" class="notice"><div><b>Mapa potřebuje grafickou akceleraci</b>Zeměkouli kreslí WebGL, které tu není k dispozici. Fotky ani jejich polohy se tím nemění.</div></div>
+<div id="empty" class="notice"><div><b data-i18n="empty-title">No Photos with a Location</b><span data-i18n="empty-body">Photos with GPS coordinates appear here after import.</span></div></div>
+<div id="nogl" class="notice"><div><b data-i18n="nogl-title">The Map Needs Graphics Acceleration</b><span data-i18n="nogl-body">The globe is drawn with WebGL, which isn’t available here. Your photos and their locations are unaffected.</span></div></div>
 
 <div id="jx" aria-live="polite">
   <div id="jvignette"></div>
   <div id="jmoment"></div>
   <div id="jcaption" class="solid"><div class="place"><span class="phase" id="jphase"></span><span id="jplace"></span></div>
     <div class="when" id="jwhen"></div></div>
-  <div id="jcap" class="solid" role="dialog" aria-label="Cesta">
-    <div class="eyebrow">Cesta</div><div class="ago" id="jago"></div>
+  <div id="jcap" class="solid" role="dialog" aria-label="Journey" data-i18n-aria="journey">
+    <div class="eyebrow" data-i18n="journey">Journey</div><div class="ago" id="jago"></div>
     <h1 id="jtitle"></h1><div class="meta" id="jmeta"></div>
     <div class="highlights" id="jhigh"></div>
-    <div class="actions"><button type="button" class="pill" id="jreplay">Přehrát znovu</button>
-      <button type="button" class="pill primary" id="jdone">Hotovo</button></div>
+    <div class="actions"><button type="button" class="pill" id="jreplay" data-i18n="replay">Play Again</button>
+      <button type="button" class="pill primary" id="jdone" data-i18n="done">Done</button></div>
   </div>
   <div id="jdock">
-    <div id="jctl" class="solid" role="toolbar" aria-label="Přehrávání cesty">
-      <button type="button" id="jprev" aria-label="Předchozí zastávka"><svg viewBox="0 0 16 16"><path d="M3 2.5h1.6v11H3zM13.5 2.8v10.4L5.8 8z"/></svg></button>
-      <button type="button" id="jplay" aria-label="Pozastavit"><svg viewBox="0 0 16 16"><path id="jplayicon" d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg></button>
-      <button type="button" id="jnext" aria-label="Další zastávka"><svg viewBox="0 0 16 16"><path d="M11.4 2.5H13v11h-1.6zM2.5 2.8v10.4L10.2 8z"/></svg></button>
-      <button type="button" id="jmusic" aria-label="Hudba" aria-pressed="false" title="Hudba" hidden><svg viewBox="0 0 16 16"><path d="M6 3.2 13.5 1.5v9.2a2.1 2.1 0 1 1-1.4-2V4.3L7.4 5.4v7.1a2.1 2.1 0 1 1-1.4-2z"/></svg></button>
-      <button type="button" id="jclose" aria-label="Ukončit cestu (Esc)"><svg viewBox="0 0 16 16"><path d="M3.7 2.6 8 6.9l4.3-4.3 1.1 1.1L9.1 8l4.3 4.3-1.1 1.1L8 9.1l-4.3 4.3-1.1-1.1L6.9 8 2.6 3.7z"/></svg></button>
+    <div id="jctl" class="solid" role="toolbar" aria-label="Journey playback" data-i18n-aria="controls-a11y">
+      <button type="button" id="jprev" aria-label="Previous stop" data-i18n-aria="prev-stop"><svg viewBox="0 0 16 16"><path d="M3 2.5h1.6v11H3zM13.5 2.8v10.4L5.8 8z"/></svg></button>
+      <button type="button" id="jplay" aria-label="Pause"><svg viewBox="0 0 16 16"><path id="jplayicon" d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg></button>
+      <button type="button" id="jnext" aria-label="Next stop" data-i18n-aria="next-stop"><svg viewBox="0 0 16 16"><path d="M11.4 2.5H13v11h-1.6zM2.5 2.8v10.4L10.2 8z"/></svg></button>
+      <button type="button" id="jmusic" aria-label="Music" aria-pressed="false" title="Music" hidden><svg viewBox="0 0 16 16"><path d="M6 3.2 13.5 1.5v9.2a2.1 2.1 0 1 1-1.4-2V4.3L7.4 5.4v7.1a2.1 2.1 0 1 1-1.4-2z"/></svg></button>
+      <button type="button" id="jclose" aria-label="End Journey (Esc)" data-i18n-aria="end-journey"><svg viewBox="0 0 16 16"><path d="M3.7 2.6 8 6.9l4.3-4.3 1.1 1.1L9.1 8l4.3 4.3-1.1 1.1L8 9.1l-4.3 4.3-1.1-1.1L6.9 8 2.6 3.7z"/></svg></button>
     </div>
-    <div id="jstripwrap" class="solid"><div id="jstrip" role="list" aria-label="Zastávky cesty"></div>
+    <div id="jstripwrap" class="solid"><div id="jstrip" role="list" aria-label="Journey stops" data-i18n-aria="stops-a11y"></div>
       <div id="jprogress"><i id="jprogbar"></i></div></div>
   </div>
 </div>
 <script>
+  // ── Gate 1: texty stránky z katalogu aplikace (i18n.page_strings("map-")); angličtina = zdroj ──
+  var DEFAULT_STRINGS = /*I18N-DEFAULTS*/{"controls-a11y": "Journey playback", "count-photos": {"$plural": "count", "forms": {"*": "{count} photos", "one": "{count} photo", "other": "{count} photos"}, "lang": "en"}, "count-stops": {"$plural": "count", "forms": {"*": "{count} stops", "one": "{count} stop", "other": "{count} stops"}, "lang": "en"}, "done": "Done", "empty-body": "Photos with GPS coordinates appear here after import.", "empty-title": "No Photos with a Location", "end-journey": "End Journey (Esc)", "globe": "Globe", "globe-tip": "Back to the globe (Esc)", "journey": "Journey", "journey-end": "End of the Journey", "journeys": "Journeys", "journeys-tip": "Play an event’s Journey", "layer-outdoor": "Outdoor", "layer-outdoor-tip": "Contours, hillshading, and marked trails", "layer-satellite": "Satellite", "layer-satellite-tip": "Aerial imagery (Esri) with vector roads and labels", "layer-standard": "Standard", "layer-standard-tip": "Light vector map with local place names (OpenFreeMap)", "layers-a11y": "Map style", "multiple-places": "Multiple places", "music-off": "Turn music off", "music-on": "Turn music on", "next-stop": "Next stop", "nogl-body": "The globe is drawn with WebGL, which isn’t available here. Your photos and their locations are unaffected.", "nogl-title": "The Map Needs Graphics Acceleration", "pause": "Pause", "phase-dawn": "Dawn", "phase-day": "Day", "phase-dusk": "Dusk", "phase-golden": "Golden hour", "phase-night": "Night", "photos-on-map": {"$plural": "count", "forms": {"*": "{count} photos on the map", "one": "{count} photo on the map", "other": "{count} photos on the map"}, "lang": "en"}, "play": "Play", "play-journey": "Play a Journey", "prev-stop": "Previous stop", "replay": "Play Again", "stop-n": "Stop {n}", "stops-a11y": "Journey stops", "tilt-off": "Top-down view (2D)", "tilt-on": "Tilt (3D)", "unavailable-body": "The map view couldn’t start ({e}). Your photos and their locations are unaffected.", "unavailable-title": "Map Unavailable", "years-ago": {"$plural": "years", "forms": {"*": "{years} years ago", "one": "A year ago", "other": "{years} years ago"}, "lang": "en"}}/*END*/;
+  var I18N = {};
+  var LANG = 'en';
+  function T(key, args) {
+    var v = I18N[key] !== undefined ? I18N[key] : DEFAULT_STRINGS[key];
+    if (v === undefined) return key;
+    if (typeof v === 'object') {
+      var n = args ? +args[v['$plural']] : 0, f = v.forms, cat = 'other';
+      try { cat = new Intl.PluralRules(v.lang || LANG).select(n); } catch (e) { /* neznámý jazyk */ }
+      v = f['=' + n] !== undefined ? f['=' + n] : (f[cat] !== undefined ? f[cat] : f['*']);
+    }
+    return String(v).replace(/\{(\w+)\}/g, function (m, k) {
+      if (!args || args[k] === undefined) return m;
+      return typeof args[k] === 'number' ? fmtNum(args[k]) : args[k];
+    });
+  }
+  function fmtNum(n) {
+    try { return new Intl.NumberFormat(LANG).format(n); } catch (e) { return String(n); }
+  }
+  function applyStatic() {
+    document.documentElement.lang = LANG;
+    document.querySelectorAll('[data-i18n]').forEach(function (el) { el.textContent = T(el.getAttribute('data-i18n')); });
+    document.querySelectorAll('[data-i18n-title]').forEach(function (el) { el.title = T(el.getAttribute('data-i18n-title')); });
+    document.querySelectorAll('[data-i18n-aria]').forEach(function (el) {
+      el.setAttribute('aria-label', T(el.getAttribute('data-i18n-aria')));
+    });
+  }
+  window.T = T;
+  window.setStrings = function (dict, lang) {
+    I18N = dict || {};
+    var changed = (lang || 'en') !== LANG;
+    LANG = lang || 'en';
+    applyStatic();
+    if (typeof refreshTexts === 'function') refreshTexts(changed);
+    return Object.keys(I18N).length;
+  };
+
   var CELL_PX = 64;                   // velikost buňky shlukování na obrazovce
   var PIN_PX = 58;                    // piny blíž než tohle by se překrývaly (pin 52 px + okraj)
   var MAX_CARD_THUMBS = 4;
@@ -315,7 +353,7 @@
   var ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services/';
   // 3D terén: AWS Open Data Terrain Tiles (Mapzen terrarium), přesný host v ALLOWED_WEB_HOSTS
   var DEM_TILES = 'https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png';
-  var DEM_ATTRIBUTION = 'Terén: <a href="https://registry.opendata.aws/terrain-tiles/">Mapzen, AWS Terrain Tiles</a>';
+  var DEM_ATTRIBUTION = 'Terrain: <a href="https://registry.opendata.aws/terrain-tiles/">Mapzen, AWS Terrain Tiles</a>';
   // Každý podklad = podkladová vrstva + volitelné průhledné překryvy (hybridní satelit,
   // značené trasy). Jen hosty z ALLOWED_WEB_HOSTS v main.py, žádné API klíče.
   // gl = vektorová varianta (OpenFreeMap); layers = rastrová podoba / záloha bez stylu
@@ -341,12 +379,12 @@
       theme: 'theme-outdoor', maxZoom: 17,
       layers: [
         { url: 'https://tile.opentopomap.org/{z}/{x}/{y}.png',
-          attribution: 'Data: ' + OSM + ', SRTM | Styl: &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)' },
+          attribution: 'Data: ' + OSM + ', SRTM | Style: &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)' },
         // Patch 12: trasy až od přiblížení obce / údolí – na mapě státu byly jen hustou sítí čar
         // přes celý reliéf; cyklotrasy (dálkové, hustší) ještě o úroveň později
         { url: 'https://tile.waymarkedtrails.org/hiking/{z}/{x}/{y}.png', overlay: true, opacity: 0.9,
           minZoom: TRAILS_MIN_ZOOM.hiking,
-          attribution: 'Trasy: &copy; <a href="https://waymarkedtrails.org">waymarkedtrails.org</a> (CC-BY-SA)' },
+          attribution: 'Trails: &copy; <a href="https://waymarkedtrails.org">waymarkedtrails.org</a> (CC-BY-SA)' },
         { url: 'https://tile.waymarkedtrails.org/cycling/{z}/{x}/{y}.png', overlay: true, opacity: 0.75,
           minZoom: TRAILS_MIN_ZOOM.cycling }
       ]
@@ -377,7 +415,9 @@
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
 
   // České názvy: name:cs, jinak latinka, jinak místní název (liberty ukazuje anglické name_en)
-  var CS_NAME = ['coalesce', ['get', 'name:cs'], ['get', 'name:latin'], ['get', 'name']];
+  // názvy míst v jazyce aplikace (OpenMapTiles name:xx), jinak latinkou / místní
+  function nameField() { return ['coalesce', ['get', 'name:' + LANG.split('-')[0]], ['get', 'name:latin'], ['get', 'name']]; }
+  var CS_NAME = nameField();
   function isNameField(tf) {
     var s = JSON.stringify(tf || '');
     return s.indexOf('name') >= 0 && s.indexOf('"ref"') < 0;
@@ -439,7 +479,7 @@
       sources: {
         esri: { type: 'raster', tileSize: 256, maxzoom: 19,
                 tiles: [ESRI + 'World_Imagery/MapServer/tile/{z}/{y}/{x}'],
-                attribution: 'Snímky &copy; Esri, Maxar, Earthstar Geographics' },
+                attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' },
         openmaptiles: { type: 'vector', url: VECTOR_TILES_URL, attribution: OFM_ATTRIBUTION }
       },
       layers: layers
@@ -603,7 +643,7 @@
     // tileSize 512 u 256px obrázků: 4× méně dlaždic na obrazovce (kreslení i dekódování),
     // obraz je o úroveň měkčí – pro náhled v díře přesně to, co má být
     style.sources.underlay = { type: 'raster', tiles: [UNDERLAY_TILES], tileSize: 512, maxzoom: UNDERLAY_MAX_ZOOM,
-                               attribution: 'Podklad &copy; Esri, HERE, Garmin, ' + OSM };
+                               attribution: 'Basemap &copy; Esri, HERE, Garmin, ' + OSM };
     var at = style.layers.findIndex(function (l) { return l.type !== 'background' && l.type !== 'raster'; });
     style.layers.splice(at < 0 ? style.layers.length : at, 0, {
       id: 'underlay', type: 'raster', source: 'underlay',
@@ -675,10 +715,10 @@
 
   function phaseLabel(sun) {
     if (!sun) return '';
-    if (sun.el > 10) return 'Den';
-    if (sun.el > -1) return 'Zlatá hodina';
-    if (sun.el > -9) return sun.morning ? 'Svítání' : 'Soumrak';
-    return 'Noc';
+    if (sun.el > 10) return T('phase-day');
+    if (sun.el > -1) return T('phase-golden');
+    if (sun.el > -9) return sun.morning ? T('phase-dawn') : T('phase-dusk');
+    return T('phase-night');
   }
 
   var styleReady = false;            // po style.load; isStyleLoaded() čeká i na sprite a písma
@@ -780,7 +820,7 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     }).then(function (style) {
-      if (!window.setVectorStyle(style)) throw new Error('neplatný styl');
+      if (!window.setVectorStyle(style)) throw new Error('invalid style');
       storeStyle(style);
     }).catch(function () {
       vectorState = 'failed';          // zůstává rastrová záloha, která už je zobrazená
@@ -974,7 +1014,7 @@
     if (!tiltBtn) return;
     var tilted = isTilted();
     tiltBtn.textContent = tilted ? '2D' : '3D';
-    tiltBtn.title = tilted ? 'Pohled shora (2D)' : 'Naklonit (3D)';
+    tiltBtn.title = tilted ? T('tilt-off') : T('tilt-on');
     tiltBtn.setAttribute('aria-pressed', tilted ? 'true' : 'false');
   }
   window.toggleTilt = function () {
@@ -1222,13 +1262,20 @@
     else el.classList.add('noimg');
   }
 
-  function fmtDate(s) {            // '2026-07-12 10:30' -> '12. 7. 2026'
+  function fmtDate(s) {            // '2026-07-12 10:30' -> '7/12/2026' / '12. 7. 2026' (jazyk aplikace)
     var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s || '');
-    return m ? (+m[3]) + '. ' + (+m[2]) + '. ' + m[1] : '';
+    if (!m) return '';
+    try {
+      return new Intl.DateTimeFormat(LANG, { day: 'numeric', month: 'numeric', year: 'numeric' })
+        .format(new Date(+m[1], +m[2] - 1, +m[3]));
+    } catch (e) { return (+m[3]) + '. ' + (+m[2]) + '. ' + m[1]; }
   }
-  function fmtTime(s) {            // '2026-07-12 09:05' -> '9:05'
+  function fmtTime(s) {            // '2026-07-12 09:05' -> '9:05 AM' / '9:05'
     var m = /[ T](\d{2}):(\d{2})/.exec(s || '');
-    return m ? (+m[1]) + ':' + m[2] : '';
+    if (!m) return '';
+    try {
+      return new Intl.DateTimeFormat(LANG, { hour: 'numeric', minute: '2-digit' }).format(new Date(2000, 0, 1, +m[1], +m[2]));
+    } catch (e) { return (+m[1]) + ':' + m[2]; }
   }
 
   function dateRange(items) {
@@ -1239,10 +1286,10 @@
   }
 
   function czCount(n) {
-    return n === 1 ? '1 fotografie' : (n >= 2 && n <= 4 ? n + ' fotografie' : n + ' fotografií');
+    return T('count-photos', { count: n });
   }
   function czStops(n) {
-    return n === 1 ? '1 zastávka' : (n >= 2 && n <= 4 ? n + ' zastávky' : n + ' zastávek');
+    return T('count-stops', { count: n });
   }
   function yearsAgo(s, now) {      // „Před 3 lety“ – časová kapsle
     var t = parseLocal(s);
@@ -1250,7 +1297,7 @@
     now = now || new Date();
     var y = now.getFullYear() - t.y;
     if (now.getMonth() + 1 < t.mo || (now.getMonth() + 1 === t.mo && now.getDate() < t.d)) y -= 1;
-    return y <= 0 ? '' : (y === 1 ? 'Před rokem' : 'Před ' + y + ' lety');
+    return y <= 0 ? '' : T('years-ago', { years: y });
   }
   window.yearsAgo = yearsAgo;
 
@@ -1267,7 +1314,7 @@
     var city = cities.length ? cities[0] : '';
     var title, sub;
     if (items.length > 1) {
-      title = city ? esc(city) : 'Více míst';
+      title = city ? esc(city) : esc(T('multiple-places'));
       sub = [czCount(items.length), dateRange(items)].filter(Boolean).join(' · ');
     } else {
       title = esc(items[0].name);
@@ -1634,11 +1681,26 @@
   };
   document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') stopSpin(); });
 
+  function refreshTexts(langChanged) {
+    var hud = document.getElementById('hudcount');
+    if (hud) hud.textContent = T('photos-on-map', { count: markers.length });
+    if (journeyList.length) window.setJourneys(journeyList);
+    if (typeof render === 'function' && map) render();
+    if (langChanged && map && styleReady) {
+      CS_NAME = nameField();
+      (map.getStyle().layers || []).forEach(function (l) {
+        if (l.type === 'symbol' && l.layout && l.layout['text-field'] && isNameField(l.layout['text-field'])) {
+          try { map.setLayoutProperty(l.id, 'text-field', CS_NAME); } catch (e) { /* vrstva se právě mění */ }
+        }
+      });
+    }
+  }
+
   window.setMarkers = function (data) {
     markers = Array.isArray(data) ? data : [];
     var hud = document.getElementById('hud');
     hud.hidden = markers.length === 0;
-    document.getElementById('hudcount').textContent = czCount(markers.length) + ' na mapě';
+    document.getElementById('hudcount').textContent = T('photos-on-map', { count: markers.length });
     document.getElementById('empty').style.display = markers.length ? 'none' : 'flex';
     initialView();
     render();
@@ -1666,7 +1728,7 @@
     var btn = document.getElementById('btn-journeys');
     btn.hidden = journeyList.length === 0;
     var box = document.getElementById('jlist');
-    box.innerHTML = '<div class="head">Přehrát cestu</div>' + journeyList.map(function (j, i) {
+    box.innerHTML = '<div class="head">' + esc(T('play-journey')) + '</div>' + journeyList.map(function (j, i) {
       var sub = [j.location, dateRange([{ date: j.start }, { date: j.end }]), czCount(j.count)].filter(Boolean).join(' · ');
       return '<button type="button" data-i="' + i + '"><div class="t">' + esc(j.title) + '</div><div class="s">'
            + esc(sub) + '</div></button>';
@@ -2670,7 +2732,7 @@
   }
   function captionFor(i) {
     var s = journey.data.stops[i], sun = sunPosition(s.lat, s.lon, s.start), sky = sun ? skyAt(sun.el) : skyAt(40);
-    document.getElementById('jplace').textContent = s.city || 'Zastávka ' + (i + 1);
+    document.getElementById('jplace').textContent = s.city || T('stop-n', { n: i + 1 });
     document.getElementById('jwhen').textContent = [phaseLabel(sun), fmtDate(s.start) + (fmtTime(s.start) ? ' ' + fmtTime(s.start) : '')]
       .filter(Boolean).join(' · ');
     document.getElementById('jphase').style.background = sky.glow;
@@ -2695,7 +2757,7 @@
     return '<div class="shot"></div><div class="meta"><div class="eyebrow">' + esc((i + 1) + ' / ' + journey.data.stops.length)
          + (phaseLabel(sun) ? ' · ' + esc(phaseLabel(sun)) : '') + '</div><div class="place">'
          + '<span class="phase" style="background:' + sky.glow + ';color:' + sky.glow + '"></span>'
-         + esc(s.city || 'Zastávka ' + (i + 1)) + '</div><div class="when">' + esc(when) + '</div></div>';
+         + esc(s.city || T('stop-n', { n: i + 1 })) + '</div><div class="when">' + esc(when) + '</div></div>';
   }
   function showMoment(i) {
     var box = document.getElementById('jmoment');
@@ -2822,7 +2884,7 @@
       f.setAttribute('role', 'listitem');
       f.dataset.stop = i;
       f.dataset.id = b ? b.id : '';
-      f.title = [s.city || 'Zastávka ' + (i + 1), fmtDate(s.start), fmtTime(s.start)].filter(Boolean).join(' · ');
+      f.title = [s.city || T('stop-n', { n: i + 1 }), fmtDate(s.start), fmtTime(s.start)].filter(Boolean).join(' · ');
       setBg(f, b ? b.thumb : '');
       f.addEventListener('click', function () { seekStop(i); });
       strip.appendChild(f);
@@ -3178,7 +3240,7 @@
     var cap = document.getElementById('jcap');
     cap.classList.remove('end');
     document.getElementById('jago').textContent = yearsAgo(data.start);
-    document.getElementById('jtitle').textContent = data.title || 'Cesta';
+    document.getElementById('jtitle').textContent = data.title || T('journey');
     document.getElementById('jmeta').textContent = [data.location, dateRange([{ date: data.start }, { date: data.end }])]
       .filter(Boolean).join(' · ') + ' · ' + czStops(data.stops.length) + ' · ' + czCount(data.count || 0);
     var high = document.getElementById('jhigh');
@@ -3211,7 +3273,7 @@
   function beginEnding() {
     journey.ended = true;
     showCaption(false);
-    document.getElementById('jago').textContent = 'Konec cesty';
+    document.getElementById('jago').textContent = T('journey-end');
     document.getElementById('jcap').classList.add('end');
     markChapters(journey.data.stops.length);       // všechny kapitoly viděné
     setPlayIcon(true);
@@ -3334,7 +3396,7 @@
   }
   function setPlayIcon(paused) {
     document.getElementById('jplayicon').setAttribute('d', paused ? 'M4 2.4v11.2L13.2 8z' : 'M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z');
-    document.getElementById('jplay').setAttribute('aria-label', paused ? 'Přehrát' : 'Pozastavit');
+    document.getElementById('jplay').setAttribute('aria-label', paused ? T('play') : T('pause'));
   }
   // ── C6: hudební podkres (volitelný, přibalené skladby ambient_music.py) ──
   // Prolínání hlasitosti: náběh s úvodem, ztlumení při pauze, doznění v závěru a při ukončení.
@@ -3344,7 +3406,7 @@
     var b = document.getElementById('jmusic');
     b.hidden = !music.tracks.length;
     b.setAttribute('aria-pressed', music.enabled ? 'true' : 'false');
-    b.setAttribute('aria-label', music.enabled ? 'Vypnout hudbu' : 'Zapnout hudbu');
+    b.setAttribute('aria-label', music.enabled ? T('music-off') : T('music-on'));
     b.title = b.getAttribute('aria-label');
   }
   window.setJourneyMusic = function (cfg) {      // aplikace: {enabled, tracks: [{title, url}]}

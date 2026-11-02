@@ -84,7 +84,8 @@ FIXTURE_STYLE = {
                    "fill-extrusion-height": ["get", "render_height"], "fill-extrusion-opacity": 0.8}},
     ],
 }
-CS_NAME = ["coalesce", ["get", "name:cs"], ["get", "name:latin"], ["get", "name"]]
+# Gate 1: názvy míst v jazyce aplikace; samostatně načtená stránka = angličtina
+CS_NAME = ["coalesce", ["get", "name:en"], ["get", "name:latin"], ["get", "name"]]
 
 
 def wait(ms):

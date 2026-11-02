@@ -4,6 +4,7 @@ segmentový přepínač a vypínač. Barvy z tokens.palette, pohyb z motion.Twee
 Všechny prvky kreslí samy sebe (styly QSS neumí přechody) a animují jen při interakci.
 API zůstává Qt: KButton je QPushButton, položky jsou zaškrtávací tlačítka v QButtonGroup.
 """
+from i18n import tr
 import re
 
 from PyQt6.QtCore import QObject, QPointF, QRect, QRectF, QSize, Qt, pyqtSignal, QEvent
@@ -992,11 +993,12 @@ class AccentPicker(QWidget):
         self.group.setExclusive(True)
         self.swatches = {}
         for k in ("iris", "ember", "moss", "classic"):
-            sw = _Swatch(k, tokens.ACCENTS[k]["name"], self)
+            label = tokens.ACCENTS[k].get("label")
+            sw = _Swatch(k, tr(label) if label else tokens.ACCENTS[k]["name"], self)
             self.group.addButton(sw)
             lay.addWidget(sw)
             self.swatches[k] = sw
-        custom = _Swatch("custom", "Vlastní barva…", self)
+        custom = _Swatch("custom", tr("accent-custom"), self)
         custom.clicked.connect(self._pick_custom)
         self.group.addButton(custom)
         lay.addWidget(custom)
@@ -1008,7 +1010,7 @@ class AccentPicker(QWidget):
     def set_value(self, key, custom_hex=""):
         if custom_hex:
             self.swatches["custom"].custom_hex = custom_hex
-            self.swatches["custom"].setToolTip(f"Vlastní barva {custom_hex}")
+            self.swatches["custom"].setToolTip(tr("accent-custom-tooltip", custom_hex=custom_hex))
         sw = self.swatches.get(key) or self.swatches[tokens.DEFAULT_ACCENT]
         sw.setChecked(True)
         self.update()
@@ -1022,10 +1024,10 @@ class AccentPicker(QWidget):
         from PyQt6.QtWidgets import QColorDialog
         sw = self.swatches["custom"]
         start = QColor(sw.custom_hex or tokens.ACCENTS["iris"]["dark"][0])
-        col = QColorDialog.getColor(start, self, "Vlastní barva zvýraznění")
+        col = QColorDialog.getColor(start, self, tr("accent-custom-dialog"))
         if col.isValid():
             sw.custom_hex = col.name().upper()
-            sw.setToolTip(f"Vlastní barva {sw.custom_hex}")
+            sw.setToolTip(tr("accent-custom-tooltip", custom_hex=sw.custom_hex))
             sw.setChecked(True)
             sw.update()
             self.changed.emit("custom", sw.custom_hex)

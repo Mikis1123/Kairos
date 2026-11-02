@@ -60,7 +60,7 @@ ACCENTS = {
     "ember": {"name": "Ember", "dark": ("#FF8A5B", "#C94E1E", "#FFC56B"), "light": ("#C2491B", "#C2491B", "#A05F00")},
     "moss": {"name": "Moss", "dark": ("#A3D977", "#3F7D22", "#E3CF6E"), "light": ("#3F7D22", "#3F7D22", "#866A00")},
     # Původní systémová modrá (Apple). Výplň má jen ~3.6 : 1 s bílou – ponecháno kvůli shodě s originálem.
-    "classic": {"name": "Klasická modrá", "dark": ("#0A84FF", "#0A84FF", "#64D2FF"), "light": ("#007AFF", "#007AFF", "#5AC8FA")},
+    "classic": {"name": "Classic Blue", "label": "accent-classic", "dark": ("#0A84FF", "#0A84FF", "#64D2FF"), "light": ("#007AFF", "#007AFF", "#5AC8FA")},
 }
 DEFAULT_ACCENT = "iris"
 LEGACY_ACCENT = "classic"

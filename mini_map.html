@@ -2,7 +2,7 @@
 <html lang="cs">
 <head>
 <meta charset="utf-8">
-<title>Kairos – Minimapa</title>
+<title>Kairos – Mini Map</title>
 <!-- Minimapa v panelu Info prohlížeče: stejný přibalený MapLibre GL JS 5 jako map_vault.html.
      Stránka se načte jednou, další fotky jen posunou pin (window.showPlace) – žádné nové WebGL.
      Podklad: tmavý vektorový styl OpenFreeMap s českými názvy, bez stylu rastrová záloha (Esri).
@@ -28,8 +28,13 @@
 </head>
 <body>
 <div id="map"></div>
-<div id="nogl">Mapa není k dispozici</div>
+<div id="nogl">Map unavailable</div>
 <script>
+  window.setStrings = function (dict, lang) {      // Gate 1: texty z katalogu aplikace
+    document.documentElement.lang = lang || 'en';
+    if (dict && dict.unavailable) document.getElementById('nogl').textContent = dict.unavailable;
+    return true;
+  };
 (function () {
   'use strict';
   var OFM = 'https://tiles.openfreemap.org/';

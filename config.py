@@ -13,6 +13,7 @@ DEFAULT_CONFIG = {
     "library_folders": [],
     "auto_scan_on_startup": True,
     "default_thumbnail_size": 180,
+    # i18n-ok: stored identifier (label comes from settings_dialog.SORT_CHOICES)
     "default_sort_order": "Datum pořízení (Nejnovější)",
     "newsletter_url": "https://omniphotovault.com/updates",
     # P3.8 – Nastavitelný práh shody obličejů (0.0–1.0)
@@ -55,6 +56,12 @@ DEFAULT_CONFIG = {
     "color_output": "auto",
     # Stage 3 – složka Skryté v postranním panelu (vypnuto = jen z Předvoleb)
     "show_hidden_folder": True,
+    # Gate 0 – AI na pozadí na baterii: "throttle" | "pause" | "full" (power.py)
+    "battery_policy": "throttle",
+    # Gate 0 – vlastní umístění mezipaměti ("" = %LOCALAPPDATA%\\Kairos\\cache; paths.CACHE_ROOT)
+    "cache_dir": "",
+    # Gate 1 – jazyk rozhraní: "system" (jazyk Windows, jinak angličtina) | en | cs | de | es | fr | ja | zh-CN
+    "language": "system",
 }
 
 

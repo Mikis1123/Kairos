@@ -13,6 +13,7 @@ Soubory: PROXY_DIR/<otisk cesty>.mp4 (platný, je-li novější než originál),
 proxy nepotřebují, prázdná značka <otisk>.none (aby se při každém startu znovu nesondovalo).
 Rozpočet na disku: config „proxy_cache_mb“ (LRU podle posledního použití).
 """
+from i18n import tr
 import hashlib
 import os
 import re
@@ -280,8 +281,8 @@ class PrepProgress:
     def text(self, index, paused=False):
         n = len(self.weights)
         pct = int(self.fraction * 100)
-        head = "Příprava videí pozastavena, dokud pracujete" if paused else "Připravuji videa"
-        parts = [head, f"{index + 1} z {n}", f"{pct} %"]
+        head = tr("proxy-paused") if paused else tr("proxy-preparing")
+        parts = [head, tr("progress-of", index=index + 1, total=n), tr("percent", value=pct)]
         eta = None if paused else self.eta_s()
         if eta is not None:
             parts.append(_eta_text(eta))
@@ -290,11 +291,11 @@ class PrepProgress:
 
 def _eta_text(seconds):
     if seconds < 60:
-        return "zbývá méně než minuta"
+        return tr("proxy-eta-under-minute")
     minutes = int(round(seconds / 60.0))
     if minutes < 60:
-        return f"zbývá asi {minutes} min"
-    return f"zbývá asi {minutes // 60} h {minutes % 60:02d} min"
+        return tr("proxy-eta-minutes", minutes=minutes)
+    return tr("proxy-eta-hours", hours=minutes // 60, minutes=format(minutes % 60, "02d"))
 
 
 def cache_size():

@@ -33,6 +33,7 @@ from paths import resolve_face_path
 
 # --- Výchozí práh shody (P3.8: nastavitelný z konfigurace) ---
 SIMILARITY_THRESHOLD = 0.62
+# i18n-ok: DB default person name (localized at display)
 UNKNOWN_NAME = "Neznámá osoba"
 MIN_MEDIA_PER_AUTO_PERSON = 2
 

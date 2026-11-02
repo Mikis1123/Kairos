@@ -357,7 +357,7 @@ class TestMapLayerPolicy(unittest.TestCase):
     def test_html_switcher_and_attributions(self):
         html = open(os.path.join(HERE, "map_vault.html"), encoding="utf-8").read()
         for needle in ('data-layer="standard"', 'data-layer="satellite"', 'data-layer="outdoor"',
-                       ">Základní<", ">Satelitní<", ">Turistická<",
+                       ">Standard<", ">Satellite<", ">Outdoor<",
                        "World_Imagery/MapServer/tile/{z}/{y}/{x}", "tile.opentopomap.org/{z}/{x}/{y}.png",
                        "Esri", "OpenTopoMap", "backdrop-filter", "map.flyTo("):
             self.assertIn(needle, html)
@@ -510,8 +510,8 @@ class TestMapPageLayers(unittest.TestCase):
         self.assertEqual(card.count('class="t"'), 4, "nejvýš 4 náhledy")
         self.assertNotIn("<img", card, "náhledy jako CSS pozadí, žádné <img>")
         self.assertIn("Sušice", card)
-        self.assertIn("5 fotografií", card)
-        self.assertIn("10. 7. 2026 – 14. 7. 2026", card)
+        self.assertIn("5 photos", card)
+        self.assertIn("7/10/2026 – 7/14/2026", card)
 
     def test_single_photo_card(self):
         markers = [{"id": 7, "lat": 49.0, "lon": 13.0, "name": "IMG_7.HEIC", "city": "Kolinec",
@@ -519,7 +519,7 @@ class TestMapPageLayers(unittest.TestCase):
         self.js(f"setMarkers({json.dumps(markers)})")
         card = self.js("getClusters()[0].card")
         self.assertIn("IMG_7.HEIC", card)
-        self.assertIn("Kolinec · 6. 7. 2026", card)
+        self.assertIn("Kolinec · 7/6/2026", card)
 
     def test_overlapping_cells_are_merged(self):
         """Dva body těsně u sebe, ale v sousedních buňkách mřížky -> jeden pin, ne dva přes sebe."""

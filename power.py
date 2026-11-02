@@ -13,6 +13,7 @@ zůstat prohlížitelná.
 Stolní PC bez baterie = vždy „ze sítě“. Modul je bezpečný pro více vláken; stav se čte
 nejvýš jednou za CACHE_S.
 """
+from i18n import tr
 import ctypes
 import sys
 import threading
@@ -105,15 +106,15 @@ class PowerMonitor:
     def describe(self):
         st = self.state()
         if not st.on_battery:
-            return "napájení ze sítě"
+            return tr("power-ac")
         act = self.action(True)
         pct = f" {st.percent} %" if st.percent is not None else ""
         if act == PAUSE:
-            why = "Spořič baterie" if st.saver else ("slabá baterie" if self.policy != "pause" else "na baterii")
+            why = tr("power-saver") if st.saver else (tr("power-low") if self.policy != "pause" else "na baterii")
             return f"baterie{pct}: AI pozastavena ({why})"
         if act == THROTTLE:
             return f"baterie{pct}: AI zpomalena"
-        return f"baterie{pct}: plný výkon"
+        return tr("power-battery-full", pct=pct)
 
 
 # ── EcoQoS (Windows 11): úsporná jádra / nižší takt pro vlákno ──

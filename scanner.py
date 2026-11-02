@@ -1,3 +1,4 @@
+from i18n import tr
 import io
 import os
 import sys
@@ -462,7 +463,7 @@ class MediaScannerThread(QThread):
         return to_process, backfill, skipped
 
     def _run_pipeline(self):
-        self.status_signal.emit("Hledám soubory...")
+        self.status_signal.emit(tr("scan-finding-files"))
         try:
             all_files = self._collect_files()
         except Exception as e:
@@ -497,7 +498,7 @@ class MediaScannerThread(QThread):
 
         # FÁZE 1: Extrakce metadat jen pro nové / změněné soubory (0 % -> 45 %)
         done = skipped
-        self.status_signal.emit("Načítám metadata...")
+        self.status_signal.emit(tr("scan-reading-metadata"))
         for i in range(0, len(to_process), self.batch_size):
             if not self._is_running:
                 return 0
@@ -538,18 +539,18 @@ class MediaScannerThread(QThread):
         conn = get_connection()
         try:
             # FÁZE 2: Párování Live Photos a geokódování (45 % -> 60 %)
-            self.status_signal.emit("Slučuji Live Photos...")
+            self.status_signal.emit(tr("scan-pairing-live"))
             self._pair_live_photos(conn)
             self._emit_progress(52, force=True)
 
             if self._is_running:
-                self.status_signal.emit("Zjišťuji polohu a města...")
+                self.status_signal.emit(tr("scan-geocoding"))
                 self._geocode_locations(conn)
                 self._emit_progress(60, force=True)
 
             # FÁZE 3: Miniatury - nové i chybějící na disku (60 % -> 92 %)
             if self._is_running:
-                self.status_signal.emit("Vytvářím náhledy...")
+                self.status_signal.emit(tr("scan-thumbnails"))
                 repair_missing_thumbnails(
                     should_stop=lambda: not self._is_running,
                     progress=lambda i, n: self._emit_progress(60 + (i / max(n, 1)) * 25),
@@ -558,7 +559,7 @@ class MediaScannerThread(QThread):
 
             # FÁZE 3b: pHash + ostrost pro detekci duplicit (85 % -> 92 %)
             if self._is_running:
-                self.status_signal.emit("Počítám otisky pro duplicity...")
+                self.status_signal.emit(tr("scan-fingerprints"))
                 try:
                     from ai_engine import refresh_phashes   # líně: táhne cv2/numpy
                     refresh_phashes(
@@ -571,7 +572,7 @@ class MediaScannerThread(QThread):
 
             # FÁZE 4: Shlukování výletů (92 % -> 100 %)
             if self._is_running:
-                self.status_signal.emit("Shlukuji výlety...")
+                self.status_signal.emit(tr("scan-clustering"))
                 self._cluster_into_events(conn)
                 self._borrow_locations(conn)
                 self._emit_progress(100, force=True)
@@ -838,6 +839,7 @@ class MediaScannerThread(QThread):
                 except Exception:
                     continue
 
+                # i18n-ok: stored auto event name (localized at display)
                 item_dict = {"id": item_id, "dt": dt, "lat": lat, "lon": lon, "city": city or "Neznámé místo"}
 
                 if not current_cluster:
@@ -893,14 +895,18 @@ class MediaScannerThread(QThread):
         else:
             date_label = f"{start_dt.strftime('%d. %m.')} – {end_dt.strftime('%d. %m. %Y')}"
 
+        # i18n-ok: stored auto event name (localized at display)
         cities = [c["city"] for c in cluster if c["city"] != "Neznámé místo"]
         if cities:
             dominant_city, _ = Counter(cities).most_common(1)[0]
             unique_cities = list(dict.fromkeys(cities))
+            # i18n-ok: stored auto event name (localized at display)
             title = f"Výlet: {dominant_city} a okolí ({date_label})" if len(unique_cities) > 1 else f"Výlet: {dominant_city} ({date_label})"
             location_name = dominant_city
         else:
+            # i18n-ok: stored auto event name (localized at display)
             title = f"Výlet ({date_label})"
+            # i18n-ok: stored auto event name (localized at display)
             location_name = "Neznámé místo"
 
         cursor.execute("""

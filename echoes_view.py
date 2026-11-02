@@ -5,6 +5,7 @@ knihovna žádný návrat nemá). ThenNowView: srovnání dvou snímků jednoho 
 celý, „tehdy“ přes něj vlevo od posuvné dělicí čáry. Jsou-li to stejné scény, srovná je
 echoes.align_pair (ORB + RANSAC) – tažením čáry pak ubíhá čas, ne obraz.
 """
+from i18n import tr
 import os
 
 from PyQt6.QtCore import QObject, QPointF, QRectF, QRunnable, QSize, Qt, QThreadPool, pyqtSignal
@@ -127,8 +128,8 @@ class EchoCard(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         first, last = echo["items"][0], echo["items"][-1]
-        self.setAccessibleName(f"Ozvěna {echo.get('place') or ''}: {first['year']} a {last['year']}")
-        self.setToolTip("Porovnat tehdy a teď")
+        self.setAccessibleName(tr("echoes-a11y-card", value=echo.get('place') or '', year=first['year'], year2=last['year']))
+        self.setToolTip(tr("echoes-compare-tooltip"))
         self._hover = motion.Tween(0.0, lambda v: self.update(), self)
 
     def enterEvent(self, e):
@@ -198,7 +199,7 @@ class EchoCard(QWidget):
         sub_f = QFont(tokens.ui_family())
         sub_f.setPixelSize(13)
         pad, tw = 18, int(r.width() - 36)
-        title = self.echo.get("place") or "Ozvěna"
+        title = self.echo.get("place") or tr("echoes-echo")
         p.setPen(QColor("#FFFFFF"))
         p.drawText(QRectF(r.left() + pad, r.bottom() - pad - 18 - th, tw, th), int(Qt.AlignmentFlag.AlignLeft),
                    p.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, tw))
@@ -226,8 +227,8 @@ class EchoesPanel(QWidget):
         self._job = None
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        self.empty = EmptyState("echo", "Hledám ozvěny…",
-                                "Procházím místa, kam jste se s fotoaparátem vrátili po letech.")
+        self.empty = EmptyState("echo", tr("echoes-loading-title"),
+                                tr("echoes-loading-body"))
         lay.addWidget(self.empty, 1)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -254,9 +255,8 @@ class EchoesPanel(QWidget):
             c.deleteLater()
         self.cards = []
         if not found:
-            self.empty.set_content("echo", "Zatím žádné ozvěny",
-                                   "Ozvěna vznikne, když se na stejné místo vrátíte po letech a vyfotíte stejný "
-                                   "záběr – vyhlídku, dům, schody. Kairos je najde sám podle polohy a kompozice.")
+            self.empty.set_content("echo", tr("echoes-empty-title"),
+                                   tr("echoes-empty-body"))
             self.empty.show()
             self.scroll.hide()
             self.loaded.emit(0)
@@ -306,7 +306,7 @@ class ThenNowView(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumHeight(320)
-        self.setAccessibleName("Srovnání tehdy a teď – šipkami posunete dělicí čáru")
+        self.setAccessibleName(tr("echoes-compare-a11y"))
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 16)
         lay.addStretch(1)
@@ -411,7 +411,7 @@ class ThenNowView(QWidget):
         r = self.image_rect()
         if now.isNull() or then.isNull():
             p.setPen(tokens.qcolor(tokens.palette()["text_secondary"]))
-            p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), "Připravuji srovnání…")
+            p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), tr("echoes-preparing"))
             p.end()
             return
         x = r.left() + r.width() * max(0.0, min(1.0, float(self.split.value)))

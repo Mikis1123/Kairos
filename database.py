@@ -20,7 +20,7 @@ def _check_test_guard(path):
         return
     if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(REAL_DB_PATH)):
         raise RealDatabaseAccessError(
-            f"Test přistupuje ke skutečné knihovně {REAL_DB_PATH} – přesměrujte database.DB_PATH")
+            f'A test is touching the real library {REAL_DB_PATH} – redirect database.DB_PATH')
 
 
 def not_hidden_sql(alias="m"):
@@ -866,6 +866,7 @@ def get_search_vectors(ids=None):
 # UPSERT médií (nahrazuje INSERT OR REPLACE, který mazal oblíbené, obličeje a embeddingy)
 # ==============================================================================
 
+# i18n-ok: SQL
 UPSERT_MEDIA_SQL = """
 INSERT INTO media_items (
     file_path, file_name, file_size, file_mtime, file_ext, media_type,

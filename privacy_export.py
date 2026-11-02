@@ -20,6 +20,7 @@ s barevným profilem, ale bez EXIF; videa jako ověřené kopie.
 
 Skryté položky (Stage 3) se neexportují nikdy – ani když je o ně někdo požádá přímo.
 """
+from i18n import current, fmt_date, tr
 import html
 import json
 import os
@@ -85,15 +86,15 @@ class ExportResult:
     skipped: list = field(default_factory=list)        # [(název, důvod)] – chybějící / skryté
 
     def summary(self):
-        parts = [f"{self.exported} {_cz(self.exported, 'položka', 'položky', 'položek')}"]
+        parts = [tr("count-items", count=self.exported)]
         if self.verified:
-            parts.append(f"ověřeno ExifToolem: {self.verified} {_cz(self.verified, 'soubor', 'soubory', 'souborů')}")
+            parts.append(tr("export-summary-verified", count=self.verified))
         if self.excluded:
-            parts.append(f"vyřazeno: {len(self.excluded)}")
+            parts.append(tr("export-summary-excluded", count=len(self.excluded)))
         return " · ".join(parts)
 
 
-def _cz(n, one, few, many):
+def _cz(n, one, few, many):          # starší pomocník (testy); text dodá katalog
     return one if n == 1 else few if 2 <= n <= 4 else many
 
 
@@ -113,6 +114,7 @@ def exiftool_available(path=None):
 
 def _named(name):
     n = (name or "").strip()
+    # i18n-ok: DB default person name check
     return bool(n) and not n.lower().startswith(("neznámá osoba", "unknown"))
 
 
@@ -163,10 +165,10 @@ def collect(conn, media_ids):
         _, path, name, mtype, date, paired, city, country, is_hidden, is_trashed = r
         label = name or os.path.basename(path or "")
         if is_hidden or is_hidden_path(path):
-            skipped.append((label, "skrytá položka"))
+            skipped.append((label, tr("export-reason-hidden")))
             continue
         if is_trashed:
-            skipped.append((label, "v koši"))
+            skipped.append((label, tr("export-reason-trash")))
             continue
         if not path or not os.path.isfile(path):
             skipped.append((label, "soubor nenalezen"))
@@ -247,6 +249,7 @@ def strip_args(opts, names=()):
                  "-PersonInImage*="]
         for n in names:
             args += [f"-XMP-dc:Subject-={n}", f"-IPTC:Keywords-={n}", f"-XMP-lr:HierarchicalSubject-=People|{n}",
+                     # i18n-ok: XMP hierarchical keyword path (data format)
                      f"-XMP-lr:HierarchicalSubject-=Lidé|{n}", f"-XMP-lr:HierarchicalSubject-=Osoby|{n}",
                      f"-XMP-microsoft:LastKeywordXMP-={n}", f"-XMP-mediapro:People-={n}"]
     if opts.strip_camera:
@@ -315,10 +318,10 @@ def scan_violations(meta, opts, patterns=()):
                                     or tl.startswith("region")):
             cat = "osoby"
         elif opts.strip_camera and (tl in _CAMERA_TAGS or "serial" in tl or parts[0] == "MakerNotes"):
-            cat = "zařízení"
+            cat = tr("export-device")
         elif opts.strip_people and patterns and any(
                 isinstance(x, str) and mentions_name(x, patterns) for x in _values(value)):
-            cat = "jméno osoby"
+            cat = tr("export-person-name")
         if cat:
             out.append((key, cat, value))
     return out
@@ -336,7 +339,7 @@ def remediation_args(violations, patterns=()):
             makernotes = True
             continue
         spec = f"{parts[-2]}:{parts[-1]}" if len(parts) >= 3 else key
-        if isinstance(value, list) and cat == "jméno osoby":
+        if isinstance(value, list) and cat == tr("export-person-name"):
             args += [f"-{spec}-={x}" for x in value if isinstance(x, str) and mentions_name(x, patterns)]
         else:
             args.append(f"-{spec}=")
@@ -391,7 +394,7 @@ def clean_and_verify(files, opts, names, exiftool=None, ffmpeg=None, progress=No
     for f in files:
         m = meta.get(os.path.normcase(f))
         if m is None:
-            bad[f] = [("ExifTool", "nečitelné", "soubor nejde ověřit")]
+            bad[f] = [("ExifTool", tr("export-reason-unreadable"), tr("export-reason-unverifiable"))]
             continue
         v = scan_violations(m, opts, patterns)
         if v:
@@ -490,10 +493,6 @@ def video_poster(src, dst, edge=WEB_EDGE, ffmpeg=None):
         return None
 
 
-_MONTHS = ("ledna", "února", "března", "dubna", "května", "června", "července", "srpna", "září",
-           "října", "listopadu", "prosince")
-
-
 def czech_date(date_text):
     m = re.match(r"(\d{4})[-:](\d{2})[-:](\d{2})", (date_text or "").strip())
     if not m:
@@ -501,7 +500,7 @@ def czech_date(date_text):
     y, mo, d = int(m[1]), int(m[2]), int(m[3])
     if not 1 <= mo <= 12:
         return ""
-    return f"{d}. {_MONTHS[mo - 1]} {y}"
+    return fmt_date(f"{y:04d}-{mo:02d}-{d:02d}", "long")
 
 
 def caption(item, opts):
@@ -517,14 +516,20 @@ def build_showcase_html(title, entries):
     """Jedna samostatná stránka: mřížka náhledů + prohlížeč (šipky, Esc, swipe). Nic se nenačítá
     zvenku – funguje z disku, z USB i z rozbaleného ZIPu."""
     data = json.dumps(entries, ensure_ascii=False).replace("</", "<\\/")
-    t = html.escape(title or "Fotky")
-    count = len(entries)
-    sub = f"{count} {_cz(count, 'položka', 'položky', 'položek')}"
-    return _SHOWCASE.replace("{{TITLE}}", t).replace("{{SUB}}", html.escape(sub)).replace("{{DATA}}", data)
+    t = html.escape(title or tr("export-web-default-title"))
+    sub = tr("count-items", count=len(entries))
+    page = _SHOWCASE
+    for token, key in (("{{L_VIEWER}}", "export-web-viewer"), ("{{L_CLOSE}}", "action-close"),
+                       ("{{L_PREV}}", "export-web-previous"), ("{{L_NEXT}}", "export-web-next"),
+                       ("{{L_FOOTER}}", "export-web-footer")):
+        page = page.replace(token, html.escape(tr(key), quote=True))
+    page = page.replace("{{L_ITEM}}", json.dumps(tr("export-web-item", n="{n}")))
+    page = page.replace("{{LANG}}", current())
+    return page.replace("{{TITLE}}", t).replace("{{SUB}}", html.escape(sub)).replace("{{DATA}}", data)
 
 
 _SHOWCASE = """<!DOCTYPE html>
-<html lang="cs">
+<html lang="{{LANG}}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -554,19 +559,19 @@ footer{color:var(--muted);text-align:center;padding:0 0 30px;font-size:12px}
 <body>
 <header><h1>{{TITLE}}</h1><p>{{SUB}}</p></header>
 <main id="g"></main>
-<div id="lb" role="dialog" aria-modal="true" aria-label="Prohlížeč">
-  <button class="nav" id="close" aria-label="Zavřít">&#x2715;</button>
-  <button class="nav" id="prev" aria-label="Předchozí">&#x2039;</button>
+<div id="lb" role="dialog" aria-modal="true" aria-label="{{L_VIEWER}}">
+  <button class="nav" id="close" aria-label="{{L_CLOSE}}">&#x2715;</button>
+  <button class="nav" id="prev" aria-label="{{L_PREV}}">&#x2039;</button>
   <div id="stage"></div><div id="cap"></div>
-  <button class="nav" id="next" aria-label="Další">&#x203A;</button>
+  <button class="nav" id="next" aria-label="{{L_NEXT}}">&#x203A;</button>
 </div>
-<footer>Vytvořeno v aplikaci Kairos · funguje offline</footer>
+<footer>{{L_FOOTER}}</footer>
 <script id="data" type="application/json">{{DATA}}</script>
 <script>
 (function(){
 var items=JSON.parse(document.getElementById('data').textContent),g=document.getElementById('g'),
 lb=document.getElementById('lb'),stage=document.getElementById('stage'),cap=document.getElementById('cap'),cur=-1,sx=null;
-items.forEach(function(it,i){var b=document.createElement('button');b.className='t';b.setAttribute('aria-label',it.c||('Položka '+(i+1)));
+items.forEach(function(it,i){var b=document.createElement('button');b.className='t';b.setAttribute('aria-label',it.c||{{L_ITEM}}.replace('{n}',i+1));
 var im=document.createElement('img');im.loading='lazy';im.decoding='async';im.src=it.t;im.alt='';b.appendChild(im);
 if(it.v){var s=document.createElement('span');s.className='badge';s.textContent='\\u25B6 video';b.appendChild(s);}
 b.onclick=function(){show(i)};g.appendChild(b);});
@@ -613,9 +618,9 @@ def export(items, opts, dest, names=(), progress=None, cancelled=None, exiftool=
     číslo), u 'zip' cesta k .zip. Vrací ExportResult. Originály se jen čtou."""
     exe = exiftool or EXIFTOOL_PATH
     if opts.strips_anything and not exiftool_available(exe):
-        raise ExportError("ExifTool není k dispozici – bez ověření se soukromý export neprovede")
+        raise ExportError(tr("export-error-no-exiftool"))
     if not items:
-        raise ExportError("Není co exportovat")
+        raise ExportError(tr("export-error-nothing"))
     sources = {os.path.normcase(os.path.abspath(p)) for it in items for p in (it["path"], it.get("paired")) if p}
 
     def tick(stage_from, stage_to, frac):
@@ -624,7 +629,7 @@ def export(items, opts, dest, names=(), progress=None, cancelled=None, exiftool=
 
     def check():
         if cancelled and cancelled():
-            raise ExportCancelled("Export zrušen")
+            raise ExportCancelled(tr("export-cancelled"))
 
     dest = os.path.abspath(dest)
     parent = os.path.dirname(dest)
@@ -667,7 +672,7 @@ def export(items, opts, dest, names=(), progress=None, cancelled=None, exiftool=
                     entry["poster"] = poster if entry["size"] else None
                     entry["video"] = True
             if entry["main"] is None:
-                result.excluded.append((it["name"], "nelze převést pro web"))
+                result.excluded.append((it["name"], tr("export-reason-web")))
                 continue
             if web:
                 show = entry["poster"] if entry.get("video") else entry["main"]
@@ -686,7 +691,7 @@ def export(items, opts, dest, names=(), progress=None, cancelled=None, exiftool=
         all_files = [p for e in produced.values() for p in (e["main"], e["motion"], e["poster"], e["thumb"]) if p]
         for p in all_files:              # pojistka: staging nikdy nesmí ukazovat na originál
             if os.path.normcase(os.path.abspath(p)) in sources:
-                raise ExportError("Cílová složka se překrývá se zdrojovými soubory")
+                raise ExportError(tr("export-error-overlap"))
         check()
         bad = {}
         if exiftool_available(exe):
@@ -721,7 +726,7 @@ def export(items, opts, dest, names=(), progress=None, cancelled=None, exiftool=
                 entries.append({"f": rel(show), "t": rel(e["thumb"] or show), "v": rel(e["main"]) if e.get("video") else "",
                                 "c": caption(it, opts), "w": (e["size"] or (0, 0))[0], "h": (e["size"] or (0, 0))[1]})
         if result.exported == 0:
-            raise ExportError("Žádná položka neprošla ověřením – export se nevytvořil")
+            raise ExportError(tr("export-error-none-verified"))
         if web:
             with open(os.path.join(staging, "index.html"), "w", encoding="utf-8", newline="\n") as f:
                 f.write(build_showcase_html(opts.title, entries))

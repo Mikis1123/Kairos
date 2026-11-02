@@ -6,6 +6,7 @@ a velikosti písmen, po slovech i po písmenech (fuzzy): „ost“ najde Ostravu
 
 Paleta nic neví o aplikaci: položky dodá provider() (main.py) jako seznam Command.
 """
+from i18n import N_, tr
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable
@@ -23,8 +24,8 @@ from ui_controls import palette_for
 CARD_WIDTH = 600
 MAX_ROWS = 9
 ROW_H = 44
-KIND_LABELS = {"page": "Stránka", "album": "Album", "person": "Osoba", "event": "Událost",
-               "action": "Akce", "search": "Hledání"}
+KIND_LABELS = {"page": N_("palette-kind-page"), "album": N_("palette-kind-album"), "person": N_("palette-kind-person"),
+               "event": N_("palette-kind-event"), "action": N_("palette-kind-action"), "search": N_("palette-kind-search")}
 KIND_WEIGHT = {"page": 0.06, "action": 0.04, "album": 0.03, "person": 0.02, "event": 0.0, "search": 0.0}
 
 
@@ -113,6 +114,7 @@ class _RowDelegate(QStyledItemDelegate):
         p.setPen(tokens.qcolor(t["text"]))
         x = r.left() + 42
         kind = KIND_LABELS.get(cmd.kind, "")
+        kind = tr(kind) if kind else ""
         fk = QFont(f)
         fk.setPixelSize(11)
         kind_w = 80
@@ -154,7 +156,7 @@ class CommandPalette(QWidget):
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
         self.edit = QLineEdit()
-        self.edit.setPlaceholderText("Hledat stránku, osobu, událost, album… nebo cokoli na fotkách")
+        self.edit.setPlaceholderText(tr("palette-placeholder"))
         self.edit.setClearButtonEnabled(True)
         self.edit.setMinimumHeight(40)
         self.edit.textChanged.connect(self._refresh)

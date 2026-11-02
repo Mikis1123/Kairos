@@ -1,3 +1,4 @@
+from i18n import tr
 import os
 import time
 import sqlite3
@@ -483,16 +484,16 @@ def face_validity(embedding_norm, det_score, kps=None, bbox=None, redetected=Tru
     why = []
     s_norm = float(np.clip((float(embedding_norm or 0.0) - FACE_NORM_LOW) / (FACE_NORM_HIGH - FACE_NORM_LOW), 0, 1))
     if s_norm < 0.3:
-        why.append("slabý obličejový vzor (embedding)")
+        why.append(tr("face-why-weak-embedding"))
     if det_score is None or not redetected:
         s_det = 0.5
     else:
         s_det = float(np.clip((float(det_score) - FACE_DET_LOW) / (FACE_DET_HIGH - FACE_DET_LOW), 0, 1))
         if s_det < 0.3:
-            why.append("nízká jistota detektoru")
+            why.append(tr("face-why-low-confidence"))
     s_geo = landmark_plausibility(kps, bbox) if (kps is not None and redetected) else 0.75
     if s_geo < 0.75:
-        why.append("nevěrohodné rozložení očí / nosu / úst")
+        why.append(tr("face-why-landmarks"))
     score = 0.60 * s_norm + 0.25 * s_det + 0.15 * s_geo
     return float(score), why
 
@@ -900,7 +901,7 @@ def detect_and_extract_faces(media_id, image_path, preloaded_image=None):
                 # cv2.imwrite by tady selhal TIŠE (např. diakritika v cestě) a v DB by zůstala
                 # cesta k neexistujícímu souboru. Raději hlasitě selhat - fotka se zkusí příště.
                 _discard_crops(raw_detections)
-                raise OSError(f"Nepodařilo se zapsat ořez obličeje: {crop_path}")
+                raise OSError(f'Couldn’t write the face crop: {crop_path}')
 
             embedding = face.embedding
             if embedding is None:
@@ -937,7 +938,7 @@ def detect_and_extract_faces(media_id, image_path, preloaded_image=None):
     if not raw_detections:
         if detection_errors and detection_errors == len(images):
             # Nic se nepodařilo zpracovat -> NE "žádné tváře" (fotka se nesmí označit za hotovou)
-            raise RuntimeError("Detekce obličejů selhala pro všechny snímky")
+            raise RuntimeError('Face detection failed for every image')
         return []
 
     unique_people_in_media = []
@@ -1158,6 +1159,7 @@ def cluster_faces_into_people(match_threshold=0.42):
                 if len(comp) >= 2:
                     c.execute(
                         "INSERT INTO people (name, cover_face_path) VALUES (?, ?)",
+                        # i18n-ok: SQL default person name
                         ("Neznámá osoba", remaining_unassigned[comp[0]][2])
                     )
                     new_p_id = c.lastrowid

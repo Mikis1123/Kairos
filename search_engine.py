@@ -225,12 +225,14 @@ def plan_query(query, vocab, today=None):
             plan.labels.append("dnes")
         elif t in ("vcera", "yesterday"):
             plan.days = (plan.days or set()) | {(today - timedelta(days=1)).isoformat()}
+            # i18n-ok: search query grammar
             plan.labels.append("včera")
         elif t in TYPE_WORDS:
             plan.media_types.add(TYPE_WORDS[t])
             plan.labels.append("videa" if TYPE_WORDS[t] == "video" else "Live Photos")
         elif t in FAVORITE_WORDS:
             plan.favorites = True
+            # i18n-ok: search query grammar
             plan.labels.append("oblíbené")
         elif t in PEOPLE_WORDS:
             plan.people = True
@@ -350,7 +352,9 @@ def run_search(query, universe, embeddings, vocab=None, semantic_fn=None, today=
         from ai_engine import rank_semantic as semantic_fn
     text = plan.text
     if plan.people:
+        # i18n-ok: search query grammar
         labels.append("lidé")
+        # i18n-ok: search query grammar
         text = f"lidé {text}".strip() if text else "lidé"
     confident, possible = semantic_fn(text, pool, embeddings, face_ids if plan.people else None)
     if plan.text:

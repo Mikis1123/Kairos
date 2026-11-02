@@ -115,10 +115,10 @@ def download(progress=None, should_stop=None, folder=None, base_url=BASE_URL, op
                     if progress:
                         progress(done + got, total)
         if os.path.getsize(part) != size:
-            raise DownloadError(f"{local}: neúplné stažení ({os.path.getsize(part)} z {size} B)")
+            raise DownloadError(f'download incomplete: {local} ({os.path.getsize(part)} of {size} B)')
         if sha and len(sha) == 64 and _sha256(part) != sha:
             os.remove(part)
-            raise DownloadError(f"{local}: nesouhlasí kontrolní součet")
+            raise DownloadError(f'checksum mismatch: {local}')
         os.replace(part, target)
         done += size
     return installed(folder)

@@ -8,6 +8,7 @@ Alba v2: karty se dají přetahovat – na střed složky = přesun do ní, k ok
 na pruh „O úroveň výš“ = do nadřazené složky. Nabídka karty nabízí totéž bez myši
 („Přesunout do…“), plus výběr obálky a export.
 """
+from i18n import N_, tr
 import os
 
 from PyQt6.QtCore import QMimeData, QPoint, QRectF, QSize, Qt, pyqtSignal
@@ -22,7 +23,8 @@ from ui_controls import EmptyState, smooth_rect_path
 
 CARD_W, CARD_H = 240, 236
 IMAGE_H = 180
-FILTER_LABELS = {"all": "", "favorites": "v Oblíbených", "photo": "jen fotky", "video": "jen videa"}
+FILTER_LABELS = {"all": "", "favorites": N_("albums-in-favorites"), "photo": N_("albums-only-photos"),
+                 "video": N_("albums-only-videos")}
 NODE_MIME = "application/x-kairos-album-node"
 INTO_BAND = 0.22                          # okraje karty složky (podíl šířky) = vložit vedle, střed = do ní
 
@@ -49,9 +51,8 @@ def subtitle(album):
         return albums.czech_folder_summary(album.get("count") or 0)
     if album["kind"] == "smart":
         extra = FILTER_LABELS.get(album.get("filter") or "all", "")
-        return f"Hledání „{album['query']}“" + (f" {extra}" if extra else "")
-    n = album.get("count") or 0
-    return f"{n} {'položka' if n == 1 else 'položky' if 2 <= n <= 4 else 'položek'}"
+        return tr("albums-search-label", query=album['query']) + (" " + tr(extra) if extra else "")
+    return tr("count-items", count=album.get("count") or 0)
 
 
 class AlbumCard(QWidget):
@@ -67,7 +68,7 @@ class AlbumCard(QWidget):
         self.setFixedSize(CARD_W, CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        kind = {"folder": "Složka", "smart": "Chytré album"}.get(album["kind"], "Album")
+        kind = {"folder": tr("albums-kind-folder"), "smart": tr("albums-kind-smart")}.get(album["kind"], tr("albums-kind-album"))
         self.setAccessibleName(f"{kind} {album['name']}, {subtitle(album)}")
         self._hover = motion.Tween(0.0, lambda v: self.update(), self)
 
@@ -216,7 +217,7 @@ class _UpTarget(QLabel):
     """Pruh „O úroveň výš“ – viditelný jen během tahu karty v podsložce."""
 
     def __init__(self, parent=None):
-        super().__init__("↑  Přetáhněte sem: o úroveň výš", parent)
+        super().__init__(tr("albums-drop-up-level"), parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setFixedHeight(40)
         self.set_active(False)
@@ -252,13 +253,11 @@ class AlbumsPanel(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         self.up = _UpTarget(self)
         lay.addWidget(self.up)
-        body = ("Přetáhněte sem alba nebo vytvořte nové. Smazáním složky se její obsah přesune o úroveň výš."
+        body = (tr("albums-folder-empty-body")
                 if folder_id is not None else
-                "Vyberte fotky v mřížce a v nabídce pravého tlačítka zvolte „Přidat do alba“. "
-                "Chytré album uloží hledání – třeba „západ slunce“ – a samo se doplňuje. "
-                "Složky alba seskupí.")
+                tr("albums-empty-body"))
         self.empty = EmptyState("folder" if folder_id is not None else "album",
-                                "Prázdná složka" if folder_id is not None else "Zatím žádná alba", body)
+                                tr("albums-empty-folder") if folder_id is not None else tr("albums-empty-title"), body)
         lay.addWidget(self.empty, 1)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -310,18 +309,18 @@ class AlbumsPanel(QWidget):
     # ── nabídka ──
     def _menu(self, album, pos):
         menu = QMenu(self)
-        act_open = menu.addAction("Otevřít")
-        act_rename = menu.addAction("Přejmenovat…")
+        act_open = menu.addAction(tr("action-open"))
+        act_rename = menu.addAction(tr("action-rename-ellipsis"))
         act_cover = act_auto = act_export = None
         if album["kind"] == "manual":
-            act_cover = menu.addAction("Vybrat obálku…")
+            act_cover = menu.addAction(tr("albums-choose-cover"))
             if album.get("cover_id") is not None:
-                act_auto = menu.addAction("Automatická obálka")
+                act_auto = menu.addAction(tr("albums-auto-cover"))
         if album["kind"] in ("manual", "folder"):
-            act_export = menu.addAction("Exportovat…")
+            act_export = menu.addAction(tr("action-export-ellipsis"))
         move_targets = self._move_menu(menu, album)
         menu.addSeparator()
-        act_delete = menu.addAction("Smazat složku" if album["kind"] == "folder" else "Smazat album")
+        act_delete = menu.addAction(tr("albums-delete-folder") if album["kind"] == "folder" else tr("albums-delete-album"))
         chosen = menu.exec(pos)
         if chosen is None:
             return
@@ -349,10 +348,10 @@ class AlbumsPanel(QWidget):
                                        if album["kind"] == "folder" else set())
         finally:
             conn.close()
-        sub = menu.addMenu("Přesunout do")
+        sub = menu.addMenu(tr("albums-move-to"))
         targets = {}
         if album.get("parent_id") is not None:
-            targets[sub.addAction("Alba (nejvyšší úroveň)")] = None
+            targets[sub.addAction(tr("albums-top-level"))] = None
         for fid, label in folders:
             if fid in blocked or fid == album.get("parent_id"):
                 continue

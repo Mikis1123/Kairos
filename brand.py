@@ -260,6 +260,7 @@ def paint_wordmark(p, origin, px, color, letters=1.0, ring=1.0, spark=1.0, sprea
         c = QColor(color)
         c.setAlphaF(c.alphaF() * max(0.0, min(1.0, letters)))
         p.setPen(c)
+        # i18n-ok: brand wordmark (the "o" is the ring)
         p.drawText(QPointF(origin.x() + x_kai + spread, origin.y()), "Kair")
         p.drawText(QPointF(origin.x() + x_s - spread, origin.y()), "s")
         p.restore()

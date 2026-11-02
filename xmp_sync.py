@@ -277,6 +277,7 @@ def write_sidecar(file_path, st, dims=None):
 # ── DB -> stav ─────────────────────────────────────────────────────────────────
 def _is_named(name):
     n = (name or "").strip()
+    # i18n-ok: DB default person name check
     return bool(n) and not n.lower().startswith(("neznámá osoba", "unknown"))
 
 

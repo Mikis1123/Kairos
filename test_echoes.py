@@ -293,7 +293,7 @@ class TestEchoesView(unittest.TestCase):
 
     def test_sidebar_has_echoes_entry(self):
         src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"), encoding="utf-8").read()
-        self.assertIn('("echoes", "Ozvěny", "echo")', src)
+        self.assertIn('("echoes", tr("nav-echoes"), "echo")', src)
         import icons
         self.assertIn("echo", icons.ICONS)
 

@@ -6,6 +6,7 @@ a čas sestřihu jemně táhne za hodinami hudby (director.BeatClock), takže st
 i při zaváhání přehrávače. Mezerník / klik = pauza, ←/→ = o záběr.
 ExportJob: MP4 na pozadí (reel_export) s průběhem.
 """
+from i18n import tr
 import os
 import time
 
@@ -144,8 +145,8 @@ class ReelCard(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName(f"Sestřih {suggestion['title']}")
-        self.setToolTip("Přehrát sestřih")
+        self.setAccessibleName(tr("reels-a11y", title=suggestion['title']))
+        self.setToolTip(tr("reels-play-tooltip"))
         self._hover = motion.Tween(0.0, lambda v: self.update(), self)
 
     def enterEvent(self, e):
@@ -243,9 +244,8 @@ class ReelsPanel(QScrollArea):
             c.deleteLater()
         self.cards = []
         if not found:
-            empty = EmptyState("reel", "Zatím žádné sestřihy",
-                               f"Sestřih vznikne z výletu, roku nebo tohoto týdne v minulých letech – stačí "
-                               f"{reels.MIN_SHOTS} fotek.")
+            empty = EmptyState("reel", tr("reels-empty-title"),
+                               tr("reels-empty-body", count=reels.MIN_SHOTS))
             self.grid.addWidget(empty, 0, 0)
             self.cards.append(empty)
         cols = 2
@@ -437,13 +437,13 @@ class ReelPage(QWidget):
         self.lay = QVBoxLayout(self)
         self.lay.setContentsMargins(0, 0, 0, 0)
         self.player = None
-        self.placeholder = EmptyState("reel", "Stříhám sestřih…", "Vybírám nejlepší záběry a skládám je do rytmu hudby.")
+        self.placeholder = EmptyState("reel", tr("reels-rendering-title"), tr("reels-rendering-body"))
         self.lay.addWidget(self.placeholder)
 
     def set_renderer(self, renderer):
         if renderer is None:
             self.placeholder.setParent(None)
-            self.placeholder = EmptyState("reel", "Sestřih nejde složit", "V tomhle období je málo použitelných fotek.")
+            self.placeholder = EmptyState("reel", tr("reels-failed-title"), tr("reels-failed-body"))
             self.lay.addWidget(self.placeholder)
             return
         self.placeholder.setParent(None)

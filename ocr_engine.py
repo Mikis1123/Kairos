@@ -82,6 +82,7 @@ def recognize(img):
 def plausible(word):
     """Slovo, ne textura: písmena v jednom tvaru (VELKÁ / malá / Začáteční), nebo číslo.
     Kámen a listí OCR čte jako „sgFF“, „i,w“, „zg:FI“ – smíšená velikost, interpunkce uvnitř."""
+    # i18n-ok: punctuation set, not text
     w = word.strip(".,:;!?\"'()[]«»„“”-–")
     if len(w) >= 2 and w.isdigit():
         return w

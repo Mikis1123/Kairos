@@ -15,6 +15,7 @@ přes DPAPI a hned zapomene. Zobrazení skrytého vyžaduje odemčení.
 Soubor miniatury: MAGIC | nonce 12 B | šifrovaný JPEG + tag; AAD = „thumb:<id>“ (zašifrovaná
 miniatura jedné položky se nedá podstrčit jiné).
 """
+from i18n import tr
 import base64
 import ctypes
 import glob
@@ -54,7 +55,7 @@ class LockedOut(VaultError):
     """Příliš mnoho špatných hesel – další pokus až za `seconds`."""
 
     def __init__(self, seconds):
-        super().__init__(f"Další pokus za {int(seconds)} s")
+        super().__init__(tr("locked-retry-in", value=int(seconds)))
         self.seconds = int(seconds)
 
 
@@ -112,7 +113,7 @@ def _blob(data):
 
 def _dpapi(data, protect):
     if os.name != "nt":
-        raise VaultError("DPAPI je jen ve Windows")
+        raise VaultError("DPAPI is only available on Windows")
     crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
     src, _keep1 = _blob(data)
     ent, _keep2 = _blob(DPAPI_ENTROPY)
@@ -291,7 +292,7 @@ class Vault:
     def setup(self, passcode):
         """Založí trezor s novým klíčem (jen jednou) a nechá ho odemčený."""
         if self.is_configured():
-            raise VaultError("Složka Skryté už je nastavená")
+            raise VaultError(tr("locked-error-already-set-up"))
         check_passcode(passcode)
         key = bytearray(secrets.token_bytes(KEY_LEN))
         meta = {"version": VAULT_VERSION, "created": int(self._clock()), "failures": 0, "locked_until": 0}
@@ -353,13 +354,13 @@ class Vault:
     def _dpapi_key(self):
         meta = self._read_meta()
         if not meta.get("dpapi"):
-            raise VaultLocked("Klíč účtu Windows chybí – odemkněte heslem")
+            raise VaultLocked(tr("locked-error-no-account-key"))
         try:
             key = dpapi_unprotect(_unb64(meta["dpapi"]))
         except VaultError as e:
             raise VaultLocked(str(e))
         if len(key) != KEY_LEN:
-            raise VaultLocked("Poškozený klíč účtu Windows")
+            raise VaultLocked(tr("locked-error-bad-account-key"))
         return bytearray(key)
 
     def unlock_with_os(self):
@@ -425,7 +426,7 @@ class Vault:
         """Dešifrovaný JPEG, nebo None (chybí / poškozený). Zamčeno: VaultLocked."""
         aead = self._aead
         if aead is None:
-            raise VaultLocked("Složka Skryté je zamčená")
+            raise VaultLocked(tr("locked-error-locked"))
         try:
             with open(self.thumb_path(media_id), "rb") as f:
                 blob = f.read()
@@ -448,7 +449,7 @@ class Vault:
 
 def check_passcode(passcode):
     if not passcode or len(passcode) < PASSCODE_MIN:
-        raise VaultError(f"Heslo musí mít aspoň {PASSCODE_MIN} znaků")
+        raise VaultError(tr("locked-error-passcode-min", PASSCODE_MIN=PASSCODE_MIN))
 
 
 _vault = None
@@ -489,7 +490,7 @@ def hide_items(media_ids, vault=None):
     import database
     vault = vault or get()
     if not vault.is_configured():
-        raise VaultLocked("Složka Skryté ještě není nastavená")
+        raise VaultLocked(tr("locked-error-not-set-up"))
     ids = sorted({int(i) for i in media_ids})
     if not ids:
         return 0
@@ -533,7 +534,7 @@ def unhide_items(media_ids, vault=None):
     import database
     vault = vault or get()
     if not vault.is_unlocked:
-        raise VaultLocked("Složka Skryté je zamčená")
+        raise VaultLocked(tr("locked-error-locked"))
     rows = database.unhide_media(media_ids)
     if not rows:
         return 0

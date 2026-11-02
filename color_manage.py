@@ -19,6 +19,7 @@ neuplatňuje a plakát musí barevně navazovat na první snímek videa.
 
 Bezpečné mimo GUI vlákno (po `configure()` z GUI vlákna při startu).
 """
+from i18n import N_, tr
 import hashlib
 import io
 import math
@@ -33,7 +34,7 @@ MODE_SRGB = "srgb"
 _SRGB = ImageCms.createProfile("sRGB")
 _transforms = {}
 _lock = threading.Lock()
-_target = {"icc": None, "name": "sRGB", "reason": "výchozí", "fp": "srgb"}   # icc None = sRGB
+_target = {"icc": None, "name": "sRGB", "reason": N_("color-reason-default"), "fp": "srgb"}   # icc None = sRGB
 
 # ── ICC profil z primárek (EDID) ──────────────────────────────────────────────
 
@@ -251,20 +252,20 @@ def _assigned_icc():
 def detect_output(mode=MODE_AUTO):
     """(icc_bytes | None = sRGB, popis, důvod) pro výstup na hlavní displej."""
     if mode == MODE_SRGB:
-        return None, "sRGB", "nastaveno ručně"
+        return None, "sRGB", tr("color-reason-manual")
     acm = _advanced_color_active()
     if acm:
-        return None, "sRGB", "barvy spravuje Windows (automatická správa barev / HDR)"
+        return None, "sRGB", tr("color-reason-windows")
     icc = _assigned_icc()
     if icc:
-        return icc, _describe(icc), "profil přiřazený displeji ve Windows"
+        return icc, _describe(icc), tr("color-reason-profile")
     edid = _internal_display_edid()
     if edid:
         prim = _edid_primaries(edid)
         ratio = gamut_area_ratio(prim)
         if ratio > 1.15:
             name = f"Displej (EDID, {ratio * 100:.0f} % sRGB)"
-            return build_matrix_profile(prim, name), name, "displej se širokým gamutem bez správy barev"
+            return build_matrix_profile(prim, name), name, tr("color-reason-wide-gamut")
     return None, "sRGB", "displej v rozsahu sRGB"
 
 

@@ -14,6 +14,7 @@ každý střih tak padá na dobu; střih na těžkou dobu dostane delší prolnu
 = Ken Burns k tvářím (director.ken_burns). Stejný plán kreslí přehrávač i export MP4
 (reel_render.py) – náhled a video jsou snímek po snímku totéž.
 """
+from i18n import event_place, fmt_date, tr
 import math
 import zlib
 from datetime import date, datetime, timedelta
@@ -39,6 +40,7 @@ FACE_BONUS = 0.35
 SMILE_WEIGHT = 1.1
 QUALITY_WEIGHT = 0.45
 THROWBACK_DAYS = 7
+# i18n-ok: search vocabulary (CLIP prompts)
 GOOD_PROMPTS = ["a beautiful photo", "a memorable moment with friends", "a stunning landscape", "krásná fotka"]
 BAD_PROMPTS = ["a blurry photo", "a screenshot", "a photo of a document", "a dark underexposed photo"]
 
@@ -78,10 +80,10 @@ def suggestions(conn, today=None, limit_events=12):
     tb = sum(len(v) for v in years.values())
     if tb >= MIN_SHOTS:
         ago = sorted(today.year - y for y in years)
-        what = (f"Před {ago[0]} {'rokem' if ago[0] == 1 else 'lety'}" if len(ago) == 1
-                else f"Tento týden před {ago[0]}–{ago[-1]} lety")
+        what = (tr("memories-years-ago", years=ago[0]) if len(ago) == 1
+                else tr("reels-this-week-range", first=ago[0], last=ago[-1]))
         out.append({"key": "throwback", "kind": "throwback", "title": what,
-                    "subtitle": f"{tb} snímků z tohoto týdne", "count": tb})
+                    "subtitle": tr("reels-shots-this-week", count=tb), "count": tb})
     for eid, title, loc, start, n in conn.execute(f"""
             SELECT e.id, e.title, e.location_name, e.start_date, COUNT(m.id)
             FROM events e JOIN media_items m ON m.event_id = e.id
@@ -90,7 +92,7 @@ def suggestions(conn, today=None, limit_events=12):
             ORDER BY e.start_date DESC, e.id DESC LIMIT {int(limit_events)}""").fetchall():
         d = _parse_day(start)
         out.append({"key": f"event:{eid}", "kind": "event", "event_id": int(eid),
-                    "title": clean_title(title) or loc or "Událost",
+                    "title": event_place(clean_title(title)) or loc or tr("event-default-title"),
                     "subtitle": " · ".join(x for x in (loc if loc != title else "", _cz_date(d)) if x), "count": int(n)})
     per_year = {}
     for _md, y, _mid in rows:
@@ -98,8 +100,8 @@ def suggestions(conn, today=None, limit_events=12):
             per_year[y] = per_year.get(y, 0) + 1
     for y in sorted(per_year, reverse=True):
         if per_year[y] >= MIN_SHOTS * 2:
-            out.append({"key": f"year:{y}", "kind": "year", "year": y, "title": f"Rok {y}",
-                        "subtitle": f"{per_year[y]} snímků", "count": per_year[y]})
+            out.append({"key": f"year:{y}", "kind": "year", "year": y, "title": tr("reels-year", year=str(y)),
+                        "subtitle": tr("count-shots", count=per_year[y]), "count": per_year[y]})
     return out
 
 
@@ -110,7 +112,7 @@ def clean_title(title):
 
 
 def _cz_date(d):
-    return f"{d.day}. {d.month}. {d.year}" if d else ""
+    return fmt_date(d, "medium") if d else ""
 
 
 # ── kandidáti ────────────────────────────────────────────────────────────────
@@ -125,7 +127,7 @@ def _scope_sql(key, today):
         return "m.event_id = ?", [int(val)]
     if kind == "year":
         return "substr(m.date_taken, 1, 4) = ?", [str(int(val))]
-    raise ValueError(f"neznámý sestřih {key}")
+    raise ValueError(f'unknown reel {key}')
 
 
 def candidates(conn, key, today=None):

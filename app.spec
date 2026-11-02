@@ -37,6 +37,9 @@ for page in ('map_vault.html', 'mini_map.html', 'director.js', 'reel_player.html
     if os.path.exists(page):
         datas.append((page, '.'))
 # Vrstva videa prohlížeče (QML VideoOutput, viewer_hud.py)
+# Gate 1: katalogy překladů (Project Fluent) – i18n.LOCALES_DIR = _MEIPASS/locales
+if os.path.isdir('locales'):
+    datas.append(('locales', 'locales'))
 if os.path.exists('video_output.qml'):
     datas.append(('video_output.qml', '.'))
 # Batch 6: MapLibre GL JS 5 (zeměkoule, terén, Cesta, minimapa), vč. licence – jediný mapový stack
@@ -62,6 +65,8 @@ if not os.path.exists(APP_ICON):
 
 # Přibalení podpory pro reverzní geokódování a HEIF
 hidden_imports = [
+    'fluent.syntax',          # Gate 1: parser katalogů (i18n.py)
+    'i18n',
     'PyQt6.QtWebEngineWidgets',
     'PyQt6.QtWebEngineCore',
     'PyQt6.QtWebChannel',

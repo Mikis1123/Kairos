@@ -1,4 +1,5 @@
 """Bezpečné čištění mezipaměti náhledů (bez závislosti na Qt, snadno testovatelné)."""
+from i18n import tr
 import os
 import shutil
 
@@ -14,25 +15,25 @@ def clear_thumbnail_cache():
     dogenerují (BackgroundAIDaemon -> scanner.repair_missing_thumbnails).
     """
     if os.path.basename(os.path.normpath(THUMB_DIR)) != "thumbnails":
-        return False, "Neočekávaná cesta k mezipaměti, mazání zrušeno."
+        return False, tr("cache-unexpected-path")
 
     problems = []
     try:
         if os.path.isdir(THUMB_DIR):
             shutil.rmtree(THUMB_DIR)
     except Exception as e:
-        problems.append(f"Nepodařilo se smazat všechny soubory: {e}")
+        problems.append(tr("cache-delete-failed", e=e))
     try:
         os.makedirs(THUMB_DIR, exist_ok=True)
     except Exception as e:
-        problems.append(f"Nepodařilo se vytvořit složku: {e}")
+        problems.append(tr("cache-mkdir-failed", e=e))
 
     try:
         with db_transaction() as conn:
             conn.execute("UPDATE media_items SET thumbnail_path = NULL")
     except Exception as e:
-        return False, f"Miniatury smazány, ale databázi se nepodařilo aktualizovat: {e}"
+        return False, tr("cache-db-update-failed", e=e)
 
     if problems:
-        return True, "Hotovo s upozorněním: " + " ".join(problems)
-    return True, "Mezipaměť miniatur byla vyčištěna."
+        return True, tr("cache-done-with-warning", detail=" ".join(problems))
+    return True, tr("cache-thumbs-cleared")

@@ -70,7 +70,7 @@ class QuietWebPage(QWebEnginePage):
         out = self.stream or sys.stderr
         name = _LEVEL_NAMES.get(level, "log")
         where = f" ({os.path.basename(str(source or ''))}:{line})" if source else ""
-        text = str(message) if n <= MAX_REPEATS else f"{str(message)[:120]} … (další opakování se nevypisují)"
+        text = str(message) if n <= MAX_REPEATS else f'web console: {str(message)[:120]} … (further repeats suppressed)'
         try:
             out.write(f"[{self.tag} {name}] {text}{where}\n")
         except Exception:

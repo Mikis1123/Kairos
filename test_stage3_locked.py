@@ -616,7 +616,7 @@ class TestMainWindowHidden(Env):
     def test_sidebar_entry_and_preference(self):
         item = self.w.sidebar_nav.item("hidden")
         self.assertIsNotNone(item)
-        self.assertEqual(item.text() if hasattr(item, "text") else "", "Skryté 🔒")
+        self.assertEqual(item.text() if hasattr(item, "text") else "", "Uzamčený trezor")     # Gate 1: nomenklatura
         self.assertFalse(item.isHidden())
         self.w.config["show_hidden_folder"] = False
         self.w._sync_hidden_entry()

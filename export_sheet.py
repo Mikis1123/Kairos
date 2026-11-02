@@ -5,6 +5,7 @@ ExportSheet je list v okně (ui_sheets.Sheet): přepínače „Odstranit polohu�
 segmentové přepínače Obsah (Soubory / Webová prezentace) a Balení (Složka / ZIP). Poslední volby
 se pamatují v configu (export_options), soukromí je výchozí.
 """
+from i18n import tr
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
@@ -46,24 +47,23 @@ def _row(label, control):
 
 class ExportSheet(Sheet):
     def __init__(self, host, count, opts, exiftool_ok=True):
-        noun = "položka" if count == 1 else "položky" if 2 <= count <= 4 else "položek"
-        body = f"{count} {noun}. Exportují se kopie – originály ve vašich složkách zůstanou beze změny."
-        super().__init__(host, "Exportovat", body, "Exportovat…")
+        body = tr("export-sheet-body", count=count)
+        super().__init__(host, tr("action-export"), body, tr("action-export-ellipsis"))
         self.opts = opts
-        self.t_gps = ToggleSwitch("Odstranit polohu (GPS a místo)")
-        self.t_people = ToggleSwitch("Odstranit jména osob a tváře")
-        self.t_camera = ToggleSwitch("Odstranit zařízení a autora")
-        self.t_names = ToggleSwitch("Neutrální názvy souborů (podle data)")
-        self.t_live = ToggleSwitch("Přidat pohybová videa Live Photos")
+        self.t_gps = ToggleSwitch(tr("export-strip-location"))
+        self.t_people = ToggleSwitch(tr("export-strip-people"))
+        self.t_camera = ToggleSwitch(tr("export-strip-device"))
+        self.t_names = ToggleSwitch(tr("export-neutral-names"))
+        self.t_live = ToggleSwitch(tr("export-include-live"))
         for t, on in ((self.t_gps, opts.strip_gps), (self.t_people, opts.strip_people),
                       (self.t_camera, opts.strip_camera), (self.t_names, opts.neutral_names),
                       (self.t_live, opts.include_live)):
             t.setChecked(bool(on))
             self.content.addWidget(t)
-        self.seg_layout = SegmentedControl([("Soubory", "files"), ("Webová prezentace", "web")], current=opts.layout)
-        self.seg_package = SegmentedControl([("Složka", "folder"), ("ZIP", "zip")], current=opts.package)
-        self.content.addWidget(_row("Obsah", self.seg_layout))
-        self.content.addWidget(_row("Balení", self.seg_package))
+        self.seg_layout = SegmentedControl([(tr("export-format-files"), "files"), (tr("export-format-web"), "web")], current=opts.layout)
+        self.seg_package = SegmentedControl([(tr("export-format-folder"), "folder"), ("ZIP", "zip")], current=opts.package)
+        self.content.addWidget(_row(tr("export-content"), self.seg_layout))
+        self.content.addWidget(_row(tr("export-packaging"), self.seg_package))
         self.lbl_note = QLabel()
         self.lbl_note.setObjectName("sheetBody")
         self.lbl_note.setWordWrap(True)
@@ -86,13 +86,13 @@ class ExportSheet(Sheet):
         self.t_live.setEnabled(not web)
         strips = self.t_gps.isChecked() or self.t_people.isChecked() or self.t_camera.isChecked()
         if strips and not self.exiftool_ok:
-            note = "ExifTool chybí – soukromý export nejde ověřit. Vypněte odstranění, nebo doplňte exiftool.exe."
+            note = tr("export-exiftool-missing")
         elif strips:
-            note = "Každá kopie se po úpravě zkontroluje ExifToolem. Co nejde vyčistit, do exportu nepůjde."
+            note = tr("export-verified-note")
         else:
-            note = "Kopie ponechají všechna metadata včetně polohy."
+            note = tr("export-keep-all-note")
         if web:
-            note += " Webová prezentace = index.html s náhledy, funguje offline bez internetu."
+            note += " " + tr("export-web-note")
         self.lbl_note.setText(note)
         self.btn_action.setEnabled(not (strips and not self.exiftool_ok))
 

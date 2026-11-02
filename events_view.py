@@ -8,6 +8,7 @@ Patch 11 (dávka D): „živé“ karty – viditelné karty v klidu prolínají
 události (k-center přes čas, GPS a CLIP, bez téměř stejných snímků). Jeden sdílený časovač,
 nejvýš dvě prolínání naráz, pauza mimo stránku / v neaktivním okně / při vypnutých animacích.
 """
+from i18n import event_kicker, event_place, event_title, tr
 import math
 import os
 import re
@@ -46,8 +47,7 @@ AMBIENT_MAX_FADING = 2
 # ── Data ──────────────────────────────────────────────────────────────────────
 
 def _czech_count(n):
-    n = int(n or 0)
-    return "1 fotka" if n == 1 else (f"{n} fotky" if 2 <= n <= 4 else f"{n} fotek")
+    return tr("count-photos", count=int(n or 0))
 
 
 _TRAILING_DATES = re.compile(r"\s*\((?:[^()]*\d[^()]*)\)\s*$")
@@ -64,7 +64,7 @@ def split_event_title(title):
         head, rest = text.split(":", 1)
         if rest.strip() and len(head) <= 20:
             kicker, text = head.strip(), rest.strip()
-    return kicker, (text or (title or "Událost"))
+    return event_kicker(kicker), (event_place(text) if text else (title or tr("event-default-title")))
 
 
 def format_event_dates(start, end):
@@ -292,7 +292,7 @@ def fetch_event_cards(conn):
                 f"AND {visible_media_sql('m')}", (eid,))]
             location = Counter(cities).most_common(1)[0][0] if cities else ""
         cards.append({
-            "id": eid, "title": title or "Událost", "location": location or "",
+            "id": eid, "title": title or tr("event-default-title"), "location": location or "",
             "start": start, "end": end, "count": int(count),
             "cover": select_event_cover(conn, eid, cover_id),
         })
@@ -351,7 +351,7 @@ class EventCard(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.kicker, self.display_title = split_event_title(event["title"])
         self.setAccessibleName(f"{self.display_title}, {self.subtitle()}, {_czech_count(event['count'])}")
-        self.setToolTip(self.event["title"] + ("\nJ – přehrát Cestu na mapě" if self.has_journey() else ""))
+        self.setToolTip(event_title(self.event["title"]) + ("\n" + tr("events-journey-hint") if self.has_journey() else ""))
 
     def subtitle(self):
         return " · ".join(filter(None, [self.event.get("location"), format_event_dates(self.event["start"],
@@ -552,7 +552,7 @@ class EventCard(QWidget):
                         tokens.qcolor(tokens.accent("dark")["accent"]))                # světlém režimu
             p.setPen(QColor("#FFFFFF"))
             p.drawText(chip.adjusted(28, 0, -10, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                       "Cesta")
+                       tr("journey"))
             p.setOpacity(1.0)
 
         # název + místo a datum

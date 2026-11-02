@@ -9,6 +9,7 @@ Každý zásah ukazuje dopad PŘÍMO pod ovládacím prvkem (kolik osob, kolik M
 Potvrzovací list jen u nevratných nebo hromadných akcí; nic z tohoto okna nesmaže databázi,
 osoby ani originály (koš jde do Koše Windows, tovární nastavení = jen config.json).
 """
+from i18n import N_, fmt_number, tr
 import os
 import webbrowser
 
@@ -23,19 +24,35 @@ from ui_controls import AccentPicker, KButton, SegmentedControl, ToggleSwitch
 from config import load_config, save_config, DEFAULT_CONFIG
 from paths import THUMB_DIR, FACE_DIR
 from cache_tools import clear_thumbnail_cache
+import paths
 import perf_profile
+import power
 import preview_cache
 import theme
 import video_proxy
 import tokens
 import brand
+import i18n
 
-THEME_CHOICES = (("dark", "Tmavý"), ("light", "Světlý"), ("system", "Podle systému"))
+THEME_CHOICES = (("dark", N_("theme-dark")), ("light", N_("theme-light")), ("system", N_("theme-system")))
 PREVIEW_MB_RANGE = (512, 8192)
 PREVIEW_MB_STEP = 256
 PROXY_MB_RANGE = (1024, 32768)
 PROXY_MB_STEP = 512
-PERF_CHOICES = [("Automaticky", "auto"), ("Plný", "high"), ("Vyvážený", "standard"), ("Úsporný", "baseline")]
+# Gate 0: AI na pozadí při napájení z baterie (power.py)
+BATTERY_CHOICES = [(N_("battery-throttle"), "throttle"), (N_("battery-pause"), "pause"), (N_("battery-full"), "full")]
+PERF_CHOICES = [(N_("perf-auto"), "auto"), (N_("perf-high"), "high"), (N_("perf-standard"), "standard"),
+                (N_("perf-baseline"), "baseline")]
+# Výchozí řazení: uložená hodnota v config.json je identifikátor (historicky český text), popisek z katalogu
+SORT_CHOICES = (("Datum pořízení (Nejnovější)", N_("sort-date-taken-newest")),  # i18n-ok: stored config value
+                ("Datum pořízení (Nejstarší)", N_("sort-date-taken-oldest")),  # i18n-ok: stored config value
+                ("Datum přidání do galerie", N_("sort-date-added")),  # i18n-ok: stored config value
+                ("Podle výletů", N_("sort-by-trip")))  # i18n-ok: stored config value
+
+
+def _choices(pairs):
+    """[(message id, value)] -> [(text, value)] v aktuálním jazyce."""
+    return [(tr(label), value) for label, value in pairs]
 
 
 def get_folder_size_mb(path):
@@ -52,16 +69,12 @@ def get_folder_size_mb(path):
 
 
 def _czech_items(n):
-    return "1 položka" if n == 1 else (f"{n} položky" if 2 <= n <= 4 else f"{n} položek")
+    return tr("count-items", count=n)
 
 
-def _czech_people(n, adjective):
-    """(3, 'nepotvrzen') -> '3 nepotvrzené osoby'."""
-    if n == 1:
-        return f"1 {adjective}á osoba"
-    if 2 <= n <= 4:
-        return f"{n} {adjective}é osoby"
-    return f"{n} {adjective}ých osob"
+def _czech_people(n, adjective="unconfirmed"):
+    """(3, 'unconfirmed') -> '3 unconfirmed people' / '3 nepotvrzené osoby'."""
+    return tr("count-people-unconfirmed", count=n)
 
 
 def _hint(text):
@@ -81,15 +94,17 @@ def _impact(text=""):
 class ConfirmSheet(QDialog):
     """Potvrzovací list: co se stane (dopad), volby a jedno pojmenované tlačítko akce."""
 
-    def __init__(self, title, body, impact_lines=(), options=(), action_text="Pokračovat",
+    def __init__(self, title, body, impact_lines=(), options=(), action_text=None,
                  destructive=True, parent=None):
         super().__init__(parent)
+        action_text = action_text or tr("action-continue")
         self.setWindowTitle(title)
         self.setModal(True)
         self.setMinimumWidth(440)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(22, 20, 22, 18)
         lay.setSpacing(10)
+        # i18n-ok: markup wrapper around a translated title
         head = QLabel(f"<b style='font-size:15px'>{title}</b>")
         lay.addWidget(head)
         lay.addWidget(_hint(body))
@@ -103,7 +118,7 @@ class ConfirmSheet(QDialog):
             lay.addWidget(chk)
         row = QHBoxLayout()
         row.addStretch()
-        cancel = KButton("Zrušit")
+        cancel = KButton(tr("action-cancel"))
         cancel.clicked.connect(self.reject)
         cancel.setDefault(True)                       # Enter = bezpečná volba
         self.btn_action = KButton(action_text)
@@ -120,7 +135,7 @@ class ConfirmSheet(QDialog):
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Předvolby – {brand.APP_NAME}")
+        self.setWindowTitle(tr("settings-window-title", APP_NAME=brand.APP_NAME))
         self.resize(660, 560)
         # Styl z tokenů (tokens.build_qss "settings"): motiv, zvýraznění, fajfka v zaškrtávátku
         tokens.apply_stylesheet(self, "settings")
@@ -156,7 +171,7 @@ class SettingsDialog(QDialog):
             print(f"[Settings] statistiky knihovny: {e}")
         return stats
 
-    def _confirm(self, title, body, impact_lines=(), options=(), action_text="Pokračovat", destructive=True):
+    def _confirm(self, title, body, impact_lines=(), options=(), action_text=None, destructive=True):
         """Potvrzovací list; vrací (potvrzeno, {volba: bool}). V testech se nahrazuje."""
         sheet = ConfirmSheet(title, body, impact_lines, options, action_text, destructive, self)
         ok = sheet.exec() == QDialog.DialogCode.Accepted
@@ -169,9 +184,9 @@ class SettingsDialog(QDialog):
         main_layout.setSpacing(14)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._scroll(self.create_standard_tab()), "Standardní")
-        self.tabs.addTab(self._scroll(self.create_advanced_tab()), "Pokročilé")
-        self.tabs.addTab(self.create_about_tab(), "O aplikaci")
+        self.tabs.addTab(self._scroll(self.create_standard_tab()), tr("settings-tab-general"))
+        self.tabs.addTab(self._scroll(self.create_advanced_tab()), tr("settings-tab-advanced"))
+        self.tabs.addTab(self.create_about_tab(), tr("settings-tab-about"))
         # Kairos: záložky přepíná segmentový přepínač nahoře uprostřed (QTabWidget drží stránky)
         self.tabs.tabBar().hide()
         self.tab_switch = SegmentedControl([(self.tabs.tabText(i), i) for i in range(self.tabs.count())], current=0)
@@ -181,16 +196,16 @@ class SettingsDialog(QDialog):
         main_layout.addWidget(self.tabs)
 
         bottom_bar = QHBoxLayout()
-        btn_reset = KButton("↺ Výchozí hodnoty ve formuláři")
+        btn_reset = KButton(tr("settings-reset-form"))
         btn_reset.setObjectName("btnReset")
-        btn_reset.setToolTip("Vrátí ovládací prvky na výchozí hodnoty; uloží se až tlačítkem Uložit.")
+        btn_reset.setToolTip(tr("settings-reset-form-tooltip"))
         btn_reset.clicked.connect(self.reset_to_defaults)
         bottom_bar.addWidget(btn_reset)
         bottom_bar.addStretch()
-        btn_cancel = KButton("Zrušit")
+        btn_cancel = KButton(tr("action-cancel"))
         btn_cancel.clicked.connect(self.reject)
         bottom_bar.addWidget(btn_cancel)
-        btn_save = KButton("Uložit změny")
+        btn_save = KButton(tr("settings-save"))
         btn_save.setObjectName("btnSave")
         btn_save.clicked.connect(self.save_and_close)
         bottom_bar.addWidget(btn_save)
@@ -268,109 +283,106 @@ class SettingsDialog(QDialog):
         layout = self._tab_layout(tab)
 
         # Knihovna + chytrý import
-        g = self._group(layout, "Knihovna")
+        g = self._group(layout, tr("settings-library"))
         self.list_folders = QListWidget()
         self.list_folders.setMinimumHeight(96)
-        self.list_folders.setToolTip("Zaškrtnutá složka se sleduje: nové fotky v ní se naimportují samy")
+        self.list_folders.setToolTip(tr("settings-watched-tooltip"))
         watched = {os.path.normcase(f) for f in self.config.get("watched_folders", [])}
         for f in self.config.get("library_folders", []):
             self._add_folder_item(f, os.path.normcase(f) in watched)
         btn_box = QHBoxLayout()
-        btn_add = KButton("Přidat složku…", compact=True)
+        btn_add = KButton(tr("settings-add-folder"), compact=True)
         btn_add.clicked.connect(self.add_library_folder)
-        btn_remove = KButton("Odebrat vybranou", compact=True)
+        btn_remove = KButton(tr("settings-remove-selected"), compact=True)
         btn_remove.clicked.connect(self.remove_library_folder)
         btn_box.addWidget(btn_add)
         btn_box.addWidget(btn_remove)
         btn_box.addStretch()
-        self._row(g, "Sledované složky", stacked=self.list_folders)
+        self._row(g, tr("settings-library-folders"), stacked=self.list_folders)
         self._row(g, stacked=btn_box)
-        self.chk_autoscan = ToggleSwitch("Při spuštění hledat nové fotky")
+        self.chk_autoscan = ToggleSwitch(tr("settings-scan-on-start"))
         self.chk_autoscan.setChecked(self.config.get("auto_scan_on_startup", True))
         self._row(g, stacked=self.chk_autoscan)
-        layout.addWidget(_hint("Odebráním složky se fotky z knihovny nesmažou. Chytrý import nové soubory "
-                               "jen spočítá a nabídne – bez vašeho souhlasu nic neimportuje. Výjimkou jsou "
-                               "zaškrtnuté složky: ty Kairos sleduje a nové fotky z nich přidá sám. Složky "
-                               "i fotky můžete také přetáhnout přímo do okna."))
+        layout.addWidget(_hint(tr("settings-folders-hint")))
 
         # Vzhled
-        g = self._group(layout, "Vzhled")
+        g = self._group(layout, tr("settings-appearance"))
+        # Gate 1: jazyk rozhraní – přepne se hned po uložení, bez restartu
+        self.combo_language = QComboBox()
+        self.combo_language.setObjectName("combo_language")
+        self.combo_language.addItem(tr("settings-language-system", language=i18n.native_name(i18n.system_language())),
+                                    i18n.SYSTEM)
+        for code, name in i18n.LANGUAGES:
+            self.combo_language.addItem(name, code)
+        self.set_language_choice(self.config.get("language", i18n.SYSTEM))
+        self._row(g, tr("settings-language"), self.combo_language)
         current = self.config.get("theme", theme.DEFAULT_THEME)
-        self.theme_switch = SegmentedControl([("Systém", "system"), ("Tmavý", "dark"), ("Světlý", "light")],
+        self.theme_switch = SegmentedControl([(tr("theme-system"), "system"), (tr("theme-dark"), "dark"), (tr("theme-light"), "light")],
                                              current=current if current in dict(THEME_CHOICES) else "dark")
-        self._row(g, "Motiv", self.theme_switch)
+        self._row(g, tr("settings-theme"), self.theme_switch)
         self.accent_picker = AccentPicker(self.config.get("accent", tokens.DEFAULT_ACCENT),
                                           self.config.get("accent_custom", ""))
-        self._row(g, "Barva zvýraznění", self.accent_picker)
-        self.chk_adaptive = ToggleSwitch("Přizpůsobit obsahu")
-        self.chk_adaptive.setToolTip("Záře karet, hlavička události a trasa Cesty se jemně přizpůsobí barvám "
-                                     "fotek. Tlačítka a ovládací prvky zůstávají ve zvolené barvě.")
+        self._row(g, tr("settings-accent"), self.accent_picker)
+        self.chk_adaptive = ToggleSwitch(tr("settings-adaptive"))
+        self.chk_adaptive.setToolTip(tr("settings-adaptive-tooltip"))
         self.chk_adaptive.setChecked(bool(self.config.get("adaptive_accent", True)))
         self._row(g, stacked=self.chk_adaptive)
-        self.chk_reduce_motion = ToggleSwitch("Omezit animace")
+        self.chk_reduce_motion = ToggleSwitch(tr("settings-reduce-motion"))
         self.chk_reduce_motion.setChecked(bool(self.config.get("reduce_motion", False)))
         self._row(g, stacked=self.chk_reduce_motion)
-        self.chk_memories = ToggleSwitch("Vzpomínky „Před 3 lety“ nad Fotografiemi")
+        self.chk_memories = ToggleSwitch(tr("settings-show-memories"))
         self.chk_memories.setChecked(bool(self.config.get("show_memories", True)))
         self._row(g, stacked=self.chk_memories)
-        layout.addWidget(_hint("Prohlížeč a prezentace zůstávají vždy tmavé – fotky v nich vyniknou. "
-                               "Vlastní barvu Kairos doladí, aby byla čitelná ve tmavém i světlém motivu. "
-                               "Když jsou ve Windows vypnuté Animační efekty, animace se omezí samy."))
+        layout.addWidget(_hint(tr("settings-appearance-hint")))
 
         # Řazení
-        g = self._group(layout, "Knihovna fotek")
+        g = self._group(layout, tr("settings-photo-library"))
         self.combo_default_sort = QComboBox()
-        self.combo_default_sort.addItems([
-            "Datum pořízení (Nejnovější)",
-            "Datum pořízení (Nejstarší)",
-            "Datum přidání do galerie",
-            "Podle výletů"
-        ])
-        self.combo_default_sort.setCurrentText(self.config.get("default_sort_order", "Datum pořízení (Nejnovější)"))
-        self._row(g, "Výchozí řazení", self.combo_default_sort)
-        self.chk_xmp = ToggleSwitch("Ukládat oblíbené, jména a polohu do souborů XMP vedle fotek")
+        for value, label in SORT_CHOICES:
+            self.combo_default_sort.addItem(tr(label), value)
+        self._set_sort(self.config.get("default_sort_order", SORT_CHOICES[0][0]))
+        self._row(g, tr("settings-default-sort"), self.combo_default_sort)
+        self.chk_xmp = ToggleSwitch(tr("settings-xmp"))
         self.chk_xmp.setChecked(bool(self.config.get("xmp_sidecars", True)))
         self._row(g, stacked=self.chk_xmp)
-        self.chk_borrow = ToggleSwitch("Doplnit polohu fotek bez GPS z telefonu ve stejné chvíli")
+        self.chk_borrow = ToggleSwitch(tr("settings-borrow-location"))
         self.chk_borrow.setChecked(bool(self.config.get("borrow_location", True)))
         self._row(g, stacked=self.chk_borrow)
-        self.chk_ocr = ToggleSwitch("Číst text na fotkách (cedule, dokumenty) pro hledání – offline")
+        self.chk_ocr = ToggleSwitch(tr("settings-ocr"))
         self.chk_ocr.setChecked(bool(self.config.get("ocr_text", True)))
         self._row(g, stacked=self.chk_ocr)
-        layout.addWidget(_hint("Velikost dlaždic měníte přímo v mřížce: Ctrl + kolečko myši nebo sevření prstů."))
+        layout.addWidget(_hint(tr("settings-tile-size-hint")))
 
         # Koš
-        g = self._group(layout, "Koš")
+        g = self._group(layout, tr("nav-trash"))
         self.lbl_trash = QLabel()
         self.lbl_trash.setWordWrap(True)
-        self.btn_empty_trash = KButton("Vysypat koš…", compact=True)
+        self.btn_empty_trash = KButton(tr("settings-empty-trash"), compact=True)
         self.btn_empty_trash.setObjectName("btnReset")
         self.btn_empty_trash.clicked.connect(self.empty_trash)
         self._row(g, self.lbl_trash, self.btn_empty_trash)
-        layout.addWidget(_hint("Soubory se přesunou do Koše Windows – dají se odtamtud obnovit."))
+        layout.addWidget(_hint(tr("settings-trash-hint")))
         self.refresh_trash_label()
 
         # Stage 3: složka Skryté
-        g = self._group(layout, "Skryté 🔒")
-        self.chk_hidden_entry = ToggleSwitch("Zobrazit Skryté v postranním panelu")
+        g = self._group(layout, tr("nav-locked"))
+        self.chk_hidden_entry = ToggleSwitch(tr("settings-show-locked"))
         self.chk_hidden_entry.setChecked(bool(self.config.get("show_hidden_folder", True)))
         self._row(g, stacked=self.chk_hidden_entry)
-        self.btn_open_hidden = KButton("Otevřít…", compact=True, icon="lock")
+        self.btn_open_hidden = KButton(tr("action-open-ellipsis"), compact=True, icon="lock")
         self.btn_open_hidden.clicked.connect(self.open_hidden)
-        self._row(g, "Fotky mimo knihovnu, hledání, tváře, mapu a sestřihy", self.btn_open_hidden)
-        self.btn_hidden_pass = KButton("Změnit heslo…", compact=True)
+        self._row(g, tr("settings-locked-row"), self.btn_open_hidden)
+        self.btn_hidden_pass = KButton(tr("settings-change-passcode"), compact=True)
         self.btn_hidden_pass.clicked.connect(self.change_hidden_passcode)
-        self._row(g, "Heslo ke Skrytým (záloha k Windows Hello)", self.btn_hidden_pass)
-        layout.addWidget(_hint("Skryté se zamknou po 2 minutách nečinnosti, při minimalizaci okna, zamčení "
-                               "počítače a při odchodu ze složky. Dokud jsou odemčené, okno se neukáže ve "
-                               "snímcích obrazovky, sdílení ani v náhledech Alt+Tab."))
+        self._row(g, tr("settings-locked-passcode-row"), self.btn_hidden_pass)
+        layout.addWidget(_hint(tr("settings-locked-hint")))
 
         # Nápověda (Polish P2) – otevře stránku Tipy a průvodce v hlavním okně
-        g = self._group(layout, "Nápověda")
-        self.btn_guide = KButton("Otevřít…", compact=True, icon="sparkle")
+        g = self._group(layout, tr("guide-where-help"))
+        self.btn_guide = KButton(tr("action-open-ellipsis"), compact=True, icon="sparkle")
         self.btn_guide.clicked.connect(self.open_guide)
-        self._row(g, "Tipy a průvodce – zkratky, mapa, tváře a hledání", self.btn_guide)
-        layout.addWidget(_hint("Kdykoli také klávesou F1. Neuložené změny v Předvolbách se zahodí."))
+        self._row(g, tr("settings-guide-row"), self.btn_guide)
+        layout.addWidget(_hint(tr("settings-guide-hint")))
         layout.addStretch()
         return tab
 
@@ -388,37 +400,36 @@ class SettingsDialog(QDialog):
             return
         from ui_toast import show_toast
         if locked.change_passcode(self):
-            show_toast(self.parent(), "Heslo ke Skrytým je nastavené.", "success")
+            show_toast(self.parent(), tr("settings-passcode-set"), "success")
 
     def create_advanced_tab(self):
         tab = QWidget()
         layout = self._tab_layout(tab)
 
-        g = self._group(layout, "Rozpoznávání tváří")
+        g = self._group(layout, tr("guide-ch-faces"))
         self._saved_threshold = int(round(float(self.config.get("face_similarity_threshold", 0.62)) * 100))
         self.lbl_threshold = QLabel()
         self.slider_threshold = QSlider(Qt.Orientation.Horizontal)
         self.slider_threshold.setRange(30, 90)   # 0.30 – 0.90
         self.slider_threshold.setValue(self._saved_threshold)
         self.slider_threshold.valueChanged.connect(self._update_threshold_impact)
-        row = self._row(g, "Práh podobnosti tváří", value=self.lbl_threshold, stacked=self.slider_threshold)
+        row = self._row(g, tr("settings-face-threshold"), value=self.lbl_threshold, stacked=self.slider_threshold)
         self.lbl_threshold_impact = _impact()
         row.layout().addWidget(self.lbl_threshold_impact)
-        row.layout().addWidget(_hint("Nižší = víc obličejů v jedné osobě (víc záměn). Vyšší = přísnější shoda "
-                                     "(víc menších skupin). Doporučeno 0,55 – 0,70."))
-        self.btn_recluster = KButton("Přeskupit osoby znovu…", compact=True)
+        row.layout().addWidget(_hint(tr("settings-face-threshold-hint")))
+        self.btn_recluster = KButton(tr("settings-regroup"), compact=True)
         self.btn_recluster.clicked.connect(self.request_recluster)
-        self._row(g, "Seskupit nepotvrzené tváře znovu", self.btn_recluster)
+        self._row(g, tr("settings-regroup-row"), self.btn_recluster)
         self._update_threshold_impact(self.slider_threshold.value())
 
-        g = self._group(layout, "Paměť a mezipaměti")
+        g = self._group(layout, tr("settings-memory-caches"))
         lru_val = int(self.config.get("thumbnail_lru_capacity", 1200))
         self.lbl_lru = QLabel()
         self.slider_lru = QSlider(Qt.Orientation.Horizontal)
         self.slider_lru.setRange(64, 4000)
         self.slider_lru.setValue(lru_val)
         self.slider_lru.valueChanged.connect(self._update_lru_impact)
-        row = self._row(g, "Miniatury v paměti (RAM)", value=self.lbl_lru, stacked=self.slider_lru)
+        row = self._row(g, tr("settings-ram-thumbs"), value=self.lbl_lru, stacked=self.slider_lru)
         self.lbl_lru_impact = _hint("")
         row.layout().addWidget(self.lbl_lru_impact)
         self._update_lru_impact(lru_val)
@@ -430,17 +441,17 @@ class SettingsDialog(QDialog):
         self.slider_preview_mb.setPageStep(PREVIEW_MB_STEP * 4)
         self.slider_preview_mb.setValue(int(self.config.get("preview_cache_mb", preview_cache.DEFAULT_BUDGET_MB)))
         self.slider_preview_mb.valueChanged.connect(self._update_preview_impact)
-        row = self._row(g, "Mezipaměť náhledů 2048 px", value=self.lbl_preview_mb, stacked=self.slider_preview_mb)
+        row = self._row(g, tr("settings-preview-cache"), value=self.lbl_preview_mb, stacked=self.slider_preview_mb)
         self.lbl_preview_impact = _hint("")
         row.layout().addWidget(self.lbl_preview_impact)
 
         self.lbl_cache_size = QLabel()
         self.lbl_cache_size.setWordWrap(True)
         cache_row = QHBoxLayout()
-        btn_clean = KButton("Smazat miniatury", compact=True)
+        btn_clean = KButton(tr("settings-delete-thumbs"), compact=True)
         btn_clean.setObjectName("btnCleanCache")
         btn_clean.clicked.connect(self.clean_cache)
-        self.btn_clear_previews = KButton("Smazat náhledy 2048 px", compact=True)
+        self.btn_clear_previews = KButton(tr("settings-delete-previews"), compact=True)
         self.btn_clear_previews.setObjectName("btnCleanCache")
         self.btn_clear_previews.clicked.connect(self.clear_previews)
         cache_row.addWidget(btn_clean)
@@ -448,20 +459,34 @@ class SettingsDialog(QDialog):
         cache_row.addStretch()
         self._row(g, stacked=self.lbl_cache_size)
         self._row(g, stacked=cache_row)
-        layout.addWidget(_hint("Obě mezipaměti se na pozadí samy vytvoří znovu. Ořezy tváří, osoby, "
-                               "databáze a vaše fotografie se tím nemění."))
+        layout.addWidget(_hint(tr("settings-caches-hint")))
         self.refresh_cache_size_label()
 
+        # Gate 0: umístění dat a přesun mezipaměti na jiný disk (provede se při dalším startu)
+        self._pending_cache_dir = None
+        self.lbl_cache_dir = QLabel()
+        self.lbl_cache_dir.setWordWrap(True)
+        self.lbl_cache_dir.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.btn_move_cache = KButton(tr("settings-move-ellipsis"), compact=True)
+        self.btn_move_cache.clicked.connect(self.choose_cache_dir)
+        self._row(g, tr("settings-cache-location"), self.btn_move_cache)
+        self._row(g, stacked=self.lbl_cache_dir)
+        self._row(g, stacked=_hint(tr("settings-cache-location-hint", DATA_DIR=paths.DATA_DIR, FACE_DIR=paths.FACE_DIR)))
+        self._update_cache_dir_label()
+
         # Fáze 1: adaptivní škálování a proxy videí (rozhodnutí C: limit úložiště v Předvolbách)
-        g = self._group(layout, "Výkon a videa")
+        g = self._group(layout, tr("settings-perf-video"))
         tier = self.config.get("performance_tier", "auto")
-        self.perf_switch = SegmentedControl(PERF_CHOICES, current=tier if tier in dict(PERF_CHOICES) else "auto")
-        self._row(g, "Výkon", self.perf_switch)
+        self.perf_switch = SegmentedControl(_choices(PERF_CHOICES), current=tier if tier in dict(PERF_CHOICES).values() else "auto")
+        self._row(g, tr("settings-performance"), self.perf_switch)
+        pol = self.config.get("battery_policy", power.DEFAULT_POLICY)
+        self.battery_switch = SegmentedControl(_choices(BATTERY_CHOICES),
+                                               current=pol if pol in dict(BATTERY_CHOICES).values() else "throttle")
+        self._row(g, tr("settings-battery-ai"), self.battery_switch)
+        self._row(g, stacked=_hint(tr("settings-battery-hint", pct=power.LOW_BATTERY_PCT, now=power.get().describe())))
         detected = perf_profile.classify(os.cpu_count() or 4, perf_profile.total_ram_gb())
-        self._row(g, stacked=_hint(
-            f"Automaticky podle počítače – tento je „{dict(PERF_CHOICES).get(detected, detected)}“. Plný: 4K HDR "
-            "videa přímo, nejostřejší 3D mapa. Úsporný: videa přes 1080p kopie, lehčí mapa a méně práce na pozadí. "
-            "Projeví se po restartu."))
+        tier_label = {k: t for t, k in PERF_CHOICES}.get(detected)
+        self._row(g, stacked=_hint(tr("settings-perf-hint", tier=tr(tier_label) if tier_label else detected)))
 
         self.lbl_proxy_mb = QLabel()
         self.slider_proxy_mb = QSlider(Qt.Orientation.Horizontal)
@@ -470,42 +495,39 @@ class SettingsDialog(QDialog):
         self.slider_proxy_mb.setPageStep(PROXY_MB_STEP * 4)
         self.slider_proxy_mb.setValue(int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB)))
         self.slider_proxy_mb.valueChanged.connect(self._update_proxy_impact)
-        row = self._row(g, "Kopie videí 1080p (4K a HDR)", value=self.lbl_proxy_mb, stacked=self.slider_proxy_mb)
+        row = self._row(g, tr("settings-video-copies"), value=self.lbl_proxy_mb, stacked=self.slider_proxy_mb)
         self.lbl_proxy_impact = _hint("")
         row.layout().addWidget(self.lbl_proxy_impact)
-        self.btn_clear_proxies = KButton("Smazat kopie videí", compact=True)
+        self.btn_clear_proxies = KButton(tr("settings-delete-video-copies"), compact=True)
         self.btn_clear_proxies.setObjectName("btnCleanCache")
         self.btn_clear_proxies.clicked.connect(self.clear_proxies)
-        self._row(g, "Kopie se na pozadí vytvoří znovu, když je potřeba", self.btn_clear_proxies)
+        self._row(g, tr("settings-video-copies-row"), self.btn_clear_proxies)
         self._update_proxy_impact(self.slider_proxy_mb.value())
 
         # Stage 2: správa barev – výstupní profil fotek (Display P3 z iPhonu -> displej)
-        g = self._group(layout, "Barvy")
+        g = self._group(layout, tr("settings-colors"))
         import color_manage
-        self.chk_color_display = ToggleSwitch("Barvy fotek podle displeje")
+        self.chk_color_display = ToggleSwitch(tr("settings-color-display"))
         self.chk_color_display.setChecked(self.config.get("color_output", "auto") != color_manage.MODE_SRGB)
         self._row(g, stacked=self.chk_color_display)
         tgt = color_manage.target()
         self._row(g, stacked=_hint(
-            f"Teď: {tgt['name']} – {tgt['reason']}. Vypnuto = vždy sRGB (pro displeje, které barvy "
-            "převádějí samy). Po změně se náhledy na pozadí přegenerují."))
+            tr("settings-color-hint", name=tgt['name'], reason=tr(tgt['reason']) if i18n.has(tgt['reason']) else tgt['reason'])))
 
         # Sprint 4.0: přesné hledání (SigLIP 2) – volitelné, výchozí lehký CLIP
-        g = self._group(layout, "Přesné hledání")
+        g = self._group(layout, tr("settings-precise-search"))
         import siglip_engine
-        self.chk_precise = ToggleSwitch("Přesné hledání (SigLIP 2)")
+        self.chk_precise = ToggleSwitch(tr("settings-precise-search-toggle"))
         self.chk_precise.setChecked(bool(self.config.get("search_precise", False)))
         self._row(g, stacked=self.chk_precise)
-        state = ("Model je stažený." if siglip_engine.installed()
-                 else f"Po zapnutí se jednou stáhne model (~{siglip_engine.DOWNLOAD_MB / 1000:.1f} GB).")
+        state = (tr("settings-model-downloaded") if siglip_engine.installed()
+                 else tr("settings-model-download-size", value=fmt_number(siglip_engine.DOWNLOAD_MB / 1000, 1)))
         self._row(g, stacked=_hint(
-            "Přesnější hledání popisem: na zkušební sadě je správná fotka mezi prvními 20 v 94 % případů "
-            "místo 82 % (výsledky aplikace 92 % místo 89 %). Knihovna se na pozadí přeindexuje – do té doby hledá dosavadní "
-            "model. Potřebuje asi o 1,6 GB paměti víc; doporučeno od 16 GB RAM. " + state))
+            tr("settings-precise-search-hint") + state))
 
-        g = self._group(layout, "Obnovení")
+        g = self._group(layout, tr("settings-recovery"))
         self.lbl_factory = _hint("")
-        self.btn_factory_reset = KButton("Obnovit tovární nastavení…", compact=True)
+        self.btn_factory_reset = KButton(tr("settings-factory-reset"), compact=True)
         self.btn_factory_reset.setObjectName("btnReset")
         self.btn_factory_reset.clicked.connect(self.factory_reset)
         self._row(g, self.lbl_factory, self.btn_factory_reset)
@@ -519,55 +541,66 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
         layout.addWidget(brand.Wordmark(34), alignment=Qt.AlignmentFlag.AlignLeft)
-        layout.addWidget(QLabel("Verze 1.0.0 (Release Candidate)"))
-        layout.addWidget(_hint("Plně offline desktopová fotogalerie s lokálním rozpoznáváním tváří "
-                               "a nativní podporou Apple Live Photos."))
+        layout.addWidget(QLabel(tr("settings-version")))
+        layout.addWidget(_hint(tr("settings-about-body")))
         layout.addSpacing(10)
-        btn_newsletter = KButton("Odebírat aktualizace a novinky (web)")
+        btn_newsletter = KButton(tr("settings-newsletter"))
         btn_newsletter.clicked.connect(self.open_newsletter_signup)
         layout.addWidget(btn_newsletter, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addStretch()
         return tab
 
     # ── náhled dopadu ──
+    def _set_sort(self, value):
+        i = self.combo_default_sort.findData(value)
+        self.combo_default_sort.setCurrentIndex(i if i >= 0 else 0)
+
+    def set_language_choice(self, value):
+        i = self.combo_language.findData(value or i18n.SYSTEM)
+        self.combo_language.setCurrentIndex(i if i >= 0 else 0)
+
+    def selected_language(self):
+        return self.combo_language.currentData() or i18n.SYSTEM
+
     def _update_threshold_impact(self, v):
-        self.lbl_threshold.setText(f"{v / 100:.2f}".replace(".", ","))
+        self.lbl_threshold.setText(fmt_number(v / 100, 2))
         unconfirmed, confirmed = self._stats.get("unconfirmed"), self._stats.get("confirmed")
         if v == self._saved_threshold:
             self.lbl_threshold_impact.setText("")
             self.lbl_threshold_impact.setVisible(False)     # bez prázdné mezery pod posuvníkem
             return
         self.lbl_threshold_impact.setVisible(True)
-        who = _czech_people(unconfirmed, "nepotvrzen") if unconfirmed is not None else "nepotvrzené osoby"
-        keep = (f"; potvrzené zůstanou beze změny ({confirmed})" if confirmed
-                else "; potvrzené osoby zůstanou")
-        direction = "rozdělí na víc skupin" if v > self._saved_threshold else "sloučí do méně skupin"
-        self.lbl_threshold_impact.setText(f"Po uložení se znovu seskupí: {who} – spíš se {direction}{keep}.")
+        who = _czech_people(unconfirmed) if unconfirmed is not None else tr("settings-threshold-who-unknown")
+        split = v > self._saved_threshold
+        if confirmed:
+            msg = "settings-threshold-impact-split-kept" if split else "settings-threshold-impact-merge-kept"
+            self.lbl_threshold_impact.setText(tr(msg, who=who, confirmed=confirmed))
+        else:
+            msg = "settings-threshold-impact-split" if split else "settings-threshold-impact-merge"
+            self.lbl_threshold_impact.setText(tr(msg, who=who))
 
     def _update_lru_impact(self, v):
         self.lbl_lru.setText(f"{v}")
-        self.lbl_lru_impact.setText(f"Až ~{v * 0.5:.0f} MB RAM při dlaždicích 360 px. Vyšší = plynulejší "
-                                    f"posouvání, nižší = úspornější. Doporučeno 800 – 2000.")
+        self.lbl_lru_impact.setText(tr("settings-ram-hint", value=fmt_number(v * 0.5, 0)))
 
     def _update_preview_impact(self, v):
         v = int(round(v / PREVIEW_MB_STEP) * PREVIEW_MB_STEP)
-        self.lbl_preview_mb.setText(f"{v / 1024:.2f} GB".replace(".", ","))
+        self.lbl_preview_mb.setText(tr("unit-size", value=fmt_number(v / 1024, 2), unit="GB"))
         used = preview_cache.cache_size() / (1024 * 1024)
-        text = f"Nyní obsazeno {used:.0f} MB (~{used / 0.45:.0f} fotek okamžitě ostrých)." if used else \
-            "Zatím prázdná – plní se na pozadí."
+        text = tr("settings-preview-used", used=fmt_number(used, 0), photos=fmt_number(used / 0.45, 0)) if used else \
+            tr("settings-preview-empty")
         if used > v:
-            text += f" Po uložení se uvolní ~{used - v:.0f} MB nejdéle nepoužitých náhledů."
+            text += " " + tr("settings-preview-freed", mb=fmt_number(used - v, 0))
         self.lbl_preview_impact.setText(text)
 
     def _update_proxy_impact(self, v):
         v = int(round(v / PROXY_MB_STEP) * PROXY_MB_STEP)
-        self.lbl_proxy_mb.setText(f"{v / 1024:.1f} GB".replace(".", ","))
+        self.lbl_proxy_mb.setText(tr("unit-size", value=fmt_number(v / 1024, 1), unit="GB"))
         used = video_proxy.cache_size() / (1024 * 1024)
-        text = (f"Nyní obsazeno {used:.0f} MB. " if used else "Zatím prázdné – plní se na pozadí, nikdy během "
-                "přehrávání. ")
-        text += "Kopie slouží k plynulému posouvání časové osy, náhledům a Cestě; originál zůstává beze změny."
+        text = (tr("settings-proxy-used", used=fmt_number(used, 0)) if used else tr("settings-proxy-empty")) + " "
+        text += tr("settings-proxy-note")
         if used > v:
-            text += f" Po uložení se uvolní ~{used - v:.0f} MB nejdéle nepoužitých kopií."
+            text += " " + tr("settings-proxy-freed", mb=fmt_number(used - v, 0))
         self.lbl_proxy_impact.setText(text)
 
     def clear_proxies(self):
@@ -578,23 +611,22 @@ class SettingsDialog(QDialog):
     def _update_factory_label(self):
         import library_tools
         changed = library_tools.changed_settings(self.config)
-        what = f"Změněno {len(changed)} nastavení." if changed else "Všechna nastavení jsou výchozí."
-        self.lbl_factory.setText(f"{what} Obnovení vrátí jen předvolby (config.json); databáze, osoby, "
-                                 f"obličeje a originály zůstanou.")
+        what = tr("settings-changed-count", count=len(changed)) if changed else tr("settings-all-default")
+        self.lbl_factory.setText(what + " " + tr("settings-reset-scope"))
 
     def refresh_trash_label(self):
         plan = self._stats.get("trash_plan")
         if plan is None:
-            self.lbl_trash.setText("V koši: —")
+            self.lbl_trash.setText(tr("settings-trash-count-unknown"))
             self.btn_empty_trash.setEnabled(False)
             return
         n_rec, n_rem, n_miss = len(plan["recycle"]), len(plan["removable"]), len(plan["missing"])
         total = n_rec + n_rem + n_miss
-        parts = [f"V koši: <b>{_czech_items(total)}</b>"]
+        parts = [tr("settings-trash-count", items="<b>" + _czech_items(total) + "</b>")]
         if n_rem:
-            parts.append(f"{n_rem} na vyjímatelném / síťovém disku (výchozí: přeskočí se)")
+            parts.append(tr("settings-trash-removable", count=n_rem))
         if n_miss:
-            parts.append(f"{n_miss} bez souboru (jen se zapomene)")
+            parts.append(tr("settings-trash-missing", count=n_miss))
         self.lbl_trash.setText(" · ".join(parts))
         self.btn_empty_trash.setEnabled(total > 0)
 
@@ -603,9 +635,7 @@ class SettingsDialog(QDialog):
         faces_mb = get_folder_size_mb(FACE_DIR)
         previews_mb = preview_cache.cache_size() / (1024 * 1024)
         self.lbl_cache_size.setText(
-            f"Miniatury (lze smazat): <b>{thumbs_mb:.1f} MB</b><br>"
-            f"Náhledy 2048 px (lze smazat): <b>{previews_mb:.1f} MB</b><br>"
-            f"Ořezy tváří (trvalá data, nemažou se): <b>{faces_mb:.1f} MB</b>"
+            tr("settings-cache-usage", thumbs_mb=fmt_number(thumbs_mb, 1), previews_mb=fmt_number(previews_mb, 1), faces_mb=fmt_number(faces_mb, 1))
         )
         if hasattr(self, "slider_preview_mb"):
             self._update_preview_impact(self.slider_preview_mb.value())
@@ -614,10 +644,8 @@ class SettingsDialog(QDialog):
     def clean_cache(self):
         reply = QMessageBox.question(
             self,
-            "Smazat miniatury?",
-            "Smažou se pouze dočasné miniatury fotografií.\n"
-            "Ořezy tváří, rozpoznané osoby, databáze a originály zůstanou nedotčeny.\n"
-            "Miniatury se na pozadí vytvoří znovu.",
+            tr("settings-delete-thumbs-q"),
+            tr("settings-delete-thumbs-body"),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
@@ -627,9 +655,9 @@ class SettingsDialog(QDialog):
         self.refresh_cache_size_label()
         if ok:
             self.cache_cleaned = True
-            QMessageBox.information(self, "Hotovo", message + "\nNáhledy se budou dogenerovat na pozadí.")
+            QMessageBox.information(self, tr("common-done"), message + tr("settings-thumbs-regen"))
         else:
-            QMessageBox.warning(self, "Chyba", message)
+            QMessageBox.warning(self, tr("common-error"), message)
 
     def clear_previews(self):
         """Mezipaměť se sama obnoví – bez potvrzení, dopad ukazuje štítek u tlačítka."""
@@ -643,60 +671,58 @@ class SettingsDialog(QDialog):
         if not plan or not any(plan.values()):
             return
         n_rec, n_rem, n_miss = len(plan["recycle"]), len(plan["removable"]), len(plan["missing"])
-        impact = [f"{_czech_items(n_rec)} se přesune do Koše Windows (lze obnovit)"] if n_rec else []
+        impact = [tr("settings-trash-impact-recycle", count=n_rec)] if n_rec else []
         if n_miss:
-            impact.append(f"{_czech_items(n_miss)} už nemá soubor – jen se odstraní z knihovny")
+            impact.append(tr("settings-trash-impact-missing", count=n_miss))
         options = []
         if n_rem:
-            impact.append(f"{_czech_items(n_rem)} leží na vyjímatelném nebo síťovém disku – tam Koš Windows "
-                          f"není, proto se ve výchozím stavu přeskočí a zůstanou v koši aplikace")
-            options.append(("permanent", f"Smazat i těchto {n_rem} TRVALE (nelze vrátit)", False))
-        ok, values = self._confirm("Vysypat koš?",
-                                   "Položky zmizí z knihovny i ze složek na disku. Rozpoznané osoby "
-                                   "ostatních fotek zůstanou.", impact, options, "Vysypat koš")
+            impact.append(tr("settings-trash-impact-removable", count=n_rem))
+            options.append(("permanent", tr("settings-trash-delete-permanently-option", count=n_rem), False))
+        ok, values = self._confirm(tr("settings-empty-trash-q"),
+                                   tr("settings-empty-trash-body"), impact, options, tr("settings-empty-trash-confirm"))
         if not ok:
             return
         permanent = bool(values.get("permanent"))
         if permanent:
-            ok2, _ = self._confirm("Trvale smazat soubory?",
-                                   f"{_czech_items(n_rem)} na vyjímatelném / síťovém disku se smaže bez "
-                                   f"možnosti obnovení.", (), (), "Smazat trvale")
+            ok2, _ = self._confirm(tr("settings-delete-permanently-q"),
+                                   tr("settings-delete-permanently-body", count=n_rem), (), (),
+                                   tr("settings-delete-permanently"))
             permanent = ok2
         stats = library_tools.empty_trash(plan, delete_removable_permanently=permanent)
         self.trash_emptied = True
         self._stats = self._read_library_stats()
         self.refresh_trash_label()
-        lines = [f"Do Koše Windows: {stats['recycled']}"]
+        lines = [tr("settings-trash-recycled", recycled=stats['recycled'])]
         if stats["deleted"]:
-            lines.append(f"Trvale smazáno: {stats['deleted']}")
+            lines.append(tr("settings-trash-deleted", deleted=stats['deleted']))
         if stats["skipped"]:
-            lines.append(f"Přeskočeno (vyjímatelný / síťový disk): {stats['skipped']}")
+            lines.append(tr("settings-trash-skipped", skipped=stats['skipped']))
         if stats["failed"]:
-            lines.append(f"Nepodařilo se: {stats['failed']} (zůstávají v koši)")
+            lines.append(tr("settings-trash-failed", failed=stats['failed']))
         self.lbl_trash.setText(self.lbl_trash.text() + "<br>" + " · ".join(lines))
 
     def request_recluster(self):
         unconfirmed = self._stats.get("unconfirmed")
-        impact = [f"Znovu se seskupí: {_czech_people(unconfirmed, 'nepotvrzen')}" if unconfirmed is not None
-                  else "Nepotvrzené osoby se seskupí znovu",
-                  "Pojmenované a potvrzené osoby zůstanou (slouží jako kotvy)"]
-        ok, _ = self._confirm("Přeskupit osoby?", "Proběhne na pozadí po zavření předvoleb.", impact,
-                              (), "Přeskupit", destructive=False)
+        impact = [tr("settings-regroup-who", who=_czech_people(unconfirmed)) if unconfirmed is not None
+                  else tr("settings-regroup-unconfirmed"),
+                  tr("settings-regroup-keep")]
+        ok, _ = self._confirm(tr("settings-regroup-q"), tr("settings-regroup-when"), impact,
+                              (), tr("settings-regroup-confirm"), destructive=False)
         if ok:
             self.recluster_requested = True
-            self.btn_recluster.setText("Přeskupení naplánováno ✓")
+            self.btn_recluster.setText(tr("settings-regroup-scheduled"))
 
     def factory_reset(self):
         import library_tools
         changed = library_tools.changed_settings(self.config)
-        impact = [f"Vrátí se {len(changed)} nastavení na výchozí hodnoty" if changed
-                  else "Nastavení už jsou výchozí",
-                  "Databáze, osoby, obličeje ani originální fotky se NEsmažou"]
-        options = [("keep_folders", "Ponechat sledované složky", True),
-                   ("clear_thumbnails", "Smazat i miniatury (vytvoří se znovu)", False),
-                   ("clear_previews", "Smazat i náhledy 2048 px (vytvoří se znovu)", False)]
-        ok, values = self._confirm("Obnovit tovární nastavení?", "Předvolby se vrátí do stavu po instalaci.",
-                                   impact, options, "Obnovit")
+        impact = [tr("settings-reset-count", count=len(changed)) if changed
+                  else tr("settings-reset-already-default"),
+                  tr("settings-reset-keeps")]
+        options = [("keep_folders", tr("settings-reset-keep-watched"), True),
+                   ("clear_thumbnails", tr("settings-reset-delete-thumbs"), False),
+                   ("clear_previews", tr("settings-reset-delete-previews"), False)]
+        ok, values = self._confirm(tr("settings-reset-q"), tr("settings-reset-body"),
+                                   impact, options, tr("settings-reset-confirm"))
         if not ok:
             return
         self.config = library_tools.factory_reset(values.get("keep_folders", True),
@@ -708,7 +734,7 @@ class SettingsDialog(QDialog):
         self.accept()
 
     def add_library_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Vyberte složku s fotkami")
+        folder = QFileDialog.getExistingDirectory(self, tr("settings-pick-folder"))
         if folder:
             existing = [self.list_folders.item(i).text() for i in range(self.list_folders.count())]
             if folder not in existing:
@@ -745,14 +771,35 @@ class SettingsDialog(QDialog):
         self.chk_memories.setChecked(DEFAULT_CONFIG.get("show_memories", True))
         self.chk_adaptive.setChecked(DEFAULT_CONFIG.get("adaptive_accent", True))
         self.chk_hidden_entry.setChecked(DEFAULT_CONFIG.get("show_hidden_folder", True))
-        self.combo_default_sort.setCurrentText(DEFAULT_CONFIG.get("default_sort_order", "Datum pořízení (Nejnovější)"))
+        self._set_sort(DEFAULT_CONFIG.get("default_sort_order", SORT_CHOICES[0][0]))
+        self.set_language_choice(DEFAULT_CONFIG.get("language", i18n.SYSTEM))
         self.slider_threshold.setValue(int(round(float(DEFAULT_CONFIG.get("face_similarity_threshold", 0.62)) * 100)))
         self.slider_lru.setValue(int(DEFAULT_CONFIG.get("thumbnail_lru_capacity", 1200)))
         self.slider_preview_mb.setValue(int(DEFAULT_CONFIG.get("preview_cache_mb", preview_cache.DEFAULT_BUDGET_MB)))
         self.slider_proxy_mb.setValue(int(DEFAULT_CONFIG.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB)))
         self.perf_switch.set_current(DEFAULT_CONFIG.get("performance_tier", "auto"))
+        self.battery_switch.set_current(DEFAULT_CONFIG.get("battery_policy", power.DEFAULT_POLICY))
         self.theme_switch.set_current(DEFAULT_CONFIG.get("theme", "dark"))
         self.accent_picker.set_value(DEFAULT_CONFIG.get("accent", tokens.DEFAULT_ACCENT))
+
+    def choose_cache_dir(self):
+        folder = QFileDialog.getExistingDirectory(self, tr("settings-pick-cache-folder"))
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        if os.path.basename(folder).lower() not in ("kairos", "cache", "kairos cache"):
+            folder = os.path.join(folder, "Kairos")      # nikdy ne přímo do kořene disku
+        if os.path.normcase(folder) == os.path.normcase(paths.CACHE_ROOT):
+            self._pending_cache_dir = None
+        else:
+            self._pending_cache_dir = folder
+        self._update_cache_dir_label()
+
+    def _update_cache_dir_label(self):
+        text = paths.CACHE_ROOT
+        if self._pending_cache_dir:
+            text += tr("settings-cache-pending", pending_cache_dir=self._pending_cache_dir)
+        self.lbl_cache_dir.setText(text)
 
     def selected_theme(self):
         return self.theme_switch.current_key() or theme.DEFAULT_THEME
@@ -771,14 +818,21 @@ class SettingsDialog(QDialog):
         self.config["show_memories"] = self.chk_memories.isChecked()
         self.config["adaptive_accent"] = self.chk_adaptive.isChecked()
         self.config["show_hidden_folder"] = self.chk_hidden_entry.isChecked()
-        self.config["default_sort_order"] = self.combo_default_sort.currentText()
+        self.config["default_sort_order"] = self.combo_default_sort.currentData() or SORT_CHOICES[0][0]
         self.config["accent"], self.config["accent_custom"] = self.accent_picker.value()
         self.config["face_similarity_threshold"] = round(self.slider_threshold.value() / 100.0, 2)
         self.config["thumbnail_lru_capacity"] = self.slider_lru.value()
         self.config["preview_cache_mb"] = int(round(self.slider_preview_mb.value() / PREVIEW_MB_STEP) * PREVIEW_MB_STEP)
         self.config["proxy_cache_mb"] = int(round(self.slider_proxy_mb.value() / PROXY_MB_STEP) * PROXY_MB_STEP)
         self.config["performance_tier"] = self.perf_switch.current_key() or "auto"
+        self.config["battery_policy"] = self.battery_switch.current_key() or power.DEFAULT_POLICY
+        if self._pending_cache_dir is not None:
+            target = self._pending_cache_dir
+            same_default = os.path.normcase(target) == os.path.normcase(paths.DEFAULT_CACHE_ROOT)
+            self.config["cache_dir"] = "" if same_default else target
+            self.config["cache_dir_pending_from"] = paths.CACHE_ROOT      # data_migration.relocate_cache
         self.config["theme"] = self.selected_theme()
+        self.config["language"] = self.selected_language()
         if self.slider_threshold.value() != self._saved_threshold:
             self.recluster_requested = True
         save_config(self.config)

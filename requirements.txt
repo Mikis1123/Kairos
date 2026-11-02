@@ -1,6 +1,7 @@
 PyQt6>=6.6.0
 pillow>=10.0.0
-pillow-heif>=0.14.0numpy>=2.0
+pillow-heif>=0.14.0
+numpy>=2.0
 opencv-python>=4.10
 # Sprint 3: hledání a tváře v ONNX Runtime s DirectML (bez torch); tokenizer bez transformers
 onnxruntime-directml>=1.24
@@ -20,3 +21,7 @@ winrt-Windows.Storage.Streams
 # Stage 3: složka Skryté – AES-GCM miniatury, scrypt hesla, Windows Hello
 cryptography>=42
 winrt-Windows.Security.Credentials.UI
+# Gate 0: obsahový otisk médií (media_identity – xxh3 prvních 64 kB)
+xxhash>=3.4
+# Gate 1: lokalizace – katalogy Project Fluent (locales/*/kairos.ftl), parser bez Babel
+fluent.syntax>=0.19

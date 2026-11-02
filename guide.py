@@ -7,6 +7,7 @@ používají jediný SpotlightOverlay: ztmaví okno kromě kotvy a vedle ní uk�
 
 Zdroj kláves (source) drží test test_polish_p2 v souladu s obsluhou kláves v kódu.
 """
+from i18n import N_, tr
 from dataclasses import dataclass, field
 
 from PyQt6.QtCore import QEvent, QPoint, QRect, QRectF, Qt, pyqtSignal
@@ -22,105 +23,113 @@ ANCHOR_PROPERTY = "guide_anchor"
 PAGE_PHOTOS, PAGE_PEOPLE, PAGE_EVENTS, PAGE_MAP = 0, 1, 2, 3
 
 
+def key_label(key):
+    """Key cap text: message ids (key-space, key-click) are localized, symbols stay."""
+    return tr(key) if key.startswith("key-") else key
+
+
 @dataclass(frozen=True)
 class Tip:
     id: str
-    title: str
-    body: str
+    title_id: str             # message ids (i18n) – texty se skládají až při zobrazení
+    body_id: str
     keys: tuple = ()          # (("Ctrl", "+"), ("Ctrl", "−")) = dvě kombinace
     anchor: str = ""
     page: int = None          # stránka stacku, kde kotva žije
-    group: str = ""           # mezititulek v kapitole
+    group_id: str = ""        # mezititulek v kapitole
     source: tuple = ()        # (soubor, ("Key_F", …)) – obsluha kláves v kódu
+
+    @property
+    def title(self):
+        return tr(self.title_id)
+
+    @property
+    def body(self):
+        return tr(self.body_id)
+
+    @property
+    def group(self):
+        return tr(self.group_id) if self.group_id else ""
 
 
 @dataclass(frozen=True)
 class Chapter:
     id: str
-    title: str
+    title_id: str
     icon: str
-    intro: str
+    intro_id: str
     tips: tuple = field(default_factory=tuple)
+
+    @property
+    def title(self):
+        return tr(self.title_id)
+
+    @property
+    def intro(self):
+        return tr(self.intro_id)
 
 
 CHAPTERS = (
-    Chapter("shortcuts", "Klávesové zkratky", "sparkle",
-            "Kairos se dá ovládat skoro celý z klávesnice. Zkratky platí tam, kde je kurzor.", (
-                Tip("grid_open", "Otevřít fotku", "Vybranou fotku v mřížce otevře v prohlížeči.",
-                    (("Mezerník",), ("Enter",)), group="Mřížka fotek",
+    Chapter("shortcuts", N_("guide-ch-shortcuts"), "sparkle",
+            N_("guide-ch-shortcuts-intro"), (
+                Tip("grid_open", N_("guide-open-photo"), N_("guide-open-photo-body"),
+                    ((N_("key-space"),), ("Enter",)), group_id=N_("guide-where-grid"),
                     source=("main.py", ("Key_Space", "Key_Return"))),
-                Tip("grid_fav", "Oblíbená", "Přidá vybrané fotky do Oblíbených, nebo je odtud odebere.",
-                    (("F",),), group="Mřížka fotek", source=("main.py", ("Key_F",))),
-                Tip("grid_show", "Prezentace", "Spustí prezentaci přes celou obrazovku od vybrané fotky.",
-                    (("S",),), group="Mřížka fotek", source=("main.py", ("Key_S",))),
-                Tip("grid_zoom", "Velikost dlaždic", "Funguje i Ctrl + kolečko myši nebo sevření prstů "
-                    "na touchpadu.", (("Ctrl", "+"), ("Ctrl", "−")), group="Mřížka fotek",
+                Tip("grid_fav", N_("guide-favorite"), N_("guide-favorite-body"),
+                    (("F",),), group_id=N_("guide-where-grid"), source=("main.py", ("Key_F",))),
+                Tip("grid_show", N_("slideshow"), N_("guide-slideshow-body"),
+                    (("S",),), group_id=N_("guide-where-grid"), source=("main.py", ("Key_S",))),
+                Tip("grid_zoom", N_("guide-tile-size"), N_("guide-tile-size-body"), (("Ctrl", "+"), ("Ctrl", "−")), group_id=N_("guide-where-grid"),
                     source=("main.py", ("Key_Plus", "Key_Minus"))),
-                Tip("grid_esc", "Zrušit výběr", "První Esc zruší výběr, další vrátí z podstránky zpět.",
-                    (("Esc",),), group="Mřížka fotek", source=("main.py", ("Key_Escape",))),
-                Tip("nav_back", "Zpět", "Vrátí na předchozí stránku přesně tam, kde jste byli.",
-                    (("Alt", "←"),), group="Mřížka fotek"),
-                Tip("viewer_arrows", "Předchozí a další", "Listování fotkami v prohlížeči.",
-                    (("←",), ("→",)), group="Prohlížeč", source=("viewer.py", ("Key_Left", "Key_Right"))),
-                Tip("viewer_info", "Informace", "Panel s datem, místem, fotoaparátem a lidmi na fotce.",
-                    (("I",),), group="Prohlížeč", source=("viewer.py", ("Key_I",))),
-                Tip("viewer_full", "Celá obrazovka", "Esc pak postupně zavře celou obrazovku, panel Info "
-                    "a nakonec prohlížeč.", (("F11",), ("Alt", "Enter")), group="Prohlížeč",
+                Tip("grid_esc", N_("guide-deselect"), N_("guide-deselect-body"),
+                    (("Esc",),), group_id=N_("guide-where-grid"), source=("main.py", ("Key_Escape",))),
+                Tip("nav_back", N_("guide-back"), N_("guide-back-body"),
+                    (("Alt", "←"),), group_id=N_("guide-where-grid")),
+                Tip("viewer_arrows", N_("guide-prev-next"), N_("guide-prev-next-body"),
+                    (("←",), ("→",)), group_id=N_("guide-where-viewer"), source=("viewer.py", ("Key_Left", "Key_Right"))),
+                Tip("viewer_info", N_("guide-info"), N_("guide-info-body"),
+                    (("I",),), group_id=N_("guide-where-viewer"), source=("viewer.py", ("Key_I",))),
+                Tip("viewer_full", N_("guide-fullscreen"), N_("guide-fullscreen-body"), (("F11",), ("Alt", "Enter")), group_id=N_("guide-where-viewer"),
                     source=("viewer.py", ("Key_F11", "Key_Escape"))),
-                Tip("viewer_play", "Přehrát", "Spustí nebo zastaví video i Live Photo.",
-                    (("Mezerník",),), group="Prohlížeč", source=("viewer.py", ("Key_Space",))),
-                Tip("video_skip", "O 10 sekund", "Posun videa zpět a vpřed; stejně funguje Shift + ← / →.",
-                    (("J",), ("L",)), group="Video", source=("viewer.py", ("Key_J", "Key_L"))),
-                Tip("video_frame", "Po snímku", "Krok o jeden snímek zpět a vpřed.",
-                    ((",",), (".",)), group="Video", source=("viewer.py", ("Key_Comma", "Key_Period"))),
-                Tip("video_mute", "Ztlumit", "Vypne a zapne zvuk videa.", (("M",),), group="Video",
+                Tip("viewer_play", N_("guide-play"), N_("guide-play-body"),
+                    ((N_("key-space"),),), group_id=N_("guide-where-viewer"), source=("viewer.py", ("Key_Space",))),
+                Tip("video_skip", N_("guide-seek"), N_("guide-seek-body"),
+                    (("J",), ("L",)), group_id=N_("guide-where-video"), source=("viewer.py", ("Key_J", "Key_L"))),
+                Tip("video_frame", N_("guide-frame-step"), N_("guide-frame-step-body"),
+                    ((",",), (".",)), group_id=N_("guide-where-video"), source=("viewer.py", ("Key_Comma", "Key_Period"))),
+                Tip("video_mute", N_("guide-mute"), N_("guide-mute-body"), (("M",),), group_id=N_("guide-where-video"),
                     source=("viewer.py", ("Key_M",))),
-                Tip("event_journey", "Cesta z události", "Na vybrané kartě události přehraje její cestu "
-                    "na mapě.", (("J",),), group="Události", source=("events_view.py", ("Key_J",))),
-                Tip("review_undo", "Vrátit rozhodnutí", "V kontrole duplicit a nejistých tváří vrátí "
-                    "poslední krok.", (("Ctrl", "Z"),), group="Kontroly", source=("main.py", ("Key_Z",))),
-                Tip("help", "Tipy a průvodce", "Otevře tuto stránku odkudkoli.", (("F1",),), group="Nápověda"),
+                Tip("event_journey", N_("guide-journey-from-event"), N_("guide-journey-from-event-body"), (("J",),), group_id=N_("nav-events"), source=("events_view.py", ("Key_J",))),
+                Tip("review_undo", N_("guide-undo"), N_("guide-undo-body"), (("Ctrl", "Z"),), group_id=N_("guide-where-reviews"), source=("main.py", ("Key_Z",))),
+                Tip("help", N_("guide-title"), N_("guide-open-anywhere-body"), (("F1",),), group_id=N_("guide-where-help")),
             )),
-    Chapter("map", "Ovládání mapy", "map",
-            "Mapa je skutečná zeměkoule. Fotky s polohou se na ní shlukují podle místa.", (
-                Tip("map_globe", "Zeměkoule a přelet", "Klik na shluk fotek přiletí do krajiny s nakloněnou "
-                    "kamerou. Tlačítko Zeměkoule nebo Esc vás vrátí zpět.", (("Esc",),),
+    Chapter("map", N_("guide-ch-map"), "map",
+            N_("guide-ch-map-intro"), (
+                Tip("map_globe", N_("guide-globe-flyover"), N_("guide-globe-flyover-body"), (("Esc",),),
                     anchor="map", page=PAGE_MAP, source=("map_vault.html", ("Escape",))),
-                Tip("map_layers", "Tři podklady", "Základní, Satelitní a Turistická (vrstevnice a značené "
-                    "trasy) – přepínač je přímo na mapě.", anchor="map", page=PAGE_MAP),
-                Tip("map_terrain", "3D terén", "Při přiblížení do krajiny se sám zapne plastický terén; "
-                    "na zeměkouli se vypne, aby mapa zůstala svižná."),
-                Tip("map_journey", "Cesta", "Kinematické přehrání výletu po zastávkách s polaroidy a filmovým "
-                    "pásem. Spustíte ji z karty události nebo tlačítkem Cesty na mapě.",
-                    (("Mezerník",), ("←",), ("→",)), anchor="map", page=PAGE_MAP,
+                Tip("map_layers", N_("guide-three-layers"), N_("guide-three-layers-body"), anchor="map", page=PAGE_MAP),
+                Tip("map_terrain", N_("guide-terrain"), N_("guide-terrain-body")),
+                Tip("map_journey", N_("journey"), N_("guide-journey-body"),
+                    ((N_("key-space"),), ("←",), ("→",)), anchor="map", page=PAGE_MAP,
                     source=("map_vault.html", (" ", "ArrowLeft", "ArrowRight"))),
             )),
-    Chapter("faces", "Rozpoznávání tváří", "people",
-            "Kairos hledá tváře na pozadí a skládá je do osob. Vy jen potvrdíte a pojmenujete.", (
-                Tip("faces_name", "Pojmenujte osobu", "Otevřete kartu v Osobách a zadejte jméno. Pojmenované "
-                    "osoby slouží jako kotvy – další fotky se k nim přiřadí přesněji.",
+    Chapter("faces", N_("guide-ch-faces"), "people",
+            N_("guide-ch-faces-intro"), (
+                Tip("faces_name", N_("guide-name-person"), N_("guide-name-people-body"),
                     anchor="people", page=PAGE_PEOPLE),
-                Tip("faces_merge", "Sloučit dvě osoby", "Ctrl + klik vybere víc karet, pak stiskněte Sloučit. "
-                    "Sloučení jde vrátit.", (("Ctrl", "klik"),), anchor="people", page=PAGE_PEOPLE),
-                Tip("faces_borderline", "Nejisté tváře", "Tváře, u kterých si Kairos není jistý, projdete "
-                    "rychle ano / ne.", anchor="faces_borderline", page=PAGE_PEOPLE),
-                Tip("faces_duplicates", "Duplicity", "Téměř stejné snímky vedle sebe – necháte lepší, "
-                    "druhý jde do koše (Ctrl + Z vrátí).", anchor="faces_duplicates", page=PAGE_PEOPLE),
-                Tip("faces_recluster", "Přeskupit znovu", "Když se osoby pomíchají, přeskupení je složí "
-                    "znovu; potvrzené osoby zůstanou.", anchor="faces_recluster", page=PAGE_PEOPLE),
+                Tip("faces_merge", N_("guide-merge"), N_("guide-merge-body"), (("Ctrl", N_("key-click")),), anchor="people", page=PAGE_PEOPLE),
+                Tip("faces_borderline", N_("guide-uncertain"), N_("guide-uncertain-body"), anchor="faces_borderline", page=PAGE_PEOPLE),
+                Tip("faces_duplicates", N_("people-duplicates"), N_("guide-duplicates-body"), anchor="faces_duplicates", page=PAGE_PEOPLE),
+                Tip("faces_recluster", N_("guide-regroup"), N_("guide-regroup-body"), anchor="faces_recluster", page=PAGE_PEOPLE),
             )),
-    Chapter("search", "Hledání", "search",
-            "Hledání rozumí obsahu fotek, ne jen názvům souborů.", (
-                Tip("search_text", "Hledejte popisem", "Zkuste „západ slunce“, „pes na pláži“ nebo „hory "
-                    "v zimě“. Poprvé se chvíli připravuje model, pak je hledání okamžité.",
+    Chapter("search", N_("guide-ch-search"), "search",
+            N_("guide-ch-search-intro"), (
+                Tip("search_text", N_("guide-search-by-description"), N_("guide-search-body"),
                     anchor="search", page=PAGE_PHOTOS),
-                Tip("search_time", "Roky, Měsíce, Dny", "Přepínač nad mřížkou přeskočí v čase – klik na rok "
-                    "otevře jeho měsíce, klik na měsíc mřížku na tom místě.",
+                Tip("search_time", N_("guide-ymd"), N_("guide-ymd-body"),
                     anchor="time_switch", page=PAGE_PHOTOS),
-                Tip("search_memories", "Vzpomínky", "Když máte fotky ze stejného dne v minulých letech, "
-                    "objeví se nad mřížkou karta „Před 3 lety“.", anchor="memories", page=PAGE_PHOTOS),
-                Tip("search_import", "Import", "Přidejte složku s fotkami; Kairos je zařadí na místě, "
-                    "nic nekopíruje.", anchor="import", page=PAGE_PHOTOS),
+                Tip("search_memories", N_("guide-memories"), N_("guide-memories-body"), anchor="memories", page=PAGE_PHOTOS),
+                Tip("search_import", N_("nav-import"), N_("guide-add-folder-body"), anchor="import", page=PAGE_PHOTOS),
             )),
 )
 
@@ -162,7 +171,7 @@ class KeyCaps(QWidget):
         f.setWeight(QFont.Weight.DemiBold)
         self.setFont(f)
         self.setFixedSize(self._layout_width(), 26)
-        self.setAccessibleName(" nebo ".join(" + ".join(c) for c in combos))
+        self.setAccessibleName(tr("guide-keys-or").join(" + ".join(key_label(k) for k in c) for c in combos))
 
     def _parts(self):
         fm = self.fontMetrics()
@@ -173,6 +182,7 @@ class KeyCaps(QWidget):
             for j, key in enumerate(combo):
                 if j:
                     parts.append(("plus", "+", fm.horizontalAdvance("+") + 8))
+                key = key_label(key)
                 parts.append(("key", key, max(24, fm.horizontalAdvance(key) + 16)))
         return parts
 
@@ -224,8 +234,8 @@ class TipCard(QWidget):
         lay.addWidget(body)
         self.btn_show = None
         if tip.anchor:
-            self.btn_show = KButton("Ukázat", compact=True, variant="ghost", icon="sparkle")
-            self.btn_show.setToolTip("Přejde na místo v aplikaci a zvýrazní ho")
+            self.btn_show = KButton(tr("guide-show-me"), compact=True, variant="ghost", icon="sparkle")
+            self.btn_show.setToolTip(tr("guide-show-me-tooltip"))
             self.btn_show.clicked.connect(lambda: self.show_requested.emit(self.tip))
             lay.addWidget(self.btn_show, 0, Qt.AlignmentFlag.AlignLeft)
 
@@ -243,7 +253,7 @@ class GuidePage(DetailPage):
     show_requested = pyqtSignal(object)      # Tip -> hlavní okno přejde na místo a zvýrazní ho
 
     def __init__(self, chapter_id=None, parent=None):
-        super().__init__("Tipy a průvodce", "Kairos Spark · krátké rady, jak z knihovny dostat víc", parent=parent)
+        super().__init__(tr("guide-title"), tr("guide-subtitle"), parent=parent)
         body = QWidget()
         row = QHBoxLayout(body)
         row.setContentsMargins(16, 16, 0, 0)
@@ -319,7 +329,7 @@ class SpotlightOverlay(QWidget):
         self._closing = False
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName(f"Tip: {title}. {body}")
+        self.setAccessibleName(tr("guide-tip-a11y", title=title, body=body))
         self._opacity = motion.Tween(0.0, lambda v: self.update(), self)
         self._opacity.finished.connect(self._after_fade)
         host.installEventFilter(self)
@@ -435,5 +445,5 @@ class SpotlightOverlay(QWidget):
         p.setFont(hf)
         p.setPen(acc)
         p.drawText(QRectF(x, y, inner, p.fontMetrics().height()), int(Qt.AlignmentFlag.AlignLeft),
-                   "Klikněte kamkoli nebo stiskněte Esc")
+                   tr("guide-dismiss-hint"))
         p.end()

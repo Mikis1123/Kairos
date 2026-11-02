@@ -5,6 +5,7 @@ InWindowDialog má stejné volání jako QInputDialog (getText / getItem → (ho
 stačí vyměnit jméno třídy. Čeká lokální smyčkou událostí jako QDialog.exec(): klávesové
 zkratky okna pod listem jsou mezitím blokované, Esc = Zrušit, Enter = potvrdit.
 """
+from i18n import tr
 from PyQt6.QtCore import QEvent, QEventLoop, QObject, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import (QApplication, QComboBox, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
@@ -36,7 +37,9 @@ class Sheet(QWidget):
     """Překryv přes celé okno: ztlumené pozadí a karta uprostřed (titulek, text, obsah, tlačítka)."""
     done = pyqtSignal(bool)
 
-    def __init__(self, host, title, body="", action_text="OK", cancel_text="Zrušit", destructive=False):
+    def __init__(self, host, title, body="", action_text=None, cancel_text=None, destructive=False):
+        action_text = action_text or tr("action-ok")
+        cancel_text = cancel_text or tr("action-cancel")
         window = host.window() if host is not None else None
         super().__init__(window)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
@@ -188,8 +191,8 @@ class InWindowDialog:
     """Náhrada QInputDialog / potvrzovacích oken – stejné návratové hodnoty, list v okně."""
 
     @staticmethod
-    def getText(parent, title, label, text="", action_text="Uložit"):
-        sheet = Sheet(parent, title, label, action_text)
+    def getText(parent, title, label, text="", action_text=None):
+        sheet = Sheet(parent, title, label, action_text or tr("action-save"))
         edit = QLineEdit(text)
         edit.selectAll()
         edit.returnPressed.connect(sheet.accept)
@@ -200,8 +203,8 @@ class InWindowDialog:
         return (value[0] if value else text), ok
 
     @staticmethod
-    def getItem(parent, title, label, items, current=0, editable=False, action_text="Vybrat"):
-        sheet = Sheet(parent, title, label, action_text)
+    def getItem(parent, title, label, items, current=0, editable=False, action_text=None):
+        sheet = Sheet(parent, title, label, action_text or tr("action-choose"))
         combo = QComboBox()
         combo.addItems(list(items))
         combo.setCurrentIndex(max(0, min(current, combo.count() - 1)))
@@ -213,5 +216,5 @@ class InWindowDialog:
         return (value[0] if value else ""), ok
 
     @staticmethod
-    def confirm(parent, title, body, action_text="Pokračovat", destructive=True):
-        return Sheet(parent, title, body, action_text, destructive=destructive).exec()
+    def confirm(parent, title, body, action_text=None, destructive=True):
+        return Sheet(parent, title, body, action_text or tr("action-continue"), destructive=destructive).exec()

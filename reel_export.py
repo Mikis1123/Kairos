@@ -65,7 +65,7 @@ def export(renderer, out_path, music=None, fps=FPS, size=SIZE, progress=None, sh
     Zrušení (should_stop) smaže rozpracovaný soubor a vyhodí ExportCancelled."""
     encoder = video_encoder(ffmpeg_path)
     if encoder is None:
-        raise RuntimeError("ffmpeg neumí H.264")
+        raise RuntimeError('ffmpeg has no H.264 encoder')
     total = float(renderer.plan["total"])
     w, h = size
     n = max(1, int(round(total * fps)))

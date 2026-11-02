@@ -6,6 +6,7 @@ kterým rozumí (lokální složky nebo podporované soubory) – ostatní propu
 DropOverlay je jediný překryv vytvořený při prvním tažení: zářící lem zvýraznění a kapsle
 „Pusťte pro import“; nereaguje na myš a mimo tažení je skrytý.
 """
+from i18n import tr
 import os
 
 from PyQt6.QtCore import QEvent, QObject, QRectF, Qt, pyqtSignal
@@ -58,11 +59,11 @@ def describe(folders, files):
     parts = []
     if folders:
         n = len(folders)
-        parts.append(f"„{os.path.basename(folders[0]) or folders[0]}“" if n == 1 else
-                     f"{n} složky" if n <= 4 else f"{n} složek")
+        parts.append(tr("quoted", text=os.path.basename(folders[0]) or folders[0]) if n == 1 else
+                     tr("count-folders", count=n))
     if files:
         n = len(files)
-        parts.append("1 soubor" if n == 1 else f"{n} soubory" if n <= 4 else f"{n} souborů")
+        parts.append(tr("count-files", count=n))
     return " · ".join(parts)
 
 
@@ -118,10 +119,10 @@ class DropOverlay(QWidget):
         sub_f = QFont(tokens.ui_family())
         sub_f.setPixelSize(12)
         p.setFont(title_f)
-        title = "Pusťte pro import"
+        title = tr("drop-release-to-import")
         tw = p.fontMetrics().horizontalAdvance(title)
         th = p.fontMetrics().height()
-        sub = (self.detail + " · " if self.detail else "") + "zařadí se na místě, nic se nekopíruje"
+        sub = (self.detail + " · " if self.detail else "") + tr("drop-in-place")
         p.setFont(sub_f)
         sw = p.fontMetrics().horizontalAdvance(sub)
         sh = p.fontMetrics().height()

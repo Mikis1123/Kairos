@@ -1,3 +1,4 @@
+from i18n import tr
 import os
 import webbrowser
 from pathlib import Path
@@ -258,7 +259,7 @@ class MediaViewerWidget(QWidget):
         self.meta_layout.setSpacing(14)
         self.info_layout.addWidget(self.meta_container)
 
-        self.lbl_faces_hdr = _caption("Osoby")
+        self.lbl_faces_hdr = _caption(tr("nav-people"))
         self.info_layout.addWidget(self.lbl_faces_hdr)
 
         self.faces_container = QWidget()
@@ -269,7 +270,7 @@ class MediaViewerWidget(QWidget):
         self.faces_layout.setSpacing(12)
         self.info_layout.addWidget(self.faces_container)
 
-        self.lbl_map_hdr = _caption("Místo pořízení")
+        self.lbl_map_hdr = _caption(tr("viewer-place-taken"))
         self.info_layout.addWidget(self.lbl_map_hdr)
 
         # Minimapa se vytvoří až při prvním zobrazení polohy v panelu Info (_ensure_mini_map):
@@ -279,7 +280,7 @@ class MediaViewerWidget(QWidget):
         self._mini_place = None              # (lat, lon) čekající na načtení stránky minimapy
         self._mini_map_index = self.info_layout.count()
 
-        self.btn_gmap = QPushButton("Otevřít v Google Maps")
+        self.btn_gmap = QPushButton(tr("viewer-open-google-maps"))
         self.btn_gmap.clicked.connect(self.open_google_maps)
         self.info_layout.addWidget(self.btn_gmap)
 
@@ -367,9 +368,9 @@ class MediaViewerWidget(QWidget):
         top.setSpacing(6)
         top.setContentsMargins(GlassPanel.SHADOW + 6, GlassPanel.SHADOW + 4,
                                GlassPanel.SHADOW + 8, GlassPanel.SHADOW + 4)
-        self.btn_back = QPushButton("‹ Zpět")
+        self.btn_back = QPushButton(tr("nav-back"))
         self.btn_back.setObjectName("HudBack")
-        self.btn_back.setToolTip("Zpět (Esc)")
+        self.btn_back.setToolTip(tr("nav-back-tooltip"))
         self.btn_back.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_back.clicked.connect(self.request_close)
@@ -384,17 +385,17 @@ class MediaViewerWidget(QWidget):
         titles.addWidget(self.lbl_counter)
         top.addLayout(titles)
         top.addStretch(1)
-        self.btn_fav = HudIconButton("heart", "Oblíbené (F)")
+        self.btn_fav = HudIconButton("heart", tr("viewer-favorite-tooltip"))
         self.btn_fav.clicked.connect(self.handle_toggle_favorite)
-        self.btn_live = HudIconButton("live", "Přehrát Live Photo (mezerník)")
+        self.btn_live = HudIconButton("live", tr("viewer-play-live-tooltip"))
         self.btn_live.setCheckable(True)
         self.btn_live.clicked.connect(self.toggle_live_playback)
-        self.btn_slideshow = HudIconButton("slideshow", "Prezentace (S)")
+        self.btn_slideshow = HudIconButton("slideshow", tr("viewer-slideshow-tooltip"))
         self.btn_slideshow.clicked.connect(self.start_slideshow)
-        self.btn_info = HudIconButton("info", "Informace (I)")
+        self.btn_info = HudIconButton("info", tr("viewer-info-tooltip"))
         self.btn_info.setCheckable(True)
         self.btn_info.clicked.connect(self.toggle_info_panel)
-        self.btn_fullscreen = HudIconButton("fullscreen", "Celá obrazovka (F11 / dvojklik)")
+        self.btn_fullscreen = HudIconButton("fullscreen", tr("viewer-fullscreen-tooltip"))
         self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
         for b in (self.btn_fav, self.btn_live, self.btn_slideshow, self.btn_info, self.btn_fullscreen):
             top.addWidget(b)
@@ -427,7 +428,7 @@ class MediaViewerWidget(QWidget):
 
         controls_row = QHBoxLayout()
         controls_row.setSpacing(6)
-        self.btn_mute = HudIconButton("volume", "Ztlumit (M)")
+        self.btn_mute = HudIconButton("volume", tr("viewer-mute-tooltip"))
         self.btn_mute.clicked.connect(self.toggle_mute)
         self.volume_slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setFixedWidth(84)
@@ -436,17 +437,17 @@ class MediaViewerWidget(QWidget):
         self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.volume_slider.valueChanged.connect(self.on_volume_changed)
         self.volume_slider.slider_clicked.connect(self.on_volume_changed)
-        self.btn_skip_back = HudIconButton("skip_back", "Zpět o 10 s (J)")
+        self.btn_skip_back = HudIconButton("skip_back", tr("viewer-back-10"))
         self.btn_skip_back.clicked.connect(lambda: self.skip_seconds(-10000))
-        self.btn_play_pause = HudIconButton("pause", "Přehrát / pozastavit (mezerník)", size=44)
+        self.btn_play_pause = HudIconButton("pause", tr("viewer-play-pause"), size=44)
         self.btn_play_pause.clicked.connect(self.toggle_play_pause)
-        self.btn_skip_fwd = HudIconButton("skip_fwd", "Vpřed o 10 s (L)")
+        self.btn_skip_fwd = HudIconButton("skip_fwd", tr("viewer-forward-10"))
         self.btn_skip_fwd.clicked.connect(lambda: self.skip_seconds(10000))
         self.btn_speed = QPushButton("1.0×")
         self.btn_speed.setObjectName("HudSpeed")
         self.btn_speed.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_speed.clicked.connect(self.cycle_playback_speed)
-        self.btn_video_fullscreen = HudIconButton("fullscreen", "Celá obrazovka (F11)")
+        self.btn_video_fullscreen = HudIconButton("fullscreen", tr("viewer-fullscreen-f11"))
         self.btn_video_fullscreen.clicked.connect(self.toggle_fullscreen)
         controls_row.addWidget(self.btn_mute)
         controls_row.addWidget(self.volume_slider)
@@ -462,8 +463,8 @@ class MediaViewerWidget(QWidget):
         # Šipky předchozí / další na okrajích
         self.prev_hud = GlassPanel(self.canvas, backdrop, radius=22)
         self.next_hud = GlassPanel(self.canvas, backdrop, radius=22)
-        self.btn_prev = HudIconButton("prev", "Předchozí (←)", size=44)
-        self.btn_next = HudIconButton("next", "Následující (→)", size=44)
+        self.btn_prev = HudIconButton("prev", tr("viewer-previous"), size=44)
+        self.btn_next = HudIconButton("next", tr("viewer-next"), size=44)
         self.btn_prev.clicked.connect(self.show_prev)
         self.btn_next.clicked.connect(self.show_next)
         for panel, btn in ((self.prev_hud, self.btn_prev), (self.next_hud, self.btn_next)):
@@ -578,7 +579,7 @@ class MediaViewerWidget(QWidget):
 
     def _update_fav_icon(self, is_fav):
         self.btn_fav.set_icon("heart_fill" if int(is_fav or 0) == 1 else "heart")
-        self.btn_fav.setToolTip("Odebrat z oblíbených (F)" if int(is_fav or 0) == 1 else "Oblíbené (F)")
+        self.btn_fav.setToolTip(tr("viewer-unfavorite-tooltip") if int(is_fav or 0) == 1 else tr("viewer-favorite-tooltip"))
 
     # ── Celá obrazovka a prezentace ───────────────────────────────────────────
 
@@ -836,7 +837,7 @@ class MediaViewerWidget(QWidget):
 
         when = czech_day(_iso_date(dt))
         clock = _clock(dt)
-        self.lbl_info_hdr.setText(when or "Datum neznámé")
+        self.lbl_info_hdr.setText(when or tr("viewer-date-unknown"))
         self.lbl_info_sub.setText(" · ".join(filter(None, [clock, os.path.basename(path or "")])))
 
         camera = " ".join(x for x in (make or "", model or "") if x).strip()
@@ -844,7 +845,7 @@ class MediaViewerWidget(QWidget):
             camera = str(model)                       # „Apple iPhone…“ místo „Apple Apple iPhone…“
         chips = [c for c in (_fnum(fnum), _exposure(exp), f"ISO {iso_val}" if iso_val else "",
                              f"{int(focal35)} mm" if focal35 else "") if c]
-        section = _section("Fotoaparát")
+        section = _section(tr("viewer-camera"))
         if camera or lens or chips:
             if camera:
                 section.layout().addWidget(_value(camera, strong=True))
@@ -853,17 +854,18 @@ class MediaViewerWidget(QWidget):
             if chips:
                 section.layout().addWidget(_chip_row(chips))
         else:
-            section.layout().addWidget(_value("Bez údajů o fotoaparátu", muted=True))
+            section.layout().addWidget(_value(tr("viewer-no-camera"), muted=True))
         self.meta_layout.addWidget(section)
 
         place = ", ".join(x for x in (city, country) if x)
-        section = _section("Místo")
+        section = _section(tr("viewer-place"))
         section.layout().addWidget(_value(place, strong=True) if place
-                                   else _value("Poloha neznámá" if lat is None else "Místo bez názvu", muted=True))
+                                   else _value(tr("viewer-location-unknown") if lat is None else tr("viewer-unnamed-place"), muted=True))
         self.meta_layout.addWidget(section)
 
         if event_title:
-            section = _section("Událost")
+            section = _section(tr("viewer-event"))
+            # i18n-ok: stored auto event name prefix
             section.layout().addWidget(_value(event_title.replace("Výlet: ", ""), strong=True))
             self.meta_layout.addWidget(section)
 
@@ -898,7 +900,7 @@ class MediaViewerWidget(QWidget):
         btn = QPushButton()
         btn.setFixedSize(48, 48)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setToolTip(person_name if person_name else "Neznámá osoba – klikněte a pojmenujte ji")
+        btn.setToolTip(person_name if person_name else tr("viewer-unknown-person-tooltip"))
         btn.setStyleSheet(f"QPushButton {{ border: none; border-radius: 24px; background: {t['surface_2']}; "
                           f"color: {t['text_secondary']}; font-weight: 600; }}"
                           f"QPushButton:hover {{ border: 2px solid {t['accent']}; }}")
@@ -922,7 +924,7 @@ class MediaViewerWidget(QWidget):
         btn.clicked.connect(lambda checked=False, f_id=face_id, p_id=person_id, p_name=person_name:
                             self.on_face_badge_clicked(f_id, p_id, p_name, item_id))
         lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignHCenter)
-        name = QLabel(person_name or "Neznámá")
+        name = QLabel(person_name or tr("viewer-unknown"))
         name.setAlignment(Qt.AlignmentFlag.AlignCenter)
         name.setFixedWidth(64)
         name.setStyleSheet(f"font-size: 11px; color: {t['text_secondary'] if not person_name else t['text']}; "
@@ -960,13 +962,19 @@ class MediaViewerWidget(QWidget):
 
     def _on_mini_map_loaded(self, ok):
         self._mini_map_ready = bool(ok)
+        if ok and getattr(self, "mini_map", None) is not None:
+            import json
+            import i18n
+            self.mini_map.page().runJavaScript(
+                f"window.setStrings && window.setStrings({json.dumps(i18n.page_strings('minimap-'), ensure_ascii=False)},"
+                f" {json.dumps(i18n.current())});")
         if ok and self._mini_place is not None:
             self._show_mini_place(*self._mini_place)
 
     def on_face_badge_clicked(self, face_id, person_id, current_name, item_id):
         new_name, ok = InWindowDialog.getText(
-            self, "Přiřadit osobu", "Zadejte jméno osoby (pokud už existuje, fotka se k ní přiřadí).",
-            text=current_name if current_name else "", action_text="Přiřadit")
+            self, tr("viewer-assign-person"), tr("viewer-assign-person-body"),
+            text=current_name if current_name else "", action_text=tr("viewer-assign"))
         if ok and new_name.strip():
             target_name = new_name.strip()
             conn = get_connection()

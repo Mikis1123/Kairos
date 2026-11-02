@@ -4,6 +4,7 @@ ToastManager se připojí k hostitelskému widgetu (hlavní okno) a kreslí toas
 překryvné děti dole uprostřed. Potvrzení zmizí samo po 3 s (pozastaví se pod myší),
 chyby zůstávají, dokud je uživatel nezavře – neúspěšné uložení nesmí tiše zmizet.
 """
+from i18n import tr
 from PyQt6.QtCore import Qt, QObject, QTimer, QEvent, QPropertyAnimation, pyqtSignal
 from PyQt6.QtGui import QPainter, QPixmap
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QGraphicsOpacityEffect
@@ -89,7 +90,7 @@ class Toast(QFrame):
         self.btn_close = QPushButton(dismiss_text or "✕")
         self.btn_close.setObjectName("ToastDismiss" if dismiss_text else "ToastClose")
         self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_close.setAccessibleName(dismiss_text or "Zavřít oznámení")
+        self.btn_close.setAccessibleName(dismiss_text or tr("toast-close-a11y"))
         self.btn_close.clicked.connect(self.dismiss)
         row.addWidget(self.btn_close)
         self.setAccessibleName(text)

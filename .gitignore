@@ -31,7 +31,6 @@ backups/
 # Locked folder (Skryté): wrapped key + sealed thumbnails, never versioned
 vault/
 
-
 # Gate 0: po migraci do AppData zůstává ve složce aplikace jen záloha + poznámka
 KAIROS_DATA_MOVED.txt
 portable.txt

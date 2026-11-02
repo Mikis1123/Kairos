@@ -331,7 +331,7 @@ class TestGlobePage(unittest.TestCase):
         self.assertFalse(self.js("document.getElementById('btn-journeys').hidden"))
         self.js("document.getElementById('btn-journeys').click(); 0")
         self.assertTrue(self.js("document.getElementById('jlist').classList.contains('open')"))
-        self.assertIn("1. 8. 2024 – 5. 8. 2024", self.js("document.getElementById('jlist').textContent"))
+        self.assertIn("8/1/2024 – 8/5/2024", self.js("document.getElementById('jlist').textContent"))
         self.js("document.querySelector('#jlist button').click(); 0")
         for _ in range(30):
             if self.m.fake.journeys:
@@ -355,8 +355,8 @@ class TestGlobePage(unittest.TestCase):
         dusk = self.js("sunPosition(50.08, 14.43, '2023-12-21 16:30')")
         self.assertTrue(-9 < dusk["el"] < 1, dusk)
         self.assertIsNone(self.js("sunPosition(50, 14, '2023-06-21')"), "bez času = bez oblohy")
-        self.assertEqual(self.js("yearsAgo('2023-07-06 10:00', new Date(2026, 9, 28))"), "Před 3 lety")
-        self.assertEqual(self.js("yearsAgo('2025-07-06 10:00', new Date(2026, 9, 28))"), "Před rokem")
+        self.assertEqual(self.js("yearsAgo('2023-07-06 10:00', new Date(2026, 9, 28))"), "3 years ago")
+        self.assertEqual(self.js("yearsAgo('2025-07-06 10:00', new Date(2026, 9, 28))"), "A year ago")
         self.assertEqual(self.js("yearsAgo('2026-11-06 10:00', new Date(2026, 9, 28))"), "")
 
     def test_accent(self):
@@ -382,7 +382,7 @@ class TestGlobePage(unittest.TestCase):
         self.assertEqual(self.js("document.getElementById('jtitle').textContent"), "Šumava <b>2023</b>",
                          "název jako text, ne HTML")
         self.assertTrue(self.js("document.getElementById('jcap').classList.contains('show')"))
-        self.assertIn("2 zastávky", self.js("document.getElementById('jmeta').textContent"))
+        self.assertIn("2 stops", self.js("document.getElementById('jmeta').textContent"))
         self.assertFalse(self.js("getPinState().visible"), "piny se během Cesty schovají")
         self.assertEqual(self.js("journeyState().frames"), 2, "kapitola za každou zastávku hned od začátku")
         self.js("journeySkip(1); 0")                              # střih rovnou na okamžik první zastávky
@@ -392,7 +392,7 @@ class TestGlobePage(unittest.TestCase):
         self.assertFalse(self.js("document.getElementById('jcap').classList.contains('show')"))
         self.assertEqual(st["place"], "Kolinec")
         self.assertEqual(st["sky"], "#6FA6EE", "poledne = denní obloha")
-        self.assertIn("Den", self.js("document.getElementById('jwhen').textContent"))
+        self.assertIn("Day", self.js("document.getElementById('jwhen').textContent"))
         # okamžik zastávky: jediný nejlepší snímek (best, jinak první fotka) ve velké kartě
         self.assertEqual(st["polaroids"], 1, "okamžik zastávky je vidět")
         self.assertIn(os.path.basename(self.thumb),
@@ -450,7 +450,7 @@ class TestGlobePage(unittest.TestCase):
         self.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: ' '})); 0")
         self.assertTrue(self.js("journeyState().paused"))
         self.assertTrue(self.js("document.body.classList.contains('paused')"), "pauza zastaví i Ken Burns")
-        self.assertEqual(self.js("document.getElementById('jplay').getAttribute('aria-label')"), "Přehrát")
+        self.assertEqual(self.js("document.getElementById('jplay').getAttribute('aria-label')"), "Play")
         t = self.js("journeyState().t")
         wait(200)
         self.assertEqual(self.js("journeyState().t"), t, "čas filmu v pauze stojí")

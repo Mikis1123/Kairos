@@ -13,6 +13,7 @@ Smazání složky nic nemaže: její obsah se přesune o úroveň výš.
 Alba se do XMP sidecarů nezapisují: jsou organizace knihovny, ne vlastnost fotky – chrání je
 denní záloha databáze (database.backup_database) stejně jako osoby.
 """
+from i18n import tr
 from datetime import datetime
 
 SMART_FILTERS = ("all", "favorites", "photo", "video")
@@ -66,7 +67,7 @@ def _now():
 def _clean_name(name):
     n = " ".join((name or "").split())
     if not n:
-        raise ValueError("Album musí mít název")
+        raise ValueError(tr("albums-error-name-required"))
     return n[:120]
 
 
@@ -75,7 +76,7 @@ def _check_parent(conn, parent_id):
         return None
     row = conn.execute("SELECT kind FROM albums WHERE id = ?", (parent_id,)).fetchone()
     if not row or row[0] != "folder":
-        raise ValueError("Cílem musí být složka alb")
+        raise ValueError(tr("albums-error-target-folder"))
     return int(parent_id)
 
 
@@ -102,7 +103,7 @@ def create_album(conn, name, media_ids=(), parent_id=None):
 def create_smart_album(conn, name, query, filter_key="all", parent_id=None):
     q = " ".join((query or "").split())
     if not q:
-        raise ValueError("Chytré album potřebuje hledaný výraz")
+        raise ValueError(tr("albums-error-smart-query"))
     if filter_key not in SMART_FILTERS:
         filter_key = "all"
     return _insert(conn, name, "smart", parent_id, q, filter_key)
@@ -154,13 +155,13 @@ def set_cover(conn, album_id, media_id):
     """Vlastní obálka alba; None = automatická (nejnovější položka)."""
     if media_id is not None and not conn.execute(
             "SELECT 1 FROM album_items WHERE album_id = ? AND media_id = ?", (album_id, int(media_id))).fetchone():
-        raise ValueError("Obálka musí být položka alba")
+        raise ValueError(tr("albums-error-cover-member"))
     conn.execute("UPDATE albums SET cover_media_id = ? WHERE id = ?", (media_id, album_id))
 
 
 def set_sort_mode(conn, album_id, mode):
     if mode not in SORT_MODES:
-        raise ValueError(f"Neznámé řazení: {mode}")
+        raise ValueError(f'Unknown sort order: {mode}')
     if mode == "custom":                          # ruční pořadí začíná od toho, co je vidět
         _renumber_items(conn, album_id, item_ids(conn, album_id, include_all=True))
     conn.execute("UPDATE albums SET sort_mode = ? WHERE id = ?", (mode, album_id))
@@ -225,7 +226,7 @@ def move_node(conn, node_id, parent_id=None, before_id=None):
     node_id = int(node_id)
     parent_id = _check_parent(conn, parent_id)
     if parent_id is not None and node_id in {a for a, _ in ancestors(conn, parent_id)}:
-        raise ValueError("Složku nelze přesunout do sebe samé")
+        raise ValueError(tr("albums-error-move-into-self"))
     siblings = [r[0] for r in conn.execute(
         "SELECT id FROM albums WHERE parent_id IS ? AND id != ? ORDER BY COALESCE(position, 2147483647), id",
         (parent_id, node_id)).fetchall()]
@@ -345,8 +346,8 @@ def albums_for_media(conn, media_id):
 
 
 def czech_albums(n):
-    return f"{n} {'album' if n == 1 else 'alba' if 2 <= n <= 4 else 'alb'}"
+    return tr("count-albums", count=n)
 
 
 def czech_folder_summary(n):
-    return f"{n} {'album' if n == 1 else 'alba' if 2 <= n <= 4 else 'alb'}" if n else "Prázdná složka"
+    return tr("count-albums", count=n) if n else tr("albums-empty-folder")

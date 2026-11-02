@@ -4,6 +4,7 @@ Záznamy jsou řádky MEDIA_COLUMNS (id, název, cesta, typ, párové video, ná
 Seskupení zachovává pořadí záznamů (knihovna je řazená od nejnovějších). Obálka = uložený
 náhled první položky skupiny. Klik na rok otevře jeho měsíce, klik na měsíc mřížku na tom místě.
 """
+from i18n import N_, capitalize, fmt_date, tr
 import os
 
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, pyqtSignal
@@ -14,28 +15,26 @@ import motion
 import tokens
 from ui_controls import palette_for, smooth_rect_path
 
-MONTHS = ["Leden", "Únor", "Březen", "Duben", "Květen", "Červen", "Červenec", "Srpen", "Září",
-          "Říjen", "Listopad", "Prosinec"]
-MONTHS_GENITIVE = ["ledna", "února", "března", "dubna", "května", "června", "července", "srpna", "září",
-                   "října", "listopadu", "prosince"]
-WEEKDAYS = ["pondělí", "úterý", "středa", "čtvrtek", "pátek", "sobota", "neděle"]
-NO_DATE = "Bez data"
+NO_DATE = N_("moments-no-date")
 CARD_SIZE = {"years": QSize(320, 220), "months": QSize(248, 176)}
 SPACING = 16
 
 
 def _items(n):
-    return "1 položka" if n == 1 else (f"{n} položky" if 2 <= n <= 4 else f"{n} položek")
+    return tr("count-items", count=n)
 
 
 def czech_day(date_text):
-    """'2025-06-14 10:22:01' -> 'Sobota 14. června 2025' (bez data -> '')."""
+    """'2025-06-14 10:22:01' -> 'Saturday, June 14, 2025' / 'Sobota 14. června 2025' (bez data -> '')."""
     from datetime import datetime
     try:
         d = datetime.strptime(str(date_text)[:10], "%Y-%m-%d")
     except (TypeError, ValueError):
         return ""
-    return f"{WEEKDAYS[d.weekday()].capitalize()} {d.day}. {MONTHS_GENITIVE[d.month - 1]} {d.year}"
+    return capitalize(fmt_date(d, "long_weekday"))
+
+
+day_label = czech_day          # jazykově neutrální název
 
 
 def group_records(records, by):
@@ -50,11 +49,11 @@ def group_records(records, by):
         g = index.get(key)
         if g is None:
             if not key:
-                title = NO_DATE
+                title = tr(NO_DATE)
             elif by == "years":
                 title = key
             else:
-                title = f"{MONTHS[int(key[5:7]) - 1]} {key[:4]}"
+                title = fmt_date(key[:7] + "-01", "month_year")
             g = {"key": key, "title": title, "count": 0, "cover": None}
             index[key] = g
             groups.append(g)

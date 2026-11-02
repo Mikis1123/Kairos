@@ -55,7 +55,7 @@ def encode_embedding(vec):
     """ndarray -> bytes (float32, normalizovaný, little-endian)."""
     arr = np.asarray(vec, dtype=np.float32).flatten()
     if arr.size not in _dims():
-        raise ValueError(f"Embedding má {arr.size} dimenzí, očekáváno {EMBED_DIM}")
+        raise ValueError(f'Embedding has {arr.size} dimensions, expected {EMBED_DIM}')
     norm = float(np.linalg.norm(arr))
     if norm > 0:
         arr = arr / norm
@@ -75,7 +75,7 @@ class _RestrictedUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
         if (module, name) in _ALLOWED_PICKLE_GLOBALS:
             return super().find_class(module, name)
-        raise pickle.UnpicklingError(f"Zakázaný objekt v pickle: {module}.{name}")
+        raise pickle.UnpicklingError(f'Forbidden object in pickle: {module}.{name}')
 
 
 def _dims():
@@ -368,6 +368,7 @@ def z_profile(dim):
 SEARCH_FRAME_Z_PENALTY = 0.25
 
 CONCEPT_BANK = (
+    # i18n-ok: search vocabulary (CLIP prompts)
     "pes kočka kůň kráva pták ryba hmyz auto autobus vlak letadlo loď kolo motorka silnice most "
     "budova dům město ulice kostel hrad zámek věž zeď okno dveře pokoj kuchyně postel stůl židle "
     "počítač telefon televize kniha papír jídlo pizza dort ovoce zelenina nápoj káva pivo víno "
@@ -375,6 +376,7 @@ CONCEPT_BANK = (
     "pláž moře jezero řeka voda vodopád les strom tráva louka květiny zahrada park pole nebe mraky "
     "slunce noc sníh led déšť oheň světlo tma fotbal sport hudba koncert oslava "
     "obraz socha muzeum obchod restaurace kancelář škola nemocnice letiště nádraží stan "
+    # i18n-ok: search vocabulary (CLIP prompts)
     "dřevo kov sklo plast hračka zbraň peníze text dokument").split() + ["západ slunce", "snímek obrazovky"]
 
 _bank_cache = {"model": None, "vectors": None}

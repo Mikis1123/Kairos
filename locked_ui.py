@@ -8,6 +8,7 @@
 * IdleWatcher – 2 minuty bez myši / klávesnice -> zamknout.
 * LockedFolderController – drží to pohromadě; MainWindow volá request_unlock() / lock().
 """
+from i18n import N_, tr
 import ctypes
 import os
 
@@ -17,7 +18,7 @@ from PyQt6.QtWidgets import QApplication, QDialog, QHBoxLayout, QLabel, QLineEdi
 import locked_folder
 from ui_controls import KButton
 
-HELLO_MESSAGE = "Kairos: odemknout složku Skryté"
+HELLO_MESSAGE = N_("locked-hello-prompt")
 
 
 # ── ochrana obrazovky ────────────────────────────────────────────────────────────────────
@@ -167,9 +168,9 @@ class IdleWatcher(QObject):
 class HelloWorker(QThread):
     done = pyqtSignal(str)
 
-    def __init__(self, message=HELLO_MESSAGE, parent=None):
+    def __init__(self, message=None, parent=None):
         super().__init__(parent)
-        self.message = message
+        self.message = message or tr(HELLO_MESSAGE)
 
     def run(self):
         self.done.emit(locked_folder.hello_verify(self.message))
@@ -203,28 +204,25 @@ class UnlockSheet(QDialog):
         self._hello_worker = None
         self.setModal(True)
         self.setMinimumWidth(420)
-        self.setWindowTitle("Skryté")
+        self.setWindowTitle(tr("nav-locked"))
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 22, 24, 18)
         lay.setSpacing(10)
-        titles = {"setup": "Nastavit složku Skryté", "unlock": "Skryté 🔒", "change": "Změnit heslo ke Skrytým"}
+        titles = {"setup": tr("locked-setup-title"), "unlock": tr("nav-locked"), "change": tr("locked-change-title")}
         lay.addWidget(_label(f"<b style='font-size:15px'>{titles[mode]}</b>", "sheetTitle"))
         bodies = {
-            "setup": "Fotky ve Skrytých nejsou v knihovně, hledání, tvářích, na mapě ani v sestřizích a "
-                     "jejich miniatury se ukládají šifrovaně. Odemknete je přes Windows Hello nebo heslem. "
-                     "Heslo nelze obnovit – bez něj (a bez Windows Hello) se ke skrytým miniaturám "
-                     "nedostanete. Originály zůstávají ve svých složkách.",
-            "unlock": ("Ověřte se pomocí Windows Hello, nebo zadejte heslo." if hello
-                       else "Zadejte heslo ke složce Skryté."),
-            "change": "Zadejte současné a nové heslo (aspoň 6 znaků).",
+            "setup": tr("locked-setup-body"),
+            "unlock": (tr("locked-unlock-body-hello") if hello
+                       else tr("locked-unlock-body")),
+            "change": tr("locked-change-body"),
         }
         lay.addWidget(_label(bodies[mode], "sheetBody"))
         self.edit_old = self.edit_new = self.edit_repeat = None
         if mode in ("unlock", "change"):
-            self.edit_old = self._field("Současné heslo" if mode == "change" else "Heslo", lay)
+            self.edit_old = self._field(tr("locked-current-passcode") if mode == "change" else tr("locked-passcode"), lay)
         if mode in ("setup", "change"):
-            self.edit_new = self._field(f"Nové heslo (aspoň {locked_folder.PASSCODE_MIN} znaků)", lay)
-            self.edit_repeat = self._field("Nové heslo znovu", lay)
+            self.edit_new = self._field(tr("locked-new-passcode", PASSCODE_MIN=locked_folder.PASSCODE_MIN), lay)
+            self.edit_repeat = self._field(tr("locked-new-passcode-again"), lay)
         self.lbl_error = _label("", "sheetBody")
         self.lbl_error.setStyleSheet("color: #ff6b6b;")
         self.lbl_error.hide()
@@ -232,14 +230,14 @@ class UnlockSheet(QDialog):
         row = QHBoxLayout()
         self.btn_hello = None
         if mode == "unlock" and hello:
-            self.btn_hello = KButton("Windows Hello")
+            self.btn_hello = KButton(tr("locked-windows-hello"))
             self.btn_hello.clicked.connect(self.start_hello)
             row.addWidget(self.btn_hello)
         row.addStretch()
-        cancel = KButton("Zrušit")
+        cancel = KButton(tr("action-cancel"))
         cancel.clicked.connect(self.reject)
         row.addWidget(cancel)
-        actions = {"setup": "Nastavit", "unlock": "Odemknout", "change": "Změnit"}
+        actions = {"setup": "Nastavit", "unlock": "Odemknout", "change": tr("action-change")}
         self.btn_ok = KButton(actions[mode])
         self.btn_ok.setObjectName("btnSave")
         self.btn_ok.setDefault(True)
@@ -273,7 +271,7 @@ class UnlockSheet(QDialog):
             self.edit_old.setEnabled(wait <= 0)
         self.btn_ok.setEnabled(wait <= 0)
         if wait > 0:
-            self._error(f"Příliš mnoho pokusů. Další za {wait} s.")
+            self._error(tr("locked-too-many-attempts", wait=wait))
             self._lockout_timer.start()
         elif self._lockout_timer.isActive():
             self._lockout_timer.stop()
@@ -296,15 +294,15 @@ class UnlockSheet(QDialog):
             try:
                 self.vault.unlock_with_os()
             except locked_folder.VaultError as e:
-                self._error(f"{e}. Zadejte heslo.")
+                self._error(tr("locked-error-enter-passcode", error=str(e)))
                 return
             self.method = "hello"
             self.accept()
             return
         if result == locked_folder.HELLO_UNAVAILABLE:
-            self._error("Windows Hello není k dispozici – zadejte heslo.")
+            self._error(tr("locked-hello-unavailable"))
         elif result == locked_folder.HELLO_FAILED:
-            self._error("Ověření se nepodařilo – zadejte heslo.")
+            self._error(tr("locked-verify-failed"))
         if self.edit_old is not None:
             self.edit_old.setFocus()
 
@@ -316,7 +314,7 @@ class UnlockSheet(QDialog):
             if self.mode == "setup":
                 new, rep = self.edit_new.text(), self.edit_repeat.text()
                 if new != rep:
-                    self._error("Hesla se neshodují.")
+                    self._error(tr("locked-mismatch"))
                     return
                 self.vault.setup(new)
                 self.method = "passcode"
@@ -331,22 +329,22 @@ class UnlockSheet(QDialog):
                     self.accept()
                 else:
                     self.edit_old.selectAll()
-                    self._error("Špatné heslo.")
+                    self._error(tr("locked-wrong"))
                     self._sync_lockout()
             else:
                 new, rep = self.edit_new.text(), self.edit_repeat.text()
                 if new != rep:
-                    self._error("Nová hesla se neshodují.")
+                    self._error(tr("locked-new-mismatch"))
                     return
                 if self.vault.change_passcode(self.edit_old.text(), new):
                     self.method = "passcode"
                     self.accept()
                 else:
-                    self._error("Současné heslo nesouhlasí.")
+                    self._error(tr("locked-current-wrong"))
                     self._sync_lockout()
         except locked_folder.LockedOut as e:
             self.btn_ok.setEnabled(True)
-            self._error(f"Příliš mnoho pokusů. Další za {e.seconds} s.")
+            self._error(tr("locked-too-many-attempts-seconds", seconds=e.seconds))
             self._sync_lockout()
         except locked_folder.VaultError as e:
             self.btn_ok.setEnabled(True)

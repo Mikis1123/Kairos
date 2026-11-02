@@ -30,6 +30,9 @@ if __name__ == "__main__":
     import data_migration
     data_migration.ensure_ready()
 
+import i18n
+from i18n import N_, fmt_number, tr
+
 from paths import (
     BASE_DIR, RESOURCE_DIR, THUMB_DIR as CACHE_DIR, FFMPEG_PATH as DEFAULT_FFMPEG, resolve_face_path,
 )
@@ -958,9 +961,9 @@ class ApplePhotoDelegate(QStyledItemDelegate):
         if not show_text:
             return
         if state == THUMB_MISSING_FILE:
-            reason = "Soubor nedostupný"
+            reason = tr("grid-file-unavailable")
         else:
-            reason = "Video bez náhledu" if is_video else "Náhled nedostupný"
+            reason = tr("grid-video-no-thumb") if is_video else tr("grid-thumb-unavailable")
         text_w = rect.width() - 16
         f = QFont("Segoe UI")
         f.setPixelSize(max(10, int(side * 0.065)))
@@ -1613,11 +1616,12 @@ class AppleGridView(QListView):
 
 
 def _czech_columns(n):
-    return f"{n} sloupec" if n == 1 else (f"{n} sloupce" if 2 <= n <= 4 else f"{n} sloupců")
+    return tr("count-columns", count=n)
 
 
 # ── P3.1 Async person cards ───────────────────────────────────────────────────
 
+# i18n-ok: DB default person name (localized at display)
 UNKNOWN_PERSON = "Neznámá osoba"
 PERSON_CARD_W, PERSON_CARD_H = 176, 228
 PERSON_AVATAR_RATIO = 0.78           # průměr avataru / šířka karty
@@ -1625,40 +1629,25 @@ PERSON_GRID_SPACING = 16
 
 
 def _czech_photo_count(n):
-    n = int(n or 0)
-    if n == 1:
-        return "1 fotka"
-    if 2 <= n <= 4:
-        return f"{n} fotky"
-    return f"{n} fotek"
+    return tr("count-photos", count=int(n or 0))
 
 
 def _czech_item_count(n):
-    n = int(n or 0)
-    if n == 1:
-        return "1 položka"
-    if 2 <= n <= 4:
-        return f"{n} položky"
-    return f"{n} položek"
+    return tr("count-items", count=int(n or 0))
 
 
 def _czech_result_count(n):
-    n = int(n or 0)
-    if n == 1:
-        return "1 shoda"
-    if 2 <= n <= 4:
-        return f"{n} shody"
-    return f"{n} shod"
+    return tr("count-results", count=int(n or 0))
 
 
 def _format_date_range(start, end):
-    """'2024-07-01 10:00' / '2024-07-03' -> '1. 7. 2024 – 3. 7. 2024' (jeden den = jedno datum)."""
+    """'2024-07-01 10:00' / '2024-07-03' -> '7/1/2024 – 7/3/2024' / '1. 7. 2024 – 3. 7. 2024' (jeden den = jedno datum)."""
     def fmt(value):
         try:
             d = datetime.strptime(str(value)[:10], "%Y-%m-%d")
         except (TypeError, ValueError):
             return ""
-        return f"{d.day}. {d.month}. {d.year}"
+        return i18n.fmt_date(d, "short")
     a, b = fmt(start), fmt(end)
     if a and b and a != b:
         return f"{a} – {b}"
@@ -1666,6 +1655,7 @@ def _format_date_range(start, end):
 
 
 def _person_initials(name):
+    # i18n-ok: DB default person name check
     if not name or name.startswith("Neznám"):
         return ""
     parts = [p for p in name.split() if p[:1].isalnum()]
@@ -1865,8 +1855,7 @@ class PersonCard(QWidget):
         self._hover_anim = motion.Tween(0.0, lambda v: self.update(), self)
         self.setFixedSize(PERSON_CARD_W, PERSON_CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(f"{self.name}\n{_czech_photo_count(count)}\n"
-                        "Ctrl+klik = vybrat více osob ke sloučení")
+        self.setToolTip(f"{self.name}\n{_czech_photo_count(count)}\n" + tr("people-card-merge-hint"))
         self.setAccessibleName(f"{self.name}, {_czech_photo_count(count)}")
 
     def set_avatar(self, image: QImage):
@@ -1948,18 +1937,18 @@ class MergeSuggestionBar(QFrame):
         row.addWidget(self.lbl_b)
         texts = QVBoxLayout()
         texts.setSpacing(2)
-        self.lbl_question = QLabel("Je to stejná osoba?")
+        self.lbl_question = QLabel(tr("faces-same-person-q"))
         self.lbl_question.setStyleSheet("font-size:15px; font-weight:600; color:#F5F5F7;")
         self.lbl_detail = QLabel()
         self.lbl_detail.setStyleSheet("font-size:12px; color:#8E8E93;")
         texts.addWidget(self.lbl_question)
         texts.addWidget(self.lbl_detail)
         row.addLayout(texts, 1)
-        self.btn_yes = QPushButton("Ano, sloučit")
+        self.btn_yes = QPushButton(tr("faces-yes-merge"))
         self.btn_yes.setObjectName("btn_primary")
-        self.btn_no = QPushButton("Ne")
-        self.btn_skip = QPushButton("Další")
-        self.btn_skip.setToolTip("Rozhodnout později")
+        self.btn_no = QPushButton(tr("common-no"))
+        self.btn_skip = QPushButton(tr("common-next"))
+        self.btn_skip.setToolTip(tr("faces-decide-later"))
         for b in (self.btn_yes, self.btn_no, self.btn_skip):
             b.setMinimumHeight(30)
             row.addWidget(b)
@@ -1999,8 +1988,7 @@ class MergeSuggestionBar(QFrame):
         name_a = s["name_a"] or UNKNOWN_PERSON
         name_b = s["name_b"] or UNKNOWN_PERSON
         self.lbl_detail.setText(
-            f"{name_a} ({s['faces_a']}) a {name_b} ({s['faces_b']}) · "
-            f"podobnost {round(s['similarity'] * 100)} % · návrh {self.index + 1} z {len(self.suggestions)}")
+            tr("faces-merge-suggestion", name_a=name_a, faces_a=s['faces_a'], name_b=name_b, faces_b=s['faces_b'], value=round(s['similarity'] * 100), value2=self.index + 1, count=len(self.suggestions)))
         self.show()
 
     def _emit(self, signal):
@@ -2113,7 +2101,7 @@ def create_event_card(cover_thumb_path, title, date_str, item_count, target_w=29
     painter.setPen(QColor("#D1D1D6"))
     painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
     painter.drawText(16, target_h - 22, target_w - 32, 18, Qt.AlignmentFlag.AlignLeft,
-                     f"{date_str}  •  {item_count} položek")
+                     f"{date_str}  •  " + tr("count-items", count=item_count))
     painter.end()
     return result
 
@@ -2125,12 +2113,12 @@ class CircularProgressWidget(QWidget):
         super().__init__(parent)
         self.setFixedSize(220, 260)
         self._progress = 0
-        self._status_text = "Načítání..."
+        self._status_text = tr("common-loading")
         self._elapsed_sec = 0
         self._total_est_sec = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 185, 15, 15)
-        self.btn_cancel = QPushButton("Zrušit import")
+        self.btn_cancel = QPushButton(tr("import-cancel"))
         self.btn_cancel.setStyleSheet("""
             QPushButton { background-color:#3A3A3C; color:#FFFFFF; border:none;
                 border-radius:8px; font-size:12px; font-weight:bold; padding:8px; }
@@ -2230,7 +2218,7 @@ class SiglipDownload(QThread):
                 self.progress.emit(got / 1e6, total / 1e6)
         try:
             ok = siglip_engine.download(report, should_stop=lambda: not self._running)
-            self.done.emit(bool(ok), "" if ok else "přerušeno")
+            self.done.emit(bool(ok), "" if ok else DOWNLOAD_INTERRUPTED)
         except Exception as e:
             self.done.emit(False, str(e))
 
@@ -2468,7 +2456,7 @@ class BackgroundAIDaemon(QThread):
         for i, (media_id, file_path, thumb_path, media_type, sig) in enumerate(rows):
             if self._yield():
                 return
-            self._status(f"Připravuji chytré hledání ({i + 1}/{total})...")
+            self._status(tr("status-preparing-search", done=i + 1, total=total))
             src = thumb_path if thumb_path and os.path.exists(thumb_path) else (
                 file_path if media_type != "video" and cloud_files.local_ok(file_path) else None)
             emb = compute_image_embedding(src) if src else None
@@ -2555,7 +2543,9 @@ class BackgroundAIDaemon(QThread):
         for i, (media_id, path, sig) in enumerate(rows):
             if self._yield():
                 return
-            self._status(f"Připravuji hledání ve videích ({i + 1}/{total})...")
+            if not cloud_files.local_ok(path):
+                continue                      # Gate 0: odpojený disk / jen v cloudu
+            self._status(tr("status-preparing-video-search", done=i + 1, total=total))
             import ai_engine
             # ffmpeg ve strážci: během přehrávání / gest stojí (dřív běžel naplno vedle videa)
             frames = video_frames.extract_frames(path, should_stop=lambda: not self._running,
@@ -2585,8 +2575,8 @@ class BackgroundAIDaemon(QThread):
             for path, mtype in preview_build_order():
                 if self._yield():
                     return
-                if preview_cache.get_preview(path, touch=False) is None:
-                    self._status("Připravuji náhledy fotek...")
+                if preview_cache.get_preview(path, touch=False) is None and cloud_files.local_ok(path):
+                    self._status(tr("status-preparing-thumbs"))
                     preview_cache.build_preview(path, mtype)
             preview_cache.enforce_budget(self.preview_budget_mb)
         except Exception as e:
@@ -2599,12 +2589,12 @@ class BackgroundAIDaemon(QThread):
             pending = face_engine.count_faces_without_frontality()
             if pending:
                 face_engine.ensure_ready()
-                self._status(f"Kontroluji obličeje ({pending})...", force=True)
+                self._status(tr("status-checking-faces", count=pending), force=True)
                 face_engine.analyze_face_crops(should_stop=self._yield)
             # Anatomická brána poslala do karantény obličej, který patří osobě (týl hlavy, kámen)
             # -> přeshlukovat, aby se z nich nestaly „osoby“
             if self._running and count_quarantined_assigned():
-                self._status("Přeshlukovávám obličeje...", force=True)
+                self._status(tr("people-regrouping"), force=True)
                 strict_recluster_faces(threshold=self.face_threshold, merge_threshold=self.merge_threshold)
                 self.people_updated.emit()
             if self._running and refresh_person_covers():
@@ -2615,7 +2605,7 @@ class BackgroundAIDaemon(QThread):
     def _repair_face_crops(self):
         """Jednorázově přeřízne deformované (protažené) ořezy obličejů u okraje fotek."""
         try:
-            self._status("Kontroluji ořezy obličejů...", force=True)
+            self._status(tr("status-checking-face-crops"), force=True)
             fixed = face_engine.repair_stretched_face_crops(should_stop=self._yield)
             if self._running:
                 fixed += face_engine.recolor_face_crops(should_stop=self._yield)   # Stage 2: barvy
@@ -2627,7 +2617,7 @@ class BackgroundAIDaemon(QThread):
     def _repair_thumbnails(self):
         created = repair_missing_thumbnails(
             should_stop=self._yield,
-            progress=lambda i, n: self._status(f"Obnovuji náhledy ({i}/{n})..."),
+            progress=lambda i, n: self._status(tr("status-refreshing-thumbs", i=i, n=n)),
         )
         if created and self._running:
             self.thumbs_repaired.emit()
@@ -2637,7 +2627,7 @@ class BackgroundAIDaemon(QThread):
         try:
             refresh_phashes(
                 should_stop=self._yield,
-                progress=lambda i, n: self._status(f"Počítám otisky pro duplicity ({i}/{n})..."),
+                progress=lambda i, n: self._status(tr("status-fingerprints", i=i, n=n)),
             )
         except Exception as e:
             print(f"[pHash] {e}")
@@ -2662,9 +2652,9 @@ class BackgroundAIDaemon(QThread):
         for idx, (media_id, file_path) in enumerate(pending):
             if self._yield():
                 return
-            if not file_path or not os.path.exists(file_path):
-                continue
-            self._status(f"Analýza tváří ({idx+1}/{total})...")
+            if not cloud_files.local_ok(file_path):
+                continue        # odpojený disk / jen v cloudu – zkusí se příště, nic se nestahuje
+            self._status(tr("status-analyzing-faces", done=idx + 1, total=total))
             try:
                 faces = face_engine.detect_and_extract_faces(media_id, file_path)
                 save_faces_for_media(media_id, faces)
@@ -2676,7 +2666,7 @@ class BackgroundAIDaemon(QThread):
             except Exception as e:
                 print(f"[AI] {file_path}: {e}")
         if new_faces_found and self._running:
-            self._status("Shlukovávám obličeje...", force=True)
+            self._status(tr("status-clustering-faces"), force=True)
             try:
                 strict_recluster_faces(threshold=self.face_threshold,
                                        merge_threshold=self.merge_threshold)
@@ -2700,7 +2690,9 @@ class BackgroundAIDaemon(QThread):
         for i, (media_id, path, sig) in enumerate(rows):
             if self._yield():
                 break
-            self._status(f"Čtu text na fotkách ({i + 1}/{total})...")
+            self._status(tr("status-reading-text", done=i + 1, total=total))
+            if path and os.path.exists(path) and not cloud_files.local_ok(path):
+                continue                      # jen v cloudu: neukládat prázdný text, zkusit později
             text = ocr_engine.recognize_file(path) if path and os.path.exists(path) else ""
             batch.append((media_id, text, sig))
             if len(batch) >= 25:
@@ -2715,7 +2707,7 @@ class BackgroundAIDaemon(QThread):
             conn = get_connection()
             try:
                 if smile.pending_faces(conn, limit=1):
-                    self._status("Hledám úsměvy pro sestřihy...")
+                    self._status(tr("status-smiles"))
                     smile.score_faces(conn, should_stop=self._yield)
             finally:
                 conn.close()
@@ -2739,7 +2731,7 @@ class BackgroundAIDaemon(QThread):
         for k in range(0, total, SIGLIP_BATCH):
             if self._yield():
                 return
-            self._status(f"Zpřesňuji hledání ({min(total, k + SIGLIP_BATCH)}/{total})...")
+            self._status(tr("status-refining-search", done=min(total, k + SIGLIP_BATCH), total=total))
             images, meta = [], []
             for media_id, file_path, thumb_path, media_type, sig in rows[k:k + SIGLIP_BATCH]:
                 src = thumb_path if thumb_path and os.path.exists(thumb_path) else (
@@ -2875,7 +2867,9 @@ class ReviewView(QWidget):
 # ── P3.5 Duplicate Review ─────────────────────────────────────────────────────
 
 class DuplicateReviewView(ReviewView):
-    title = "Duplicitní fotografie"
+    @property
+    def title(self):
+        return tr("duplicates-title")
 
     def __init__(self, pairs, parent=None):
         super().__init__(parent)
@@ -2923,32 +2917,30 @@ class DuplicateReviewView(ReviewView):
         img_row.addLayout(right_col)
         root.addLayout(img_row, 1)
         # Doporučené ponechání (A = nejostřejší) je jediná plná akce; ostatní tlumené sklo
-        self.btn_keep_a = self._review_button("Ponechat levé", "primary", "Pravou položku přesune do koše")
-        self.btn_keep_b = self._review_button("Ponechat pravé", "secondary", "Levou položku přesune do koše")
-        self.btn_keep_both = self._review_button("Ponechat obě", "secondary",
-                                                 "Nejsou to duplicity – pár se už nenabídne")
-        self.btn_skip = self._review_button("Přeskočit", "ghost")
+        self.btn_keep_a = self._review_button(tr("duplicates-keep-left"), "primary", tr("duplicates-keep-left-tooltip"))
+        self.btn_keep_b = self._review_button(tr("duplicates-keep-right"), "secondary", tr("duplicates-keep-right-tooltip"))
+        self.btn_keep_both = self._review_button(tr("duplicates-keep-both"), "secondary",
+                                                 tr("duplicates-keep-both-tooltip"))
+        self.btn_skip = self._review_button(tr("common-skip"), "ghost")
         self.btn_keep_a.clicked.connect(lambda: self._action("keep_a"))
         self.btn_keep_b.clicked.connect(lambda: self._action("keep_b"))
         self.btn_keep_both.clicked.connect(lambda: self._action("keep_both"))
         self.btn_skip.clicked.connect(lambda: self._action("skip"))
         root.addLayout(self._action_row(self.btn_keep_a, self.btn_keep_b, self.btn_keep_both, self.btn_skip))
         self.lbl_hint = self._review_label("callout", "text_tertiary")
-        self.lbl_hint.setText("Nechtěná položka se přesune do koše (Fotografie › Smazané). "
-                              "Soubor na disku zůstává a lze ji obnovit. "
-                              "Klávesy: ← / → předchozí / další pár, Ctrl+Z vrátit, Esc zavřít.")
+        self.lbl_hint.setText(tr("duplicates-hint"))
         self.lbl_hint.setWordWrap(True)
         root.addWidget(self.lbl_hint)
         nav_row = QHBoxLayout()
         nav_row.setSpacing(8)
-        self.btn_undo = KButton("Vrátit", variant="ghost", compact=True)
-        self.btn_undo.setToolTip("Vrátí poslední rozhodnutí (Ctrl+Z)")
+        self.btn_undo = KButton(tr("action-undo"), variant="ghost", compact=True)
+        self.btn_undo.setToolTip(tr("action-undo-decision-tooltip"))
         self.btn_undo.setEnabled(False)
         self.btn_undo.clicked.connect(self._undo)
         nav_row.addWidget(self.btn_undo)
         nav_row.addStretch(1)
-        self.btn_prev = KButton("‹ Předchozí", variant="secondary", compact=True)
-        self.btn_next = KButton("Další ›", variant="secondary", compact=True)
+        self.btn_prev = KButton(tr("common-previous-arrow"), variant="secondary", compact=True)
+        self.btn_next = KButton(tr("common-next-arrow"), variant="secondary", compact=True)
         self.lbl_counter = self._review_label("callout", "text_secondary")
         self.lbl_counter.setMinimumWidth(64)
         self.btn_prev.clicked.connect(self._prev)
@@ -2966,7 +2958,7 @@ class DuplicateReviewView(ReviewView):
 
     def _load_pair(self):
         if not self.pairs:
-            self.lbl_title.setText("Žádné duplicity nenalezeny.")
+            self.lbl_title.setText(tr("duplicates-none"))
             return
         n = len(self.pairs)
         i = self.current_idx
@@ -2975,12 +2967,12 @@ class DuplicateReviewView(ReviewView):
         self.btn_next.setEnabled(self._neighbor(+1) is not None)
         pair = self.pairs[i]
         id_a, path_a, id_b, path_b, hamming = pair
-        self.lbl_title.setText(f"Možný duplikát  (Hammingova vzdálenost: {hamming})")
+        self.lbl_title.setText(tr("duplicates-possible", hamming=hamming))
         self._load_token += 1
         self._set_thumb(self.lbl_a, id_a, path_a)
         self._set_thumb(self.lbl_b, id_b, path_b)
         # A je z get_duplicate_pairs nejostřejší (pak největší) položka skupiny
-        self.lbl_info_a.setText((os.path.basename(path_a) if path_a else "?") + "  •  doporučeno ponechat")
+        self.lbl_info_a.setText((os.path.basename(path_a) if path_a else "?") + tr("duplicates-recommended"))
         self.lbl_info_b.setText(os.path.basename(path_b) if path_b else "?")
 
     def _set_thumb(self, label, media_id, path):
@@ -3007,9 +2999,9 @@ class DuplicateReviewView(ReviewView):
         elif thumb:
             label.set_source(QPixmap(thumb))
         elif has_original:
-            label.setText("Načítám…")
+            label.setText(tr("common-loading"))
         else:
-            label.setText("Obrázek nenalezen")
+            label.setText(tr("viewer-image-not-found"))
         if label is self.lbl_b:
             self._prefetch_following()
 
@@ -3070,7 +3062,7 @@ class DuplicateReviewView(ReviewView):
             else:
                 entry = ("skip", None)
         except Exception as e:
-            show_toast(self, f"Akci se nepodařilo uložit: {e}", "error")
+            show_toast(self, tr("error-action-save", e=e), "error")
             return
         if entry[0] == "trash":
             self._trashed.add(entry[1])
@@ -3091,7 +3083,7 @@ class DuplicateReviewView(ReviewView):
             elif kind == "dismiss":
                 undismiss_duplicate_pair(*data)
         except Exception as e:
-            show_toast(self, f"Akci se nepodařilo vrátit: {e}", "error")
+            show_toast(self, tr("error-action-undo", e=e), "error")
             return
         self.current_idx = idx
         self.btn_undo.setEnabled(bool(self._history))
@@ -3150,7 +3142,7 @@ class BorderlineReviewView(ReviewView):
         self.faces = list(borderline_faces)
         self.current_idx = 0
         self.assigned = 0          # kolik obličejů uživatel potvrdil (hlavní okno obnoví osoby)
-        self.title = f"Hraniční obličeje – {person_name}"
+        self.title = tr("faces-borderline-title-person", person_name=person_name)
         self._build_ui()
         self._load_face()
 
@@ -3169,7 +3161,7 @@ class BorderlineReviewView(ReviewView):
         left = QVBoxLayout()
         left.setSpacing(10)
         self.lbl_profile = self._review_label("caption", "text_tertiary")
-        self.lbl_profile.setText("PROFIL OSOBY")
+        self.lbl_profile.setText(tr("faces-profile-eyebrow"))
         self.img_profile = QLabel()
         self.img_profile.setFixedSize(200, 200)
         self.img_profile.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3179,7 +3171,7 @@ class BorderlineReviewView(ReviewView):
         right = QVBoxLayout()
         right.setSpacing(10)
         self.lbl_candidate_info = self._review_label("caption", "text_tertiary")
-        self.lbl_candidate_info.setText("KANDIDÁT")
+        self.lbl_candidate_info.setText(tr("faces-candidate-eyebrow"))
         self.img_candidate = QLabel()
         self.img_candidate.setFixedSize(200, 200)
         self.img_candidate.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3193,9 +3185,9 @@ class BorderlineReviewView(ReviewView):
         self.lbl_sim = self._review_label("body", "text_secondary")
         root.addWidget(self.lbl_sim)
         root.addSpacing(4)
-        self.btn_yes = self._review_button("Ano, je to stejná osoba", "primary")
-        self.btn_no = self._review_button("Ne, jiná osoba", "danger_outline")
-        self.btn_skip = self._review_button("Přeskočit", "ghost")
+        self.btn_yes = self._review_button(tr("faces-yes-same"), "primary")
+        self.btn_no = self._review_button(tr("faces-no-different"), "danger_outline")
+        self.btn_skip = self._review_button(tr("common-skip"), "ghost")
         self.btn_yes.clicked.connect(self._assign_yes)
         self.btn_no.clicked.connect(self._assign_no)
         self.btn_skip.clicked.connect(self._next)
@@ -3207,7 +3199,7 @@ class BorderlineReviewView(ReviewView):
 
     def _load_face(self):
         if not self.faces:
-            self.lbl_title.setText("Žádné hraniční obličeje.")
+            self.lbl_title.setText(tr("faces-borderline-none-short"))
             return
         n = len(self.faces)
         i = self.current_idx
@@ -3216,9 +3208,9 @@ class BorderlineReviewView(ReviewView):
         face_id = face.get("face_id")
         crop_path = face.get("crop_path", "")
         similarity = face.get("similarity", 0.0)
-        self.lbl_title.setText(f"Je tento obličej {self.person_name}?")
-        self.lbl_sim.setText(f"Podobnost {round(similarity * 100)} %  ·  hraniční pásmo")
-        self.lbl_candidate_info.setText(f"Obličej #{face_id}")
+        self.lbl_title.setText(tr("faces-is-this-person", person_name=self.person_name))
+        self.lbl_sim.setText(tr("faces-similarity-borderline", value=round(similarity * 100)))
+        self.lbl_candidate_info.setText(tr("faces-face-number", face_id=face_id))
         self._set_round_thumb(self.img_candidate, crop_path)
         try:
             from face_engine import reconstruct_best_crop_for_person
@@ -3243,7 +3235,7 @@ class BorderlineReviewView(ReviewView):
             assign_face_to_person(face_id, self.person_id)
             self.assigned += 1
         except Exception as e:
-            show_toast(self, f"Obličej se nepodařilo přiřadit: {e}", "error")
+            show_toast(self, tr("error-face-assign", e=e), "error")
             return
         self._next()
 
@@ -3296,10 +3288,11 @@ class FrameStatsOverlay(QLabel):
         if view is not None and getattr(self._window, "_map_loaded", False):
             view.page().runJavaScript("window.getFrameStats ? window.getFrameStats() : null", self._on_map_stats)
         prof = perf_profile.current()
-        lines = [f"Kairos · {prof.tier} · {prof.refresh_hz:.0f} Hz (rozpočet {prof.frame_budget_ms:.1f} ms)"]
+        lines = [f'Kairos · {prof.tier} · {fmt_number(prof.refresh_hz, 0)} Hz (budget {fmt_number(prof.frame_budget_ms, 1)} ms)']
         lines += [frame_meter.format_stats(s) for s in frame_meter.all_stats()]
         held = governor.get().reasons()
-        lines.append(f"pozadí: {'pozastaveno (' + ', '.join(held) + ')' if held else ('klid' if not governor.get().busy() else 'čeká na klid')}")
+        state = ("paused (" + ", ".join(held) + ")" if held else ("idle" if not governor.get().busy() else "waiting for idle"))
+        lines.append(f"background: {state}")          # vývojářský překryv výkonu (F12) – anglicky
         self.setText("\n".join(lines))
         self.adjustSize()
         self.move(self._window.width() - self.width() - 16, 56)
@@ -3316,10 +3309,14 @@ class FrameStatsOverlay(QLabel):
 # Styl hlavního okna se generuje z tokenů pro aktuální režim a zvýraznění (tokens.build_qss).
 
 
+DOWNLOAD_INTERRUPTED = "interrupted"   # stavový kód stahování (ne text pro uživatele)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config = load_config()
+        i18n.notifier().changed.connect(self._on_language_changed)   # Gate 1: přepnutí jazyka za běhu
         # Sprint 2: kurátorská data i do XMP sidecarů (zápis na pozadí, vypínatelné v Předvolbách)
         xmp_sync.install(get_connection, lambda: bool(self.config.get("xmp_sidecars", True)))
         self.setWindowTitle(brand.APP_NAME)
@@ -3452,8 +3449,8 @@ class MainWindow(QMainWindow):
     # Postranní panel (Kairos dávka 3): stránky stacku a kolekce = filtry mřížky Fotografie
     SIDEBAR_PAGES = ("photos", "people", "events", "map")
     COLLECTION_FILTERS = {"favorites": "favorites", "videos": "video", "trash": "trash", "hidden": "hidden"}
-    FILTER_TITLES = {"all": "Fotografie", "favorites": "Oblíbené", "photo": "Fotografie",
-                     "video": "Videa", "trash": "Smazané", "hidden": "Skryté"}
+    FILTER_TITLES = {"all": N_("nav-library"), "favorites": N_("nav-favorites"), "photo": N_("nav-library"),
+                     "video": N_("nav-videos"), "trash": N_("nav-trash"), "hidden": N_("nav-locked")}
 
     def _build_sidebar(self):
         sidebar = QWidget()
@@ -3470,15 +3467,16 @@ class MainWindow(QMainWindow):
         layout.addSpacing(6)
 
         self.sidebar_nav = SidebarNav([
-            NavSection("Knihovna"),
-            ("photos", "Fotografie", "photos"), ("people", "Osoby", "people"),
-            ("events", "Události", "events"), ("map", "Mapa", "map"),
-            NavSection("Kolekce"),
-            ("favorites", "Oblíbené", "heart"), ("videos", "Videa", "video"), ("albums", "Alba", "album"),
-            ("trash", "Smazané", "trash"),
-            ("hidden", "Skryté 🔒", "lock"),
-            NavSection("Pro vás"),
-            ("reels", "Sestřihy", "reel"), ("echoes", "Ozvěny", "echo"),
+            NavSection(tr("nav-section-browse")),
+            ("photos", tr("nav-library"), "photos"), ("people", tr("nav-people"), "people"),
+            ("events", tr("nav-events"), "events"), ("map", tr("nav-places"), "map"),
+            NavSection(tr("nav-section-collections")),
+            ("favorites", tr("nav-favorites"), "heart"), ("videos", tr("nav-videos"), "video"),
+            ("albums", tr("nav-albums"), "album"),
+            ("trash", tr("nav-trash"), "trash"),
+            ("hidden", tr("nav-locked"), "lock"),
+            NavSection(tr("nav-section-for-you")),
+            ("reels", tr("nav-reels"), "reel"), ("echoes", tr("nav-echoes"), "echo"),
         ])
         # Kairos Spark: kliknutí na hlavní záložku vyšle z jiskry loga světelný puls (~180 ms);
         # spojení před přepnutím stránky, ať animace startuje bez čekání na novou stránku
@@ -3493,19 +3491,19 @@ class MainWindow(QMainWindow):
         self._nav_buttons[0].setChecked(True)
         layout.addStretch()
 
-        self.btn_import = KButton("Importovat", icon="plus")
+        self.btn_import = KButton(tr("nav-import"), icon="plus")
         self.btn_import.setObjectName("btn_primary")
         self.btn_import.clicked.connect(self._start_import)
         layout.addWidget(guide.mark(self.btn_import, "import"))
         layout.addSpacing(4)
 
-        self.btn_settings = NavItem("Předvolby", icon="settings")
+        self.btn_settings = NavItem(tr("nav-settings"), icon="settings")
         self.btn_settings.setCheckable(False)
         self.btn_settings.clicked.connect(self._open_settings)
         layout.addWidget(self.btn_settings)
-        self.btn_guide = NavItem("Tipy a průvodce", icon="sparkle")
+        self.btn_guide = NavItem(tr("guide-title"), icon="sparkle")
         self.btn_guide.setCheckable(False)
-        self.btn_guide.setToolTip("Zkratky, mapa, tváře a hledání (F1)")
+        self.btn_guide.setToolTip(tr("nav-guide-tooltip"))
         self.btn_guide.clicked.connect(lambda: self.open_guide())
         layout.addWidget(guide.mark(self.btn_guide, "guide"))
 
@@ -3553,38 +3551,38 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
 
         self.lbl_photo_count = QLabel("")
-        toolbar, tb_layout, self.lbl_photos_title = self._make_toolbar("Fotografie", self.lbl_photo_count)
+        toolbar, tb_layout, self.lbl_photos_title = self._make_toolbar(tr("nav-library"), self.lbl_photo_count)
 
         # Kairos dávka 4: pohled podle času (Roky / Měsíce = karty, Dny = větší dlaždice s datem)
         self._time_view = "all"
         self._cell_before_days = None
-        self.time_switch = SegmentedControl([("Roky", "years"), ("Měsíce", "months"), ("Dny", "days"),
-                                             ("Vše", "all")], current="all")
+        self.time_switch = SegmentedControl([(tr("zoom-years"), "years"), (tr("zoom-months"), "months"), (tr("zoom-days"), "days"),
+                                             (tr("zoom-all"), "all")], current="all")
         self.time_switch.changed.connect(self._set_time_view)
         tb_layout.addWidget(guide.mark(self.time_switch, "time_switch"))
         tb_layout.addSpacing(10)
 
         # P3.2 Search bar
-        self.search_bar, self._search_icon = self._make_search("Hledat – třeba „moře“ nebo „pes“")
+        self.search_bar, self._search_icon = self._make_search(tr("search-placeholder"))
         self.search_bar.textChanged.connect(self._on_search_changed)
         tb_layout.addWidget(guide.mark(self.search_bar, "search"))
 
         self.btn_clear_search = KButton("", variant="ghost", compact=True, icon="x")
-        self.btn_clear_search.setToolTip("Vymazat hledání")
+        self.btn_clear_search.setToolTip(tr("search-clear"))
         self.btn_clear_search.clicked.connect(self._clear_search)
         self.btn_clear_search.setVisible(False)
         tb_layout.addWidget(self.btn_clear_search)
 
         tb_layout.addSpacing(6)
-        self.btn_slideshow = KButton("Prezentace", compact=True, icon="slideshow")
-        self.btn_slideshow.setToolTip("Prezentace přes celou obrazovku od vybrané fotky (S)")
+        self.btn_slideshow = KButton(tr("slideshow"), compact=True, icon="slideshow")
+        self.btn_slideshow.setToolTip(tr("slideshow-tooltip"))
         self.btn_slideshow.clicked.connect(lambda: self.start_slideshow_from_grid(self.grid_view))
         tb_layout.addWidget(self.btn_slideshow)
 
         # Sort combo
         # Kairos kapsle s nabídkou místo nativního QComboBox (stejné API)
-        self.sort_combo = MenuSelect(["Nejnovější", "Nejstarší", "Název A–Z", "Velikost"], icon="sort")
-        self.sort_combo.setAccessibleName("Řazení")
+        self.sort_combo = MenuSelect([tr("sort-newest"), tr("sort-oldest"), tr("sort-name"), tr("sort-size")], icon="sort")
+        self.sort_combo.setAccessibleName(tr("sort-a11y"))
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         tb_layout.addWidget(self.sort_combo)
 
@@ -3651,32 +3649,32 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
 
         self.lbl_people_count = QLabel("")
-        toolbar, tb_layout, _ = self._make_toolbar("Osoby", self.lbl_people_count)
+        toolbar, tb_layout, _ = self._make_toolbar(tr("nav-people"), self.lbl_people_count)
 
-        self.people_search, self._people_search_icon = self._make_search("Hledat osoby")
+        self.people_search, self._people_search_icon = self._make_search(tr("people-search-placeholder"))
         self.people_search.textChanged.connect(self._filter_people)
         tb_layout.addWidget(self.people_search)
         tb_layout.addSpacing(6)
 
         # Sloučení vybraných karet (Ctrl+klik) – vidět jen při výběru 2+ osob
-        self.btn_merge = KButton("Sloučit osoby", variant="primary", icon="merge")
-        self.btn_merge.setToolTip("Sloučí vybrané osoby do jedné (Ctrl+klik vybírá karty)")
+        self.btn_merge = KButton(tr("people-merge"), variant="primary", icon="merge")
+        self.btn_merge.setToolTip(tr("people-merge-tooltip"))
         self.btn_merge.clicked.connect(lambda: self._merge_people_ids(sorted(self._selected_people)))
         self.btn_merge.setVisible(False)
         tb_layout.addWidget(self.btn_merge)
 
-        self.btn_recluster = KButton("Přeshlukovat", compact=True, icon="refresh")
-        self.btn_recluster.setToolTip("Znovu seskupit nepotvrzené tváře (pojmenované osoby zůstanou)")
+        self.btn_recluster = KButton(tr("people-regroup"), compact=True, icon="refresh")
+        self.btn_recluster.setToolTip(tr("people-regroup-tooltip"))
         self.btn_recluster.clicked.connect(self._recluster_faces)
         tb_layout.addWidget(guide.mark(self.btn_recluster, "faces_recluster"))
 
-        self.btn_borderline = KButton("Hraniční", compact=True, icon="face_question")
-        self.btn_borderline.setToolTip("Tváře, u kterých si rozpoznávání není jisté")
+        self.btn_borderline = KButton(tr("people-borderline"), compact=True, icon="face_question")
+        self.btn_borderline.setToolTip(tr("people-borderline-tooltip"))
         self.btn_borderline.clicked.connect(self._open_borderline_review)
         tb_layout.addWidget(guide.mark(self.btn_borderline, "faces_borderline"))
 
-        self.btn_duplicates = KButton("Duplicity", compact=True, icon="duplicates")
-        self.btn_duplicates.setToolTip("Najít téměř stejné fotky")
+        self.btn_duplicates = KButton(tr("people-duplicates"), compact=True, icon="duplicates")
+        self.btn_duplicates.setToolTip(tr("people-duplicates-tooltip"))
         self.btn_duplicates.clicked.connect(self._open_duplicate_review)
         tb_layout.addWidget(guide.mark(self.btn_duplicates, "faces_duplicates"))
 
@@ -3710,9 +3708,8 @@ class MainWindow(QMainWindow):
         self._people_flow.setContentsMargins(0, 0, 0, 0)
         content.addWidget(self._people_grid)
 
-        self.people_empty = EmptyState("people", "Zatím žádné osoby",
-                                       "Tváře se rozpoznávají na pozadí po importu fotek. "
-                                       "Vše probíhá v počítači – nic se neodesílá.")
+        self.people_empty = EmptyState("people", tr("people-empty-title"),
+                                       tr("people-empty-body"))
         self.people_empty.hide()
         content.addWidget(self.people_empty, 1)
         content.addStretch(1)
@@ -3728,7 +3725,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         self.lbl_events_sub = QLabel("")
-        toolbar, _, _ = self._make_toolbar("Události", self.lbl_events_sub)
+        toolbar, _, _ = self._make_toolbar(tr("nav-events"), self.lbl_events_sub)
         layout.addWidget(toolbar)
 
         # Bento m\u0159\u00ed\u017eka karet (events_view.py) ve scrollovac\u00ed oblasti
@@ -3742,9 +3739,8 @@ class MainWindow(QMainWindow):
         self._events_scroll.setWidget(self._events_grid)
         layout.addWidget(self._events_scroll, 1)
 
-        self.lbl_events_empty = EmptyState("events", "Zatím žádné události",
-                                           "Výlety a dny se poskládají samy podle data a místa, "
-                                           "jakmile importujete fotky.")
+        self.lbl_events_empty = EmptyState("events", tr("events-empty-title"),
+                                           tr("events-empty-body"))
         self.lbl_events_empty.setVisible(False)
         layout.addWidget(self.lbl_events_empty, 1)
 
@@ -3800,9 +3796,8 @@ class MainWindow(QMainWindow):
                 self.map_view.load(QUrl.fromLocalFile(os.path.abspath(map_html)))
             layout.addWidget(self.map_view)
         except Exception as e:
-            layout.addWidget(EmptyState("map", "Mapa není dostupná",
-                                        f"Zobrazení mapy se nepodařilo spustit ({e}). Fotky ani jejich "
-                                        f"polohy se tím nemění."), 1)
+            layout.addWidget(EmptyState("map", tr("map-unavailable-title"),
+                                        tr("map-unavailable-body", e=e)), 1)
             self.map_view = None
 
         return page
@@ -3825,7 +3820,7 @@ class MainWindow(QMainWindow):
         try:
             init_db()
         except Exception as e:
-            QMessageBox.critical(self, "Chyba DB", f"Nelze inicializovat databázi:\n{e}")
+            QMessageBox.critical(self, tr("error-db-title"), tr("error-db-init", e=e))
             return
         try:
             fixed = relocate_face_paths()
@@ -3864,10 +3859,9 @@ class MainWindow(QMainWindow):
     def _on_new_media_found(self, count, folders):
         if count <= 0 or not folders:
             return
-        noun = "nová fotka" if count == 1 else ("nové fotky" if 2 <= count <= 4 else "nových fotek")
-        show_toast(self, f"Nalezeno {count} {noun}", "info", action_text="Importovat na pozadí",
+        show_toast(self, tr("import-found-new", count=count), "info", action_text=tr("import-in-background"),
                    on_action=lambda: self._import_in_background(folders), timeout_ms=None,
-                   dismiss_text="Přeskočit")
+                   dismiss_text=tr("common-skip"))
 
     def _import_in_background(self, folders):
         """Import bez přepnutí na stránku průběhu – složky jedna po druhé, na konci toast."""
@@ -3905,7 +3899,7 @@ class MainWindow(QMainWindow):
             self._refresh_memory()
             self._start_ai_daemon()
             if self._background_imported:
-                show_toast(self, f"Import dokončen: {_czech_item_count(self._background_imported)}", "success")
+                show_toast(self, tr("import-done", items=_czech_item_count(self._background_imported)), "success")
             self._background_imported = 0
             return
         if self._scanner and self._scanner.isRunning():
@@ -3951,11 +3945,11 @@ class MainWindow(QMainWindow):
         unwatched = [f for f in folders if not self._is_watched(f)]
         what = drop_import.describe(folders, files)
         if unwatched:
-            label = "Sledovat složku" if len(unwatched) == 1 else "Sledovat složky"
-            show_toast(self, f"Importuji {what} na pozadí", "info", action_text=label,
+            label = tr("watch-folders-action", count=len(unwatched))
+            show_toast(self, tr("import-importing-background", what=what), "info", action_text=label,
                        on_action=lambda: self.watch_folders(unwatched), timeout_ms=8000)
         else:
-            show_toast(self, f"Importuji {what} na pozadí", "info")
+            show_toast(self, tr("import-importing-background", what=what), "info")
 
     def watch_folders(self, folders):
         """Trvale sledovat: složka se přidá do knihovny a změny se naimportují samy."""
@@ -3970,7 +3964,7 @@ class MainWindow(QMainWindow):
         save_config(self.config)
         self.folder_watcher.set_roots(self._watched_roots())
         names = ", ".join(f"„{os.path.basename(f) or f}“" for f in folders)
-        show_toast(self, f"Sleduji {names} – nové fotky se přidají samy", "success")
+        show_toast(self, tr("watch-started", names=names), "success")
 
     def _on_watched_changed(self, roots):
         # sken je inkrementální: známé soubory přeskočí
@@ -4008,6 +4002,7 @@ class MainWindow(QMainWindow):
         try:
             conn = get_connection()
             c = conn.cursor()
+            # i18n-ok: SQL
             c.execute("""
                 SELECT p.id, p.name, p.cover_face_path,
                        COUNT(f.id) as face_count
@@ -4081,7 +4076,7 @@ class MainWindow(QMainWindow):
     def _update_merge_button(self):
         n = len(self._selected_people)
         self.btn_merge.setVisible(n >= 2)
-        self.btn_merge.setText(f"Sloučit osoby ({n})")
+        self.btn_merge.setText(tr("people-merge-count", n=n))
 
     def _show_person_context_menu(self, person_id: int, global_pos):
         if person_id not in self._selected_people:
@@ -4093,14 +4088,14 @@ class MainWindow(QMainWindow):
         name = (self._people_rows.get(person_id) or (UNKNOWN_PERSON,))[0] or UNKNOWN_PERSON
         n = len(self._selected_people)
         menu = QMenu(self)
-        act_open = menu.addAction("Otevřít")
-        act_rename = menu.addAction("Přejmenovat…")
+        act_open = menu.addAction(tr("action-open"))
+        act_rename = menu.addAction(tr("action-rename-ellipsis"))
         menu.addSeparator()
-        act_merge = menu.addAction(f"Sloučit osoby ({n})" if n >= 2 else "Sloučit osoby")
+        act_merge = menu.addAction(tr("people-merge-count", n=n) if n >= 2 else tr("people-merge"))
         act_merge.setEnabled(n >= 2)
         if n < 2:
-            act_merge.setToolTip("Ctrl+klikem vyberte další osobu")
-        act_clear = menu.addAction("Zrušit výběr")
+            act_merge.setToolTip(tr("people-select-more-tooltip"))
+        act_clear = menu.addAction(tr("guide-deselect"))
         act_clear.setEnabled(n > 0)
         action = menu.exec(global_pos)
         if action == act_open:
@@ -4124,7 +4119,7 @@ class MainWindow(QMainWindow):
     def _merge_people_ids(self, ids, ask_name=True):
         ids = [int(i) for i in ids if int(i) in self._people_rows]
         if len(ids) < 2:
-            show_toast(self, "Ke sloučení vyberte alespoň dvě osoby (Ctrl+klik)", "info")
+            show_toast(self, tr("people-merge-need-two"), "info")
             return None
         target = self._merge_target(ids)
         names = []
@@ -4134,14 +4129,14 @@ class MainWindow(QMainWindow):
                 names.append(name)
         chosen = names[0] if names else None
         if len(names) > 1 and ask_name:
-            chosen, ok = InWindowDialog.getItem(self, "Sloučit osoby",
-                                              "Osoby mají různá jména. Které ponechat?", names, 0, False)
+            chosen, ok = InWindowDialog.getItem(self, tr("people-merge"),
+                                              tr("people-merge-which-name"), names, 0, False)
             if not ok:
                 return None
         try:
             result = merge_people(target, [i for i in ids if i != target], name=chosen)
         except Exception as e:
-            show_toast(self, f"Osoby se nepodařilo sloučit: {e}", "error")
+            show_toast(self, tr("error-people-merge", e=e), "error")
             return None
         if not result:
             return None
@@ -4150,17 +4145,20 @@ class MainWindow(QMainWindow):
         self._load_people()
         if self.stack.currentWidget() is not self.page_people:
             self._refresh_merge_suggestions()
-        label = f"„{result['name']}“" if result["name"] and result["name"] != UNKNOWN_PERSON else "jedné osoby"
-        extra = f", nově nalezeno: {result['pulled_in']}" if result["pulled_in"] else ""
-        show_toast(self, f"Sloučeno do {label} – přesunuto obličejů: {result['moved_faces']}{extra}",
-                   "success", action_text="Vrátit", on_action=lambda u=result["undo"]: self._undo_people_merge(u))
+        named = bool(result["name"]) and result["name"] != UNKNOWN_PERSON
+        msg = tr("people-merged-into", name=result["name"], faces=result["moved_faces"]) if named else \
+            tr("people-merged", faces=result["moved_faces"])
+        if result["pulled_in"]:
+            msg += tr("people-merged-pulled-in", count=result["pulled_in"])
+        show_toast(self, msg,
+                   "success", action_text=tr("action-undo"), on_action=lambda u=result["undo"]: self._undo_people_merge(u))
         return result
 
     def _undo_people_merge(self, undo):
         try:
             undo_merge(undo)
         except Exception as e:
-            show_toast(self, f"Sloučení se nepodařilo vrátit: {e}", "error")
+            show_toast(self, tr("error-merge-undo", e=e), "error")
             return
         self._avatar_cache.clear()
         self._load_people()
@@ -4186,7 +4184,7 @@ class MainWindow(QMainWindow):
         try:
             dismiss_person_merge(suggestion["a"], suggestion["b"])
         except Exception as e:
-            show_toast(self, f"Rozhodnutí se nepodařilo uložit: {e}", "error")
+            show_toast(self, tr("error-decision-save", e=e), "error")
             return
         self.merge_bar.drop_current()
 
@@ -4205,7 +4203,7 @@ class MainWindow(QMainWindow):
             match = not search_text or search_text in strip_accents(card.name)
             card.setVisible(match)
             visible += match
-        self.lbl_people_count.setText(f"{visible} osob")
+        self.lbl_people_count.setText(tr("count-people", count=visible))
         self._update_people_empty(visible)
 
     def _load_events(self):
@@ -4259,8 +4257,7 @@ class MainWindow(QMainWindow):
             self._events_layout.addWidget(card)
             self.event_cards.append(card)
         n = len(cards)
-        self.lbl_events_sub.setText("" if not n else
-                                    f"{n} {'událost' if n == 1 else 'události' if n < 5 else 'událostí'}")
+        self.lbl_events_sub.setText("" if not n else tr("count-events", count=n))
         self.lbl_events_empty.setVisible(n == 0)
         self._events_scroll.setVisible(n > 0)
         self._events_scroll.setVisible(n > 0)
@@ -4309,7 +4306,7 @@ class MainWindow(QMainWindow):
         if need > 0 and have >= SIGLIP_READY_SHARE * need:
             self._siglip_ready = True
             self._load_embeddings()
-            show_toast(self, "Přesné hledání je připravené", "success")
+            show_toast(self, tr("search-precise-ready"), "success")
 
     def _merge_siglip(self, ids):
         if self._precise_active():
@@ -4336,19 +4333,19 @@ class MainWindow(QMainWindow):
             return
         dl = SiglipDownload(self)
         dl.progress.connect(lambda got, total: self.lbl_status.set_task(
-            "siglip", f"Stahuji model přesného hledání ({got:.0f} / {total:.0f} MB)…"))
+            "siglip", tr("search-precise-downloading", got=fmt_number(got, 0), total=fmt_number(total, 0))))
         dl.done.connect(self._on_siglip_downloaded)
         self._siglip_download = dl
-        self.lbl_status.set_task("siglip", f"Stahuji model přesného hledání (0 / {siglip_engine.DOWNLOAD_MB} MB)…")
+        self.lbl_status.set_task("siglip", tr("search-precise-downloading-start", DOWNLOAD_MB=siglip_engine.DOWNLOAD_MB))
         dl.start()
 
     def _on_siglip_downloaded(self, ok, error):
         self.lbl_status.set_task("siglip", "")
         if not ok:
-            if error != "přerušeno":
-                show_toast(self, f"Model přesného hledání se nepodařilo stáhnout: {error}", "error")
+            if error != DOWNLOAD_INTERRUPTED:
+                show_toast(self, tr("search-precise-download-failed", error=error), "error")
             return
-        show_toast(self, "Model přesného hledání stažen – knihovna se na pozadí přeindexuje", "info")
+        show_toast(self, tr("search-precise-downloaded"), "info")
         if self._ai_daemon and self._ai_daemon.isRunning():
             self._ai_daemon_rerun = True
         else:
@@ -4419,10 +4416,10 @@ class MainWindow(QMainWindow):
         if count <= 0 or not files:
             return
         size = cloud_files.human_size(size_bytes)
-        show_toast(self, f"Souborů jen v cloudu: {count} ({size}) – bez souhlasu se nestahují", "info",
-                   action_text=f"Stáhnout {size} a importovat",
+        show_toast(self, tr("cloud-only-files", count=count, size=size), "info",
+                   action_text=tr("cloud-download-import", size=size),
                    on_action=lambda f=list(files): self._enqueue_background_import([("cloud", f)]),
-                   timeout_ms=None, dismiss_text="Teď ne")
+                   timeout_ms=None, dismiss_text=tr("common-not-now"))
 
     def _on_identity_checked(self, stats):
         """Gate 0: výsledek kontroly dostupnosti – přesunuté disky se tiše přepojily, odpojené
@@ -4431,8 +4428,8 @@ class MainWindow(QMainWindow):
         if remapped:
             self._load_photos()
         if offline:
-            show_toast(self, f"Offline: {offline} položek (odpojený disk) – nic se nemaže, "
-                             f"po připojení disku se samy vrátí", "info")
+            vols = len(stats.get("offline_volumes") or {}) or 1
+            show_toast(self, tr("offline-items", count=offline, disks=vols), "info")
 
     def _on_ai_daemon_finished(self):
         if getattr(self, "_ai_daemon_rerun", False) and not getattr(self, "_shutting_down", False):
@@ -4507,17 +4504,17 @@ class MainWindow(QMainWindow):
         query = self._search_query.strip()
         if query:
             if not count:
-                return f"Nic neodpovídá „{query}“"
+                return tr("search-nothing-matches", query=query)
             sure = count - possible
             if not possible:
-                return f"{_czech_result_count(sure)} pro „{query}“"
+                return tr("search-results-for", results=_czech_result_count(sure), query=query)
             if not sure:
-                return f"Žádná jistá shoda · {possible} možných pro „{query}“"
-            return f"{_czech_result_count(sure)} · {possible} možných pro „{query}“"
+                return tr("search-possible-only", possible=possible, query=query)
+            return tr("search-results-and-possible", results=_czech_result_count(sure), possible=possible, query=query)
         if self._current_filter == "trash":
-            return f"{_czech_item_count(count)} · obnovíte je pravým tlačítkem" if count else ""
+            return tr("trash-count-subtitle", items=_czech_item_count(count)) if count else ""
         if self._current_filter == "hidden":
-            return f"{_czech_item_count(count)} · zamkne se samo po 2 minutách" if count else ""
+            return tr("locked-count-subtitle", items=_czech_item_count(count)) if count else ""
         return _czech_item_count(count)
 
     def _set_filter(self, key: str):
@@ -4529,7 +4526,7 @@ class MainWindow(QMainWindow):
             model.vault = self.locked.vault if self.locked.is_unlocked else None
         elif model.vault is not None:
             model.purge_vault()
-        self.lbl_photos_title.setText(self.FILTER_TITLES.get(key, "Fotografie"))
+        self.lbl_photos_title.setText(tr(self.FILTER_TITLES.get(key, "nav-library")))
         if self._search_query.strip():
             self._search_result = None       # jiná kolekce = jiné prostředí hledání
             self._run_ai_search()
@@ -4588,31 +4585,30 @@ class MainWindow(QMainWindow):
         query, f = self._search_query.strip(), self._current_filter
         action = None
         if query:
-            content = ("search", f"Žádné výsledky pro „{query}“",
-                       "Zkuste jiné slovo nebo popis – třeba „moře“, „pes“ nebo „západ slunce“.")
-            action = ("clear", "Vymazat hledání")
+            content = ("search", tr("search-no-results", query=query),
+                       tr("search-no-results-body"))
+            action = ("clear", tr("search-clear"))
         elif f == "trash":
-            content = ("trash", "Koš je prázdný",
-                       "Smazané fotky a videa tu počkají, dokud koš nevysypete v Předvolbách.")
+            content = ("trash", tr("trash-empty-title"),
+                       tr("trash-empty-body"))
         elif f == "hidden" and not self.locked.is_unlocked:
-            content = ("lock", "Skryté jsou zamčené",
-                       "Odemkněte je přes Windows Hello nebo heslem.")
+            content = ("lock", tr("locked-locked-title"),
+                       tr("locked-locked-body"))
             action = ("unlock", "Odemknout")
         elif f == "hidden":
-            content = ("lock", "Ve Skrytých nic není",
-                       "Fotku sem přesunete pravým tlačítkem v mřížce › Přesunout do Skrytých. "
-                       "Zmizí z knihovny, hledání, tváří, mapy i sestřihů.")
+            content = ("lock", tr("locked-empty-title"),
+                       tr("locked-empty-body"))
         elif f == "favorites":
-            content = ("heart", "Zatím žádné oblíbené",
-                       "Označte fotku srdíčkem – klávesou F v mřížce nebo v prohlížeči – a najdete ji tady.")
+            content = ("heart", tr("favorites-empty-title"),
+                       tr("favorites-empty-body"))
         elif f == "video":
-            content = ("video", "Žádná videa", "Videa z vašich složek se tu objeví hned po importu.")
+            content = ("video", tr("videos-empty-title"), tr("videos-empty-body"))
         elif f == "photo":
-            content = ("photos", "Žádné fotky", "Fotky z vašich složek se tu objeví hned po importu.")
+            content = ("photos", tr("photos-empty-title"), tr("photos-empty-body"))
         else:
-            content = ("photos", "Zatím tu nejsou žádné fotky",
-                       "Přidejte složku s fotkami. Import poběží na pozadí a nic se nepřesouvá ani nemaže.")
-            action = ("import", "Importovat")
+            content = ("photos", tr("library-empty-title"),
+                       tr("library-empty-body"))
+            action = ("import", tr("nav-import"))
         self._photos_empty_action = action[0] if action else None
         self.photos_empty.set_content(*content, action[1] if action else None)
         if self.photos_empty.isHidden():
@@ -4676,14 +4672,41 @@ class MainWindow(QMainWindow):
 
     def _update_people_empty(self, visible):
         if not self._person_cards:
-            self.people_empty.set_content("people", "Zatím žádné osoby",
-                                          "Tváře se rozpoznávají na pozadí po importu fotek. "
-                                          "Vše probíhá v počítači – nic se neodesílá.")
+            self.people_empty.set_content("people", tr("people-empty-title"),
+                                          tr("people-empty-body"))
         else:
             q = self.people_search.text().strip()
-            self.people_empty.set_content("search", f"Nikdo neodpovídá „{q}“",
-                                          "Zkuste jiné jméno, nebo pojmenujte osobu na její kartě.")
+            self.people_empty.set_content("search", tr("people-nobody-matches", q=q),
+                                          tr("people-nobody-matches-body"))
         self.people_empty.setVisible(visible == 0)
+
+    # ── Gate 1: jazyk rozhraní za běhu ────────────────────────────────────────
+    def apply_language(self, setting):
+        """Předvolby › Jazyk: přepne katalog, přeloží viditelné texty a obnoví pohledy (bez restartu)."""
+        return i18n.set_language(i18n.resolve(setting))
+
+    def _on_language_changed(self, code):
+        """Texty skládané z dat (počty, data, názvy) se přepočítají; statické přeložil i18n.Retranslator."""
+        steps = (
+            lambda: self.lbl_photos_title.setText(tr(self.FILTER_TITLES.get(self._current_filter, "nav-library"))),
+            self._apply_filter_and_sort, self._refresh_moments, self._load_people, self._load_events,
+            self._push_map_strings, self._refresh_memory,
+        )
+        for step in steps:
+            try:
+                step()
+            except Exception as e:          # jeden pohled nesmí zastavit přepnutí ostatních
+                print(f"[i18n] refresh after language change: {e}")
+
+    def _push_map_strings(self):
+        """Texty stránky mapy (map_vault.html) v aktuálním jazyce – posílají se i po každém načtení."""
+        view = getattr(self, "map_view", None)
+        if view is None:
+            return
+        strings = i18n.page_strings("map-")
+        view.page().runJavaScript(
+            f"window.setStrings && window.setStrings({json.dumps(strings, ensure_ascii=False)}, "
+            f"{json.dumps(i18n.current())});")
 
     def _refresh_theme_icons(self):
         """Ikony kreslené mimo vlastní widgety (akce v polích hledání) podle motivu."""
@@ -4728,7 +4751,7 @@ class MainWindow(QMainWindow):
         if self._search_warmup is not None or not self._embeddings_cache or loaded is not None:
             return
         self._search_warmup = SearchModelWarmup(precise)
-        self.lbl_status.set_task("search_model", "Připravuji chytré hledání…")
+        self.lbl_status.set_task("search_model", tr("search-preparing"))
         self._search_warmup.finished.connect(lambda: self.lbl_status.set_task("search_model", ""))
         self._search_warmup.start()
 
@@ -4740,8 +4763,8 @@ class MainWindow(QMainWindow):
         status = getattr(self, "lbl_status", None)
         if status is not None:
             import ai_engine
-            status.set_task("search", f"Hledám „{query}“…" if ai_engine._text_model is not None
-                            else "Připravuji chytré hledání…")
+            status.set_task("search", tr("search-searching", query=query) if ai_engine._text_model is not None
+                            else tr("search-preparing"))
         # QThread.quit() vlákno bez event loopu nezastaví a přepsání reference by zničilo
         # běžící QThread (pád). Starší hledání doběhnou samy, jejich výsledky se zahodí.
         # Hledá se v aktuální kolekci (i v koši); fazety (místo, čas, typ) fungují i bez modelu.
@@ -4801,6 +4824,7 @@ class MainWindow(QMainWindow):
         page.runJavaScript(f"window.setPerfProfile && window.setPerfProfile({json.dumps(self.perf.for_map())});")
         page.runJavaScript(f"window.setBaseLayer && window.setBaseLayer({json.dumps(layer)});")
         page.runJavaScript(f"window.setJourneyMusic && window.setJourneyMusic({json.dumps(self._music_config())});")
+        self._push_map_strings()
         self._sync_accent()
         self._sync_map_active()
         self._refresh_map()
@@ -4923,7 +4947,7 @@ class MainWindow(QMainWindow):
         ze které klik přišel."""
         def go():
             if not self.play_journey(int(event_id), return_here=True):
-                show_toast(self, "Tahle událost nemá dost míst pro Cestu", "info")
+                show_toast(self, tr("journey-not-enough-places"), "info")
         QTimer.singleShot(0, go)
 
     def journey_closed(self):
@@ -4980,7 +5004,7 @@ class MainWindow(QMainWindow):
             records = fetch_media_records(f"m.id IN ({','.join('?' * len(ids))})", tuple(ids),
                                           order_by="m.date_taken, m.id")
         except Exception as e:
-            show_toast(self, f"Fotky nelze otevřít: {e}", "error")
+            show_toast(self, tr("error-open-photos", e=e), "error")
             return
         self._open_viewer(records, 0)
 
@@ -4998,7 +5022,7 @@ class MainWindow(QMainWindow):
         try:
             records = fetch_media_records("m.id = ?", (int(item_id),))
         except Exception as e:
-            show_toast(self, f"Soubor nelze otevřít: {e}", "error")
+            show_toast(self, tr("error-open-file", e=e), "error")
             return
         self._open_viewer(records, 0)
 
@@ -5130,7 +5154,7 @@ class MainWindow(QMainWindow):
     def _start_slideshow(self, records, index=0, model=None):
         records = list(records)
         if not records:
-            show_toast(self, "Prezentace nemá co ukázat – žádné položky", "info")
+            show_toast(self, tr("slideshow-nothing"), "info")
             return None
         from_viewer = self._viewer is not None and self.nav.current() is self._viewer
         view = SlideshowView(records, index)
@@ -5162,7 +5186,7 @@ class MainWindow(QMainWindow):
         try:
             viewer.set_media_data(list(records), index)
         except Exception as e:
-            show_toast(self, f"Soubor nelze otevřít: {e}", "error")
+            show_toast(self, tr("error-open-file", e=e), "error")
             return
         self._viewer_model = model
         if show_info and not viewer.btn_info.isChecked():
@@ -5219,20 +5243,20 @@ class MainWindow(QMainWindow):
             self._show_hidden_context_menu(rows, pos)
             return
         menu = QMenu(self)
-        act_fav = menu.addAction("Přidat/odebrat oblíbené (F)")
-        act_open = menu.addAction("Otevřít")
+        act_fav = menu.addAction(tr("grid-toggle-favorite"))
+        act_open = menu.addAction(tr("action-open"))
         ids = [int(self._filtered_records[r][0]) for r in rows if 0 <= r < len(self._filtered_records)]
         act_hide = act_export = None
         if self._current_filter != "trash":
             self._add_album_menu(menu, ids)
-            act_export = menu.addAction("Exportovat…")
+            act_export = menu.addAction(tr("action-export-ellipsis"))
         menu.addSeparator()
-        act_info = menu.addAction("Informace o souboru")
+        act_info = menu.addAction(tr("grid-file-info"))
         menu.addSeparator()
         in_trash = self._current_filter == "trash"
         if not in_trash:
-            act_hide = menu.addAction("Přesunout do Skrytých 🔒")
-        act_trash = menu.addAction("Obnovit" if in_trash else "Přesunout do koše")
+            act_hide = menu.addAction(tr("locked-move-to"))
+        act_trash = menu.addAction(tr("trash-restore") if in_trash else tr("trash-move-to"))
         action = menu.exec(self.grid_view.mapToGlobal(pos))
         if action is not None and action == act_hide:
             self.hide_media_ids(ids)
@@ -5253,21 +5277,21 @@ class MainWindow(QMainWindow):
         try:
             (trash_media if trashed else restore_media)(ids)
         except Exception as e:
-            show_toast(self, f"Akci se nepodařilo provést: {e}", "error")
+            show_toast(self, tr("error-action", e=e), "error")
             return
         self._on_library_changed()
         n = len(ids)
         if trashed:
-            show_toast(self, f"Přesunuto do koše: {_czech_item_count(n)}", "success",
-                       action_text="Vrátit", on_action=lambda: self._undo_trash(ids))
+            show_toast(self, tr("trash-moved", items=_czech_item_count(n)), "success",
+                       action_text=tr("action-undo"), on_action=lambda: self._undo_trash(ids))
         else:
-            show_toast(self, f"Obnoveno z koše: {_czech_item_count(n)}", "success")
+            show_toast(self, tr("trash-restored", items=_czech_item_count(n)), "success")
 
     def _undo_trash(self, ids):
         try:
             restore_media(ids)
         except Exception as e:
-            show_toast(self, f"Obnovení se nepodařilo: {e}", "error")
+            show_toast(self, tr("error-restore", e=e), "error")
             return
         self._on_library_changed()
 
@@ -5288,12 +5312,12 @@ class MainWindow(QMainWindow):
     def _show_hidden_context_menu(self, rows, pos):
         ids = [int(self._filtered_records[r][0]) for r in rows if 0 <= r < len(self._filtered_records)]
         menu = QMenu(self)
-        act_open = menu.addAction("Otevřít")
-        act_info = menu.addAction("Informace o souboru")
+        act_open = menu.addAction(tr("action-open"))
+        act_info = menu.addAction(tr("grid-file-info"))
         menu.addSeparator()
-        act_unhide = menu.addAction("Vrátit do knihovny")
+        act_unhide = menu.addAction(tr("locked-return-to-library"))
         menu.addSeparator()
-        act_lock = menu.addAction("Zamknout")
+        act_lock = menu.addAction(tr("locked-lock"))
         action = menu.exec(self.grid_view.mapToGlobal(pos))
         if action == act_unhide:
             self.unhide_media_ids(ids)
@@ -5316,29 +5340,29 @@ class MainWindow(QMainWindow):
                 return 0
             n = locked_folder.hide_items(ids, self.locked.vault)
         except Exception as e:
-            show_toast(self, f"Skrytí se nepodařilo: {e}", "error")
+            show_toast(self, tr("error-lock", e=e), "error")
             return 0
         self.grid_view.photo_model.ram_cache.discard(ids)    # nešifrované miniatury z RAM pryč
         self._embeddings_cache = {k: v for k, v in (self._embeddings_cache or {}).items() if k not in set(ids)}
         self._search_result = None
         self._on_library_changed()
         if n:
-            show_toast(self, f"Přesunuto do Skrytých: {_czech_item_count(n)}", "success")
+            show_toast(self, tr("locked-moved", items=_czech_item_count(n)), "success")
         return n
 
     def unhide_media_ids(self, ids):
         try:
             n = locked_folder.unhide_items(ids, self.locked.vault)
         except locked_folder.VaultLocked:
-            show_toast(self, "Skryté jsou zamčené – odemkněte je.", "error")
+            show_toast(self, tr("locked-is-locked-unlock"), "error")
             return 0
         except Exception as e:
-            show_toast(self, f"Vrácení se nepodařilo: {e}", "error")
+            show_toast(self, tr("error-unlock-return", e=e), "error")
             return 0
         self.grid_view.photo_model.ram_cache.discard(int(i) for i in ids)
         self._on_library_changed()
         if n:
-            show_toast(self, f"Vráceno do knihovny: {_czech_item_count(n)}", "success")
+            show_toast(self, tr("locked-returned", items=_czech_item_count(n)), "success")
         return n
 
     def _in_hidden_context(self):
@@ -5384,7 +5408,7 @@ class MainWindow(QMainWindow):
         if self._current_filter == "hidden":
             self._apply_filter_and_sort()           # mřížka prázdná, stav „zamčeno“
             if reason in ("idle", "session", "minimize"):
-                show_toast(self, "Skryté se zamkly.", "info")
+                show_toast(self, tr("locked-did-lock"), "info")
 
     def _hidden_startup_sweep(self):
         try:
@@ -5439,18 +5463,18 @@ class MainWindow(QMainWindow):
 
         # Fotky osoby = podstránka v okně (dřív modální dialog)
         page = DetailPage(name, _czech_photo_count(len(records)))
-        page.add_action("Přejmenovat", lambda: self._rename_person(person_id, page.lbl_title.text(), page))
-        page.add_action("Hraniční obličeje…",
+        page.add_action(tr("action-rename"), lambda: self._rename_person(person_id, page.lbl_title.text(), page))
+        page.add_action(tr("faces-borderline-ellipsis"),
                         lambda: self._open_borderline_for_person(person_id, page.lbl_title.text()),
-                        "Projít obličeje, které se této osobě jen trochu podobají")
+                        tr("faces-borderline-action-tooltip"))
         grid = self._make_collection_grid(records, page)
         self._add_slideshow_action(page, grid)
         page.set_content(grid)
         self.nav.push(page)
 
     def _add_slideshow_action(self, page, grid):
-        btn = page.add_action("▶  Prezentace", lambda: self.start_slideshow_from_grid(grid),
-                              "Prezentace přes celou obrazovku (S)")
+        btn = page.add_action(tr("slideshow-play"), lambda: self.start_slideshow_from_grid(grid),
+                              tr("slideshow-fullscreen-tooltip"))
         btn.setObjectName("btn_primary")
         btn.setEnabled(grid.photo_model.rowCount() > 0)
         return btn
@@ -5483,7 +5507,7 @@ class MainWindow(QMainWindow):
             self._switch_page(0)
             self.search_bar.setText(query)
             self._sync_sidebar()
-        return Command(f"Hledat „{query}“ v knihovně", run, "search", "Chytré hledání podle obsahu fotek",
+        return Command(tr("palette-search-library", query=query), run, "search", tr("palette-smart-search-sub"),
                        "search")
 
     def _palette_commands(self):
@@ -5493,33 +5517,33 @@ class MainWindow(QMainWindow):
             self.sidebar_nav.set_current(key)
             self._on_sidebar(key)
         cmds = [
-            Command("Fotografie", lambda: nav("photos"), "page", icon="photos", keywords="knihovna mřížka vše"),
-            Command("Osoby", lambda: nav("people"), "page", icon="people", keywords="tváře lidé obličeje"),
-            Command("Události", lambda: nav("events"), "page", icon="events", keywords="výlety akce cesty"),
-            Command("Mapa", lambda: nav("map"), "page", icon="map", keywords="místa poloha zeměkoule"),
-            Command("Oblíbené", lambda: nav("favorites"), "page", icon="heart", keywords="srdce"),
-            Command("Videa", lambda: nav("videos"), "page", icon="video", keywords="klipy filmy"),
-            Command("Alba", lambda: nav("albums"), "page", icon="album", keywords="kolekce výběry"),
-            Command("Smazané", lambda: nav("trash"), "page", icon="trash", keywords="koš"),
-        ] + ([Command("Skryté", lambda: nav("hidden"), "page", icon="lock", keywords="zamčené soukromé")]
+            Command(tr("nav-library"), lambda: nav("photos"), "page", icon="photos", keywords=tr("palette-kw-library")),
+            Command(tr("nav-people"), lambda: nav("people"), "page", icon="people", keywords=tr("palette-kw-people")),
+            Command(tr("nav-events"), lambda: nav("events"), "page", icon="events", keywords=tr("palette-kw-events")),
+            Command(tr("nav-places"), lambda: nav("map"), "page", icon="map", keywords=tr("palette-kw-places")),
+            Command(tr("nav-favorites"), lambda: nav("favorites"), "page", icon="heart", keywords="srdce"),
+            Command(tr("nav-videos"), lambda: nav("videos"), "page", icon="video", keywords=tr("palette-kw-videos")),
+            Command(tr("nav-albums"), lambda: nav("albums"), "page", icon="album", keywords=tr("palette-kw-albums")),
+            Command(tr("nav-trash"), lambda: nav("trash"), "page", icon="trash", keywords=tr("palette-kw-trash")),
+        ] + ([Command(tr("nav-locked"), lambda: nav("hidden"), "page", icon="lock", keywords=tr("palette-kw-locked"))]
              if self.config.get("show_hidden_folder", True) else []) + [
-            Command("Ozvěny", lambda: nav("echoes"), "page", icon="echo", keywords="tehdy teď návrat"),
-            Command("Sestřihy", lambda: nav("reels"), "page", icon="reel",
-                    keywords="reels video film throwback vzpomínky hudba export mp4"),
-            Command("Importovat fotky…", self._start_import, "action", icon="import", keywords="přidat složka"),
-            Command("Předvolby", self._open_settings, "action", icon="settings", keywords="nastavení možnosti"),
-            Command("Nové album…", lambda: self._new_album(), "action", icon="plus", keywords="vytvořit album"),
-            Command("Nápověda a tipy", self.open_guide, "action", icon="info", keywords="průvodce help"),
+            Command(tr("nav-echoes"), lambda: nav("echoes"), "page", icon="echo", keywords=tr("palette-kw-echoes")),
+            Command(tr("nav-reels"), lambda: nav("reels"), "page", icon="reel",
+                    keywords=tr("palette-kw-reels")),
+            Command(tr("palette-import"), self._start_import, "action", icon="import", keywords=tr("palette-kw-import")),
+            Command(tr("nav-settings"), self._open_settings, "action", icon="settings", keywords=tr("palette-kw-settings")),
+            Command(tr("albums-new-ellipsis"), lambda: self._new_album(), "action", icon="plus", keywords=tr("palette-kw-new-album")),
+            Command(tr("palette-help"), self.open_guide, "action", icon="info", keywords=tr("palette-kw-help")),
         ]
         if self._search_query.strip():
-            cmds.append(Command(f"Uložit hledání „{self._search_query.strip()}“ jako chytré album",
+            cmds.append(Command(tr("palette-save-smart", value=self._search_query.strip()),
                                 self.save_search_as_smart_album, "action", icon="sparkle",
-                                keywords="chytré album uložit"))
+                                keywords=tr("palette-kw-save-smart")))
         conn = get_connection()
         try:
             albums.ensure_tables(conn)
             for a in albums.list_albums(conn):
-                sub_text = (f"Hledání „{a['query']}“" if a["kind"] == "smart"
+                sub_text = (tr("albums-search-label", query=a['query']) if a["kind"] == "smart"
                             else _czech_item_count(a["count"] or 0))
                 cmds.append(Command(a["name"], lambda a=a: self._open_album(a), "album", sub_text,
                                     "sparkle" if a["kind"] == "smart" else "album"))
@@ -5527,13 +5551,14 @@ class MainWindow(QMainWindow):
             conn.close()
         for pid, (name, _cover, count) in sorted(getattr(self, "_people_rows", {}).items(),
                                                  key=lambda kv: -(kv[1][2] or 0)):
+            # i18n-ok: DB default person name check
             if not name or name.lower().startswith(("neznámá osoba", "unknown")):
                 continue
             cmds.append(Command(name, lambda pid=pid, name=name: self._palette_person(pid, name), "person",
                                 _czech_photo_count(count or 0), "people"))
         for ev in getattr(self, "_event_cards", []):
             when = (ev.get("start") or "")[:10]
-            cmds.append(Command(ev.get("title") or "Událost", lambda eid=ev["id"]: self._palette_event(eid), "event",
+            cmds.append(Command(ev.get("title") or tr("event-default-title"), lambda eid=ev["id"]: self._palette_event(eid), "event",
                                 " · ".join(x for x in (ev.get("location"), when) if x), "events",
                                 keywords=f"{ev.get('location') or ''} {when[:4]}"))
         return cmds
@@ -5561,14 +5586,14 @@ class MainWindow(QMainWindow):
         if not ids:
             return
         menu = QMenu(self)
-        act_fav = menu.addAction("Přidat/odebrat oblíbené (F)")
+        act_fav = menu.addAction(tr("grid-toggle-favorite"))
         self._add_album_menu(menu, ids, exclude=album_id)
-        act_export = menu.addAction("Exportovat…")
+        act_export = menu.addAction(tr("action-export-ellipsis"))
         act_remove = act_cover = None
         if album_id is not None:
             menu.addSeparator()
-            act_cover = menu.addAction("Nastavit jako obálku alba") if len(ids) == 1 else None
-            act_remove = menu.addAction("Odebrat z alba")
+            act_cover = menu.addAction(tr("albums-set-cover")) if len(ids) == 1 else None
+            act_remove = menu.addAction(tr("albums-remove-from"))
         chosen = menu.exec(grid.mapToGlobal(pos))
         if chosen is None:
             return
@@ -5580,7 +5605,7 @@ class MainWindow(QMainWindow):
             self._album_edit(lambda conn: albums.remove_items(conn, album_id, ids))
             gone = set(ids)
             grid.photo_model.set_records([r for r in grid.photo_model.records if int(r[0]) not in gone])
-            show_toast(self, f"Odebráno z alba: {_czech_item_count(len(ids))}", "success")
+            show_toast(self, tr("albums-removed-from", items=_czech_item_count(len(ids))), "success")
             self._refresh_albums_panel()
         elif chosen == act_cover:
             self._album_edit(lambda conn: albums.set_cover(conn, album_id, ids[0]))
@@ -5588,7 +5613,7 @@ class MainWindow(QMainWindow):
 
     def _add_album_menu(self, menu, ids, exclude=None):
         """Podnabídka „Přidat do alba“: existující ruční alba (s cestou složek) + nové album z výběru."""
-        sub = menu.addMenu("Přidat do alba")
+        sub = menu.addMenu(tr("albums-add-to"))
         conn = get_connection()
         try:
             albums.ensure_tables(conn)
@@ -5596,7 +5621,7 @@ class MainWindow(QMainWindow):
         finally:
             conn.close()
         manual.sort(key=lambda a: a["path"].casefold())
-        act_new = sub.addAction("Nové album…")
+        act_new = sub.addAction(tr("albums-new-ellipsis"))
         act_new.triggered.connect(lambda: self._new_album(ids))
         if manual:
             sub.addSeparator()
@@ -5612,39 +5637,39 @@ class MainWindow(QMainWindow):
                 result = fn(conn)
             return True if result is None else result
         except Exception as e:
-            show_toast(self, f"Album nelze upravit: {e}", "error")
+            show_toast(self, tr("error-album-edit", e=e), "error")
             return None
 
     def _add_to_album(self, album, ids):
         added = self._album_edit(lambda conn: albums.add_items(conn, album["id"], ids))
         if added is None:
             return
-        text = (f"Přidáno do alba „{album['name']}“: {_czech_item_count(added)}" if added
-                else f"Vše už v albu „{album['name']}“ je")
-        show_toast(self, text, "success", action_text="Otevřít",
+        text = (tr("albums-added-to", name=album['name'], items=_czech_item_count(added)) if added
+                else tr("albums-all-already-in", name=album['name']))
+        show_toast(self, text, "success", action_text=tr("action-open"),
                    on_action=lambda: self._open_album_by_id(album["id"]))
         self._refresh_albums_panel()
 
     def _new_album(self, ids=(), parent_id=None):
-        name, ok = InWindowDialog.getText(self, "Nové album", "Název alba:", text="")
+        name, ok = InWindowDialog.getText(self, tr("albums-new"), tr("albums-name-prompt"), text="")
         if not ok or not name.strip():
             return None
         aid = self._album_edit(lambda conn: albums.create_album(conn, name, ids, parent_id))
         if aid is None:
             return None
         if ids:
-            show_toast(self, f"Album „{name.strip()}“: {_czech_item_count(len(ids))}", "success",
-                       action_text="Otevřít", on_action=lambda: self._open_album_by_id(aid))
+            show_toast(self, tr("albums-created", name=name.strip(), items=_czech_item_count(len(ids))), "success",
+                       action_text=tr("action-open"), on_action=lambda: self._open_album_by_id(aid))
         self._refresh_albums_panel()
         return aid
 
     def _new_folder(self, parent_id=None):
-        name, ok = InWindowDialog.getText(self, "Nová složka", "Název složky alb:", text="", action_text="Vytvořit")
+        name, ok = InWindowDialog.getText(self, tr("albums-new-folder"), tr("albums-folder-name-prompt"), text="", action_text=tr("action-create"))
         if not ok or not name.strip():
             return None
         fid = self._album_edit(lambda conn: albums.create_folder(conn, name, parent_id))
         if fid is not None:
-            show_toast(self, f"Složka „{' '.join(name.split())}“ – alba do ní přetáhněte", "success")
+            show_toast(self, tr("albums-folder-created", value=' '.join(name.split())), "success")
             self._refresh_albums_panel()
         return fid
 
@@ -5652,15 +5677,15 @@ class MainWindow(QMainWindow):
         """Aktuální hledání (a kolekce) jako chytré album – samo se doplňuje novými fotkami."""
         query = self._search_query.strip()
         if not query:
-            show_toast(self, "Nejdřív něco vyhledejte – chytré album uloží hledání", "info")
+            show_toast(self, tr("albums-smart-need-search"), "info")
             return None
         flt = self._current_filter if self._current_filter in albums.SMART_FILTERS else "all"
-        name, ok = InWindowDialog.getText(self, "Chytré album", "Název alba:", text=query[:1].upper() + query[1:])
+        name, ok = InWindowDialog.getText(self, tr("albums-kind-smart"), tr("albums-name-prompt"), text=query[:1].upper() + query[1:])
         if not ok or not name.strip():
             return None
         aid = self._album_edit(lambda conn: albums.create_smart_album(conn, name, query, flt))
         if aid is not None:
-            show_toast(self, f"Chytré album „{name.strip()}“ uloženo", "success")
+            show_toast(self, tr("albums-smart-saved", value=name.strip()), "success")
             self._refresh_albums_panel()
         return aid
 
@@ -5671,7 +5696,7 @@ class MainWindow(QMainWindow):
             try:
                 n = panel.load()
                 if panel.folder_id is None:
-                    page.set_title("Alba", albums.czech_albums(n) if n else "Vaše výběry a uložená hledání")
+                    page.set_title(tr("nav-albums"), albums.czech_albums(n) if n else tr("albums-subtitle"))
                 alive.append((panel, page))
             except RuntimeError:                 # stránka už zavřená (C++ objekt smazán)
                 pass
@@ -5680,7 +5705,7 @@ class MainWindow(QMainWindow):
     def open_albums(self, folder_id=None):
         """Postranní panel Kolekce › Alba: složky, ruční a chytrá alba (albums.py). folder_id = podsložka."""
         import albums_view
-        name, subtitle = None, "Vaše výběry a uložená hledání"
+        name, subtitle = None, tr("albums-subtitle")
         if folder_id is None:
             self.nav.reset()
         else:
@@ -5694,8 +5719,8 @@ class MainWindow(QMainWindow):
             if not node:
                 return
             name = node["name"]
-            subtitle = " › ".join(["Alba"] + [n for _i, n in crumbs[:-1]])
-        page = DetailPage(name or "Alba", subtitle)
+            subtitle = " › ".join([tr("nav-albums")] + [n for _i, n in crumbs[:-1]])
+        page = DetailPage(name or tr("nav-albums"), subtitle)
         page.setProperty("sidebar_key", "albums")
         panel = albums_view.AlbumsPanel(get_connection, page, folder_id=folder_id, edit=self._album_edit)
         panel.opened.connect(self._open_album)
@@ -5705,15 +5730,15 @@ class MainWindow(QMainWindow):
         panel.cover_requested.connect(lambda a: self._open_album(a, pick_cover=True))
         panel.cover_reset_requested.connect(self._reset_album_cover)
         panel.changed.connect(self._refresh_albums_panel)
-        page.add_action("Nová složka", lambda: self._new_folder(folder_id), "Složka seskupí alba (přetáhněte je do ní)")
-        page.add_action("Nové album", lambda: self._new_album(parent_id=folder_id))
+        page.add_action(tr("albums-new-folder"), lambda: self._new_folder(folder_id), tr("albums-new-folder-tooltip"))
+        page.add_action(tr("albums-new"), lambda: self._new_album(parent_id=folder_id))
         if folder_id is None:
-            btn = page.add_action("Uložit hledání", self.save_search_as_smart_album,
-                                  "Aktuální hledání jako chytré album (samo se doplňuje)")
+            btn = page.add_action(tr("albums-save-search"), self.save_search_as_smart_album,
+                                  tr("albums-save-search-tooltip"))
             btn.setEnabled(bool(self._search_query.strip()))
         else:
-            page.add_action("Exportovat", lambda: self._export_album({"id": folder_id, "name": name}),
-                            "Všechna ruční alba ve složce – s volbami soukromí")
+            page.add_action(tr("action-export"), lambda: self._export_album({"id": folder_id, "name": name}),
+                            tr("albums-export-folder-tooltip"))
         page.set_content(panel)
         if folder_id is None:
             self._albums_panels = []
@@ -5722,7 +5747,7 @@ class MainWindow(QMainWindow):
         self._sync_sidebar()
         n = panel.load()
         if n and folder_id is None:
-            page.set_title("Alba", albums.czech_albums(n))
+            page.set_title(tr("nav-albums"), albums.czech_albums(n))
 
     def _reset_album_cover(self, album):
         if self._album_edit(lambda conn: albums.set_cover(conn, album["id"], None)) is not None:
@@ -5762,13 +5787,13 @@ class MainWindow(QMainWindow):
         page = DetailPage(album["name"], _czech_photo_count(len(records)))
         page.setProperty("sidebar_key", "albums")
         grid = self._make_collection_grid(records, page, album_id=album["id"])
-        sort = SegmentedControl([("Podle data", "date"), ("Vlastní", "custom")], current=info.get("sort_mode", "date"))
-        sort.setToolTip("Vlastní pořadí: vybrané fotky přetáhněte na nové místo")
+        sort = SegmentedControl([(tr("albums-order-by-date"), "date"), (tr("albums-order-custom"), "custom")], current=info.get("sort_mode", "date"))
+        sort.setToolTip(tr("albums-custom-order-tooltip"))
         sort.changed.connect(lambda mode: self._set_album_sort(album["id"], grid, mode))
         page.actions_layout.addWidget(sort)
-        page.add_action("Obálka…", lambda: self._begin_cover_pick(album, grid), "Vyberte fotku, která bude obálkou alba")
-        page.add_action("Exportovat", lambda: self._export_album(album), "Kopie bez polohy a jmen osob, ZIP nebo web")
-        page.add_action("Přejmenovat", lambda: self._rename_album(album, page))
+        page.add_action(tr("albums-cover-ellipsis"), lambda: self._begin_cover_pick(album, grid), tr("albums-cover-tooltip"))
+        page.add_action(tr("action-export"), lambda: self._export_album(album), tr("albums-export-tooltip"))
+        page.add_action(tr("action-rename"), lambda: self._rename_album(album, page))
 
         def on_move(moved, before):
             order = self._album_edit(lambda conn: albums.move_items(conn, album["id"], moved, before))
@@ -5813,13 +5838,13 @@ class MainWindow(QMainWindow):
             if self._album_edit(lambda conn: albums.set_cover(conn, album["id"], int(recs[row][0]))) is None:
                 return
             self._refresh_albums_panel()
-            show_toast(self, f"Obálka alba „{album['name']}“ nastavena", "success")
+            show_toast(self, tr("albums-cover-set", name=album['name']), "success")
         grid._cover_pick_cb = pick
-        show_toast(self, "Dvakrát klikněte na fotku, která bude obálkou alba", "info",
-                   action_text="Zrušit", on_action=lambda: setattr(grid, "_cover_pick_cb", None))
+        show_toast(self, tr("albums-cover-pick-toast"), "info",
+                   action_text=tr("action-cancel"), on_action=lambda: setattr(grid, "_cover_pick_cb", None))
 
     def _rename_album(self, album, page=None):
-        name, ok = InWindowDialog.getText(self, "Přejmenovat album", "Nový název:", text=album["name"])
+        name, ok = InWindowDialog.getText(self, tr("albums-rename"), tr("albums-new-name-prompt"), text=album["name"])
         if not ok or not name.strip():
             return
         if self._album_edit(lambda conn: albums.rename_album(conn, album["id"], name)) is None:
@@ -5832,8 +5857,8 @@ class MainWindow(QMainWindow):
     def _delete_album(self, album):
         if self._album_edit(lambda conn: albums.delete_album(conn, album["id"])) is None:
             return
-        text = (f"Složka „{album['name']}“ smazána – její alba jsou o úroveň výš" if album.get("kind") == "folder"
-                else f"Album „{album['name']}“ smazáno – fotky zůstaly v knihovně")
+        text = (tr("albums-folder-deleted", name=album['name']) if album.get("kind") == "folder"
+                else tr("albums-album-deleted", name=album['name']))
         show_toast(self, text, "success")
         self._refresh_albums_panel()
 
@@ -5845,7 +5870,7 @@ class MainWindow(QMainWindow):
         import privacy_export as pe
         job = getattr(self, "_privacy_export", None)
         if job is not None and job.isRunning():
-            show_toast(self, "Export už běží", "info", action_text="Zrušit", on_action=job.stop)
+            show_toast(self, tr("export-already-running"), "info", action_text=tr("action-cancel"), on_action=job.stop)
             return None
         conn = get_connection()
         try:
@@ -5854,7 +5879,7 @@ class MainWindow(QMainWindow):
         finally:
             conn.close()
         if not items:
-            show_toast(self, "Není co exportovat", "info")
+            show_toast(self, tr("export-error-nothing"), "info")
             return None
         opts = export_sheet.ask_options(self, len(items), export_sheet.options_from_config(self.config, title),
                                         pe.exiftool_available())
@@ -5864,41 +5889,41 @@ class MainWindow(QMainWindow):
         start_dir = self.config.get("export_last_dir") or os.path.join(os.path.expanduser("~"), "Pictures")
         base = pe.default_name(title)
         if opts.package == "zip":
-            dest, _ = QFileDialog.getSaveFileName(self, "Uložit export", os.path.join(start_dir, base + ".zip"),
-                                                  "Archiv ZIP (*.zip)")
+            dest, _ = QFileDialog.getSaveFileName(self, tr("export-save-dialog"), os.path.join(start_dir, base + ".zip"),
+                                                  tr("export-zip-filter"))
         else:
-            parent = QFileDialog.getExistingDirectory(self, "Kam export uložit (vytvoří se nová složka)", start_dir)
+            parent = QFileDialog.getExistingDirectory(self, tr("export-pick-folder"), start_dir)
             dest = os.path.join(parent, base) if parent else ""
         if not dest:
             return None
         self.config["export_last_dir"] = os.path.dirname(dest)
         save_config(self.config)
         job = export_sheet.PrivacyExportJob(items, opts, dest, names, self)
-        job.progress.connect(lambda f: self.lbl_status.set_task("privacy_export", f"Exportuji… {f * 100:.0f} %"))
+        job.progress.connect(lambda f: self.lbl_status.set_task("privacy_export", tr("export-progress", value=fmt_number(f * 100, 0))))
 
         def done(res):
             self.lbl_status.set_task("privacy_export", "")
             for name, why in res.excluded + skipped:
                 print(f"[Export] vynecháno: {name} – {why}")
-            text = f"Exportováno: {res.summary()}"
+            text = tr("export-done", value=res.summary())
             if res.excluded:
-                text += " – vyřazené položky by prozradily polohu nebo jména"
-            show_toast(self, text, "success" if not res.excluded else "info", action_text="Zobrazit ve složce",
+                text += " – " + tr("export-excluded-reason")
+            show_toast(self, text, "success" if not res.excluded else "info", action_text=tr("action-show-in-folder"),
                        on_action=lambda: subprocess.Popen(["explorer", "/select,", os.path.normpath(res.path)]))
 
         def failed(err):
             self.lbl_status.set_task("privacy_export", "")
-            show_toast(self, f"Export se nepodařil: {err}", "error")
+            show_toast(self, tr("export-failed", err=err), "error")
 
         def cancelled():
             self.lbl_status.set_task("privacy_export", "")
-            show_toast(self, "Export zrušen – nic se neuložilo", "info")
+            show_toast(self, tr("export-cancelled-nothing"), "info")
         job.finished_ok.connect(done)
         job.failed.connect(failed)
         job.cancelled.connect(cancelled)
         self._privacy_export = job
         job.start()
-        show_toast(self, f"Exportuji {_czech_item_count(len(items))}…", "info", action_text="Zrušit",
+        show_toast(self, tr("export-exporting", items=_czech_item_count(len(items))), "info", action_text=tr("action-cancel"),
                    on_action=job.stop)
         return job
 
@@ -5913,7 +5938,7 @@ class MainWindow(QMainWindow):
 
     def _rename_person(self, person_id: int, current_name: str, page=None):
         new_name, ok = InWindowDialog.getText(
-            self, "Přejmenovat osobu", "Nové jméno:", text=current_name)
+            self, tr("people-rename"), tr("people-new-name-prompt"), text=current_name)
         if ok and new_name.strip():
             try:
                 from database import db_transaction
@@ -5926,11 +5951,11 @@ class MainWindow(QMainWindow):
                 if isinstance(page, DetailPage):
                     page.set_title(new_name.strip())
             except Exception as e:
-                show_toast(self, f"Osobu nelze přejmenovat: {e}", "error")
+                show_toast(self, tr("error-person-rename", e=e), "error")
 
     def _recluster_faces(self):
         threshold = float(self.config.get("face_similarity_threshold", 0.62))
-        self.lbl_status.setText("Přeshlukovávám obličeje...")
+        self.lbl_status.setText(tr("people-regrouping"))
         QCoreApplication.processEvents()
         try:
             stats = strict_recluster_faces(threshold=threshold,
@@ -5939,12 +5964,11 @@ class MainWindow(QMainWindow):
             self._load_people()
             if stats:
                 persons = int(stats.get("anchors", 0)) + int(stats.get("new_people", 0))
-                show_toast(self, f"Přeshlukování dokončeno – {persons} osob, "
-                                 f"{stats.get('faces', 0)} obličejů", "success")
+                show_toast(self, tr("people-regroup-done", people=persons, faces=stats.get('faces', 0)), "success")
             else:
-                show_toast(self, "Žádné obličeje k přeshlukování", "info")
+                show_toast(self, tr("people-regroup-none"), "info")
         except Exception as e:
-            show_toast(self, f"Přeshlukování selhalo: {e}", "error")
+            show_toast(self, tr("people-regroup-failed", e=e), "error")
         finally:
             self.lbl_status.setText("")
 
@@ -5958,11 +5982,10 @@ class MainWindow(QMainWindow):
             finally:
                 conn.close()
         except Exception as e:
-            show_toast(self, f"Osoby nelze načíst: {e}", "error")
+            show_toast(self, tr("error-people-load", e=e), "error")
             return
         if not persons:
-            show_toast(self, "Hraniční obličeje se hledají u pojmenovaných osob – "
-                             "nejdřív některou osobu pojmenujte", "info")
+            show_toast(self, tr("faces-borderline-need-named"), "info")
             return
         # První osoba, která má hraniční obličeje
         for pid, pname in persons:
@@ -5970,18 +5993,18 @@ class MainWindow(QMainWindow):
             if faces:
                 self._push_borderline_review(pid, pname, faces)
                 return
-        show_toast(self, "Žádné hraniční obličeje nenalezeny", "info")
+        show_toast(self, tr("faces-borderline-none"), "info")
 
     def _open_borderline_for_person(self, person_id: int, name: str):
         faces = get_borderline_faces_for_person(person_id)
         if not faces:
-            show_toast(self, f"Žádné hraniční obličeje pro {name}", "info")
+            show_toast(self, tr("faces-borderline-none-for", name=name), "info")
             return
         self._push_borderline_review(person_id, name, faces)
 
     def _push_borderline_review(self, person_id: int, name: str, faces):
         view = BorderlineReviewView(person_id, name, faces)
-        page = DetailPage("Hraniční obličeje", name)
+        page = DetailPage(tr("faces-borderline"), name)
         page.set_content(view)
         view.finished_review.connect(page.back_requested.emit)
         self.nav.push(page, on_pop=lambda v=view: self._on_borderline_done(v))
@@ -5991,10 +6014,10 @@ class MainWindow(QMainWindow):
     def _on_borderline_done(self, view):
         if view.assigned:
             self._load_people()
-            show_toast(self, f"{view.person_name}: potvrzeno obličejů – {view.assigned}", "success")
+            show_toast(self, tr("faces-confirmed-count", person_name=view.person_name, assigned=view.assigned), "success")
 
     def _open_duplicate_review(self):
-        self.lbl_status.setText("Hledám duplicity...")
+        self.lbl_status.setText(tr("duplicates-searching"))
         QCoreApplication.processEvents()
         try:
             from ai_engine import get_duplicate_pairs
@@ -6006,19 +6029,19 @@ class MainWindow(QMainWindow):
             finally:
                 conn.close()
         except Exception as e:
-            show_toast(self, f"Duplicity nelze vyhledat: {e}", "error")
+            show_toast(self, tr("error-duplicates", e=e), "error")
             self.lbl_status.setText("")
             return
         self.lbl_status.setText("")
         if not pairs:
-            show_toast(self, "Žádné duplicitní fotografie nenalezeny", "success")
+            show_toast(self, tr("duplicates-none-photos"), "success")
             return
         self._push_duplicate_review(pairs)
 
     def _push_duplicate_review(self, pairs):
         view = DuplicateReviewView(pairs)
         n = len(view.pairs)
-        page = DetailPage("Duplicity", f"{n} {'možný pár' if n == 1 else 'možné páry' if n < 5 else 'možných párů'}")
+        page = DetailPage(tr("people-duplicates"), tr("count-possible-pairs", count=n))
         page.set_content(view)
         view.finished_review.connect(page.back_requested.emit)
         self.nav.push(page, on_pop=lambda v=view: self._on_duplicates_done(v))
@@ -6031,12 +6054,12 @@ class MainWindow(QMainWindow):
         self._on_library_changed()
         trashed = view.trashed_count()
         if trashed:
-            show_toast(self, f"Přesunuto do koše: {_czech_item_count(trashed)}", "success",
-                       action_text="Zobrazit koš", on_action=self._show_trash)
+            show_toast(self, tr("trash-moved", items=_czech_item_count(trashed)), "success",
+                       action_text=tr("trash-show"), on_action=self._show_trash)
 
     def _on_phash_progress(self, i: int, n: int):
         if i == n or i % 25 == 0:
-            self.lbl_status.setText(f"Počítám otisky ({i}/{n})...")
+            self.lbl_status.setText(tr("status-fingerprints-short", done=i, total=n))
             QCoreApplication.processEvents()
 
     # ── Events ────────────────────────────────────────────────────────────────
@@ -6050,9 +6073,9 @@ class MainWindow(QMainWindow):
             print(f"[Event] {e}")
             records = []
         if not records:
-            show_toast(self, "Událost neobsahuje žádné viditelné položky", "info")
+            show_toast(self, tr("events-no-visible-items"), "info")
             return
-        title = split_event_title((event or {}).get("title") or "Událost")[1]
+        title = split_event_title((event or {}).get("title") or tr("event-default-title"))[1]
         start, end = (event or {}).get("start"), (event or {}).get("end")
         location = (event or {}).get("location")
         page = DetailPage(title, " · ".join(filter(None, [location, _format_date_range(start, end),
@@ -6060,7 +6083,7 @@ class MainWindow(QMainWindow):
         page.set_ambient(self._event_glow(event))               # Polish P4: odstín obálky v hlavičce
         grid = self._make_collection_grid(records, page)
         if (event or {}).get("journey"):
-            page.add_action("Cesta", lambda: self._request_journey(event_id), "Přehrát cestu událostí na mapě")
+            page.add_action(tr("journey"), lambda: self._request_journey(event_id), tr("journey-play-event-tooltip"))
         self._add_slideshow_action(page, grid)
         page.set_content(grid)
         self.nav.push(page)
@@ -6072,13 +6095,13 @@ class MainWindow(QMainWindow):
         Podstránka nad aktuální stránkou; hledání běží na pozadí (EchoJob)."""
         import echoes_view
         self.nav.reset()
-        page = DetailPage("Ozvěny", "Stejné místo, stejný záběr – o roky později")
+        page = DetailPage(tr("nav-echoes"), tr("echoes-subtitle"))
         page.setProperty("sidebar_key", "echoes")
         panel = echoes_view.EchoesPanel(get_connection, page)
         panel.opened.connect(self._open_echo)
         panel.loaded.connect(lambda n: page.set_title(
-            "Ozvěny", f"{n} {'místo' if n == 1 else 'místa' if 2 <= n <= 4 else 'míst'}, kam jste se vrátili"
-            if n else "Stejné místo, stejný záběr – o roky později"))
+            tr("nav-echoes"), tr("echoes-places-returned", count=n)
+            if n else tr("echoes-subtitle")))
         page.set_content(panel)
         self._echoes_panel = panel
         self.nav.push(page, on_pop=self._sync_sidebar)
@@ -6089,14 +6112,14 @@ class MainWindow(QMainWindow):
         import echoes
         import echoes_view
         first, last = echo["items"][0], echo["items"][-1]
-        page = DetailPage(echo.get("place") or "Ozvěna", echoes.subtitle(echo))
+        page = DetailPage(echo.get("place") or tr("echoes-echo"), echoes.subtitle(echo))
         page.setProperty("sidebar_key", "echoes")
         view = echoes_view.ThenNowView(echo, page)
         view.open_photo.connect(lambda mid: self._open_echo_photo(echo, mid))     # dvojklik na polovinu
-        page.add_action("Tehdy", lambda: self._open_echo_photo(echo, echo["items"][view.then_i]["id"]),
-                        f"Snímek z roku {first['year']} v prohlížeči")
-        page.add_action("Teď", lambda: self._open_echo_photo(echo, last["id"]),
-                        f"Snímek z roku {last['year']} v prohlížeči")
+        page.add_action(tr("echoes-then"), lambda: self._open_echo_photo(echo, echo["items"][view.then_i]["id"]),
+                        tr("echoes-shot-in-viewer", year=first['year']))
+        page.add_action(tr("echoes-now"), lambda: self._open_echo_photo(echo, last["id"]),
+                        tr("echoes-shot-in-viewer", year=last['year']))
         page.set_content(view)
         self.nav.push(page)
         view.setFocus()
@@ -6107,13 +6130,13 @@ class MainWindow(QMainWindow):
         """Pro vás › Sestřihy: návrhy filmových sestřihů (reels.py) – výpočet na pozadí."""
         import reels_view
         self.nav.reset()
-        page = DetailPage("Sestřihy", "Nejlepší chvíle ve střihu na rytmus hudby")
+        page = DetailPage(tr("nav-reels"), tr("reels-subtitle"))
         page.setProperty("sidebar_key", "reels")
         panel = reels_view.ReelsPanel(get_connection, page)
         panel.opened.connect(self._open_reel)
         panel.loaded.connect(lambda n: page.set_title(
-            "Sestřihy", f"{n} {'sestřih' if n == 1 else 'sestřihy' if 2 <= n <= 4 else 'sestřihů'} připraveno"
-            if n else "Nejlepší chvíle ve střihu na rytmus hudby"))
+            tr("nav-reels"), tr("reels-ready", count=n)
+            if n else tr("reels-subtitle")))
         page.set_content(panel)
         self._reels_panel = panel
         self.nav.push(page, on_pop=self._sync_sidebar)
@@ -6127,13 +6150,13 @@ class MainWindow(QMainWindow):
         page.setProperty("sidebar_key", "reels")
         body = reels_view.ReelPage(page)
         page.set_content(body)
-        btn_play = page.add_action("Pauza", lambda: body.player and body.player.toggle(), "Přehrát / pozastavit (mezerník)")
-        btn_export = page.add_action("Exportovat MP4…", lambda: self._export_reel(body), "Video H.264 1080p s hudbou ke sdílení")
+        btn_play = page.add_action(tr("reels-pause"), lambda: body.player and body.player.toggle(), tr("viewer-play-pause"))
+        btn_export = page.add_action(tr("reels-export-mp4"), lambda: self._export_reel(body), tr("reels-export-mp4-tooltip"))
         btn_export.setEnabled(False)
 
         def sync_play():
             if body.player is not None:
-                btn_play.setText("Pauza" if body.player.playing else "Přehrát")
+                btn_play.setText(tr("reels-pause") if body.player.playing else tr("guide-play"))
 
         def ready(renderer):
             body.set_renderer(renderer)
@@ -6142,8 +6165,9 @@ class MainWindow(QMainWindow):
                 plan = renderer.plan
                 music = (plan.get("music") or {}).get("title")
                 page.set_title(suggestion["title"], " · ".join(x for x in (
-                    suggestion.get("subtitle", ""), f"{plan['shots']} záběrů", f"{plan['total']:.0f} s",
-                    f"hudba: {music}" if music else "") if x))
+                    suggestion.get("subtitle", ""), tr("count-shots", count=plan['shots']),
+                    tr("unit-seconds", value=fmt_number(plan['total'], 0)),
+                    tr("reels-music", music=music) if music else "") if x))
                 body.player.ended.connect(sync_play)
                 timer = QTimer(page)
                 timer.timeout.connect(sync_play)
@@ -6163,21 +6187,21 @@ class MainWindow(QMainWindow):
         plan = body.player.plan
         body.player.pause()
         start = os.path.join(os.path.expanduser("~"), "Videos", reel_export.default_name(plan))
-        path, _ = QFileDialog.getSaveFileName(self, "Uložit sestřih", start, "Video MP4 (*.mp4)")
+        path, _ = QFileDialog.getSaveFileName(self, tr("reels-save-dialog"), start, tr("reels-mp4-filter"))
         if not path:
             return
         job = reels_view.ExportJob(plan, path, self)
-        job.progress.connect(lambda f: self.lbl_status.set_task("reel_export", f"Exportuji sestřih… {f * 100:.0f} %"))
+        job.progress.connect(lambda f: self.lbl_status.set_task("reel_export", tr("reels-exporting", value=fmt_number(f * 100, 0))))
 
         def done(out, stats):
             self.lbl_status.set_task("reel_export", "")
             print(f"[Reels] export {stats}")
-            show_toast(self, f"Sestřih uložen ({stats['mb']:.0f} MB)", "success", action_text="Zobrazit ve složce",
+            show_toast(self, tr("reels-saved", mb=fmt_number(stats['mb'], 0)), "success", action_text=tr("action-show-in-folder"),
                        on_action=lambda: subprocess.Popen(["explorer", "/select,", os.path.normpath(out)]))
 
         def failed(err):
             self.lbl_status.set_task("reel_export", "")
-            show_toast(self, f"Export se nepodařil: {err}", "error")
+            show_toast(self, tr("export-failed", err=err), "error")
         job.finished_ok.connect(done)
         job.failed.connect(failed)
         self._reel_export = job
@@ -6189,7 +6213,7 @@ class MainWindow(QMainWindow):
             records = fetch_media_records(f"m.id IN ({','.join('?' * len(ids))})", tuple(ids),
                                           order_by="m.date_taken, m.id")
         except Exception as e:
-            show_toast(self, f"Fotky nelze otevřít: {e}", "error")
+            show_toast(self, tr("error-open-photos", e=e), "error")
             return
         index = next((i for i, r in enumerate(records) if int(r[0]) == int(media_id)), 0)
         self._open_viewer(records, index)
@@ -6197,7 +6221,7 @@ class MainWindow(QMainWindow):
     # ── Import ────────────────────────────────────────────────────────────────
 
     def _start_import(self):
-        folder = QFileDialog.getExistingDirectory(self, "Vyberte složku s fotografiemi")
+        folder = QFileDialog.getExistingDirectory(self, tr("import-pick-folder"))
         if not folder:
             return
         self.config["library_folders"] = list(set(
@@ -6208,13 +6232,13 @@ class MainWindow(QMainWindow):
 
     def _run_scan(self, folder: str):
         if self._scanner and self._scanner.isRunning():
-            show_toast(self, "Import už probíhá", "info")
+            show_toast(self, tr("import-already-running"), "info")
             return
         self.nav.reset()
         self.stack.setCurrentIndex(4)
         self._scan_start_time = time.monotonic()
         self.progress_widget.set_progress(0, 1)
-        self.progress_widget.set_status("Spouštím import...")
+        self.progress_widget.set_status(tr("import-starting"))
 
         self._scanner = MediaScannerThread(folder)
         self._scanner.cloud_skipped_signal.connect(self._on_cloud_skipped)
@@ -6238,7 +6262,7 @@ class MainWindow(QMainWindow):
         self._load_events()
         self._start_ai_daemon()
         if processed:
-            show_toast(self, f"Import dokončen: {_czech_item_count(processed)}", "success")
+            show_toast(self, tr("import-done", items=_czech_item_count(processed)), "success")
         if self._background_import:
             QTimer.singleShot(0, self._resume_background_queue)
 
@@ -6261,6 +6285,7 @@ class MainWindow(QMainWindow):
         old_memories = self.config.get("show_memories", True)
         old_precise = self._precise_wanted()
         old_color = self.config.get("color_output", "auto")
+        old_language = self.config.get("language", i18n.SYSTEM)
         dlg = SettingsDialog(self)
         accepted = dlg.exec()
         if dlg.trash_emptied:                  # proběhlo i při Zrušit – knihovna musí sedět s DB
@@ -6272,6 +6297,8 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         self.config = load_config()
+        if self.config.get("language", i18n.SYSTEM) != old_language:
+            self.apply_language(self.config.get("language", i18n.SYSTEM))    # Gate 1: bez restartu
         motion.configure(self.config)       # Omezit animace (Předvolby)
         self._sync_hidden_entry()
         if bool(self.config.get("adaptive_accent", True)) != tokens.adaptive():
@@ -6344,7 +6371,7 @@ class MainWindow(QMainWindow):
         self.config["memories_dismissed"] = datetime.now().date().isoformat()
         save_config(self.config)
         self._sync_memory_card()
-        show_toast(self, "Vzpomínka se zítra objeví znovu", "info")
+        show_toast(self, tr("memories-dismissed"), "info")
 
     # ── Tipy a průvodce (Polish P2) ───────────────────────────────────────────
 
@@ -6464,6 +6491,7 @@ def main(app=None, splash=None):
 
     # Paleta a styly podle motivu (theme.py) a zvýraznění (tokens.py); nové widgety přestyluje filtr
     cfg = load_config()
+    i18n.init_from_config(cfg)            # Gate 1: jazyk dřív, než vznikne první widget
     tokens.configure(cfg)
     motion.configure(cfg)
     configure_display_pipeline(app, cfg)
