@@ -25,6 +25,10 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
 if __name__ == "__main__" and not os.environ.get("KAIROS_NO_SPLASH"):
     import splash
     sys.exit(splash.boot())
+if __name__ == "__main__":
+    # Gate 0 bez úvodní obrazovky: migrace dat do AppData dřív, než importy níže převezmou cesty
+    import data_migration
+    data_migration.ensure_ready()
 
 from paths import (
     BASE_DIR, RESOURCE_DIR, THUMB_DIR as CACHE_DIR, FFMPEG_PATH as DEFAULT_FFMPEG, resolve_face_path,
@@ -64,6 +68,9 @@ from database import (
     get_media_needing_siglip, save_siglip_embeddings, siglip_coverage, get_siglip_vectors,
 )
 from scanner import MediaScannerThread, repair_missing_thumbnails
+import cloud_files
+import media_identity
+import power
 from face_cluster import (
     strict_recluster_faces, get_borderline_faces_for_person,
     assign_face_to_person, invalidate_centroid_cache,
@@ -386,7 +393,8 @@ def shutdown_app(app, window):
     except Exception as e:
         print(f"[Shutdown] {e}")
     if frame_meter.enabled_logging():       # KAIROS_FRAMESTATS=1: statistika snímků do perf_logs/
-        path = frame_meter.write_log(os.path.join(BASE_DIR, "perf_logs"))
+        import paths as _paths_mod
+        path = frame_meter.write_log(os.path.join(_paths_mod.LOG_DIR, "perf_logs"))
         if path:
             print(f"[FrameStats] {path}")
     app.processEvents()
@@ -548,7 +556,8 @@ class ThumbnailWorker(QRunnable):
     def run(self):
         img = QImage()
         for path in (self.thumb_path, self.fallback_path):
-            if path and os.path.exists(path):
+            # Gate 0: originál jen v cloudu se kvůli mřížce nestahuje (posun = stovky souborů)
+            if path and os.path.exists(path) and (path is self.thumb_path or cloud_files.local_ok(path)):
                 img = self._load(path)
                 if not img.isNull():
                     break
@@ -2315,6 +2324,7 @@ class MapBridge(QObject):
 
 PROXY_WORK_SHARE = 0.8      # u videa s převodem: podíl práce na proxy (zbytek = náhledový pás)
 _housekeeping_done = False  # záloha + úklid jen při prvním průchodu démona za běh
+_reconcile_done = False     # Gate 0: kontrola dostupnosti originálů jen jednou za běh
 
 class BackgroundAIDaemon(QThread):
     people_updated     = pyqtSignal()
@@ -2325,6 +2335,7 @@ class BackgroundAIDaemon(QThread):
     status_changed     = pyqtSignal(str)
     siglip_added       = pyqtSignal(list)      # Sprint 4.0: nové vektory přesného hledání
     siglip_progress    = pyqtSignal(int, int)  # (hotovo, celkem) – kdy přepnout hledání
+    identity_checked   = pyqtSignal(dict)      # Gate 0: statistika media_identity.reconcile
 
     def __init__(self, face_threshold: float = 0.62, parent=None, merge_threshold=None):
         super().__init__(parent)
@@ -2336,6 +2347,8 @@ class BackgroundAIDaemon(QThread):
         self.proxy_budget_mb = video_proxy.DEFAULT_BUDGET_MB
         self.ocr_enabled = True                    # Sprint 3: text na fotkách (Předvolby › ocr_text)
         self.siglip_enabled = False                # Sprint 4.0: přesné hledání (Předvolby › search_precise)
+        self._heavy = False                        # Gate 0: právě běží těžký krok (power.py)
+        self.last_reconcile = None
 
     def stop(self):
         self._running = False
@@ -2343,7 +2356,9 @@ class BackgroundAIDaemon(QThread):
     def _yield(self):
         """should_stop pro každou položku práce: během interakce (video, gesto, Cesta) čeká
         na klid (governor), na slabším PC dává UI pauzu. True = skončit."""
-        return governor.get().checkpoint(lambda: not self._running)
+        if power.get().action(self._heavy) == power.PAUSE:
+            self._status(power.get().describe(), force=True)     # „baterie 15 %: AI pozastavena“
+        return governor.get().checkpoint(lambda: not self._running, heavy=self._heavy)
 
     def _status(self, text, force=False):
         now = time.monotonic()
@@ -2369,36 +2384,76 @@ class BackgroundAIDaemon(QThread):
             print(f"[Housekeeping] {e}")
 
     def run(self):
+        # Gate 0: (krok, těžký?) – těžké kroky na baterii zpomalí / počkají na síť (power.py),
+        # lehké (miniatury, opravy) jen zpomalí: knihovna musí zůstat prohlížitelná
+        steps = (
+            (self._housekeeping, False),
+            (self._reconcile_identity, False),
+            (self._repair_thumbnails, False),
+            (self._migrate_embeddings, False),
+            (self._refresh_embeddings, True),        # hledání: miniatury už jsou, embeddingy hned po nich
+            (self._repair_face_crops, False),
+            (self._backfill_fingerprints, False),
+            (self._compute_phashes, True),
+            (self._build_previews, False),
+            (self._analyze_faces, True),
+            (self._build_video_derivatives, True),
+            (self._index_video_frames, True),         # až po proxy: snímky z rychlé SDR kopie
+            (self._improve_person_covers, True),
+            (self._score_smiles, True),
+            (self._index_ocr, True),
+            (self._index_siglip, True),
+        )
         try:
-            self._housekeeping()
-            self._repair_thumbnails()
-            if self._running:
-                self._migrate_embeddings()
-            if self._running:
-                self._refresh_embeddings()       # hledání: miniatury už jsou, embeddingy hned po nich
-            if self._running:
-                self._repair_face_crops()
-            if self._running:
-                self._compute_phashes()
-            if self._running:
-                self._build_previews()
-            if self._running:
-                self._analyze_faces()
-            if self._running:
-                self._build_video_derivatives()
-            if self._running:
-                self._index_video_frames()           # až po proxy: snímky z rychlé SDR kopie
-            if self._running:
-                self._improve_person_covers()
-            if self._running:
-                self._score_smiles()
-            if self._running:
-                self._index_ocr()
-            if self._running:
-                self._index_siglip()
+            for step, heavy in steps:
+                if not self._running:
+                    break
+                self._heavy = heavy
+                step()
         except Exception as e:
             print(f"AI Daemon error: {e}")
+        power.set_thread_eco(False)
         self.status_changed.emit("")
+
+    def _reconcile_identity(self):
+        """Gate 0: dostupnost originálů – jiné písmeno disku = přepsat cesty, odpojený disk =
+        'offline' (nic se nemaže), soubory jen v cloudu = 'cloud'. Jednou za běh."""
+        global _reconcile_done
+        if _reconcile_done:
+            return
+        _reconcile_done = True
+        try:
+            t0 = time.perf_counter()
+            conn = get_connection()
+            try:
+                # zjišťování bez zámku, zápis změn na konci (krátká transakce)
+                stats = media_identity.reconcile(conn, should_stop=lambda: not self._running)
+                conn.commit()
+            finally:
+                conn.close()
+            stats["ms"] = round((time.perf_counter() - t0) * 1000)
+            self.last_reconcile = stats
+            print(f"[Identita] {stats}")
+            if stats["remapped"]:
+                locked_folder.load_hidden_paths()      # registr Skrytých je podle cesty
+            if stats["remapped"] or stats["offline"]:
+                self.identity_checked.emit(stats)
+        except Exception as e:
+            print(f"[Identita] {e}")
+
+    def _backfill_fingerprints(self):
+        """Gate 0: obsahové otisky položek ze starších verzí (64 kB na soubor, jen lokální)."""
+        try:
+            conn = get_connection()
+            try:
+                n = media_identity.backfill_fingerprints(
+                    conn, should_stop=self._yield, exists=cloud_files.local_ok)
+            finally:
+                conn.close()
+            if n:
+                print(f"[Identita] doplněno {n} otisků")
+        except Exception as e:
+            print(f"[Identita] otisky: {e}")
 
     def _refresh_embeddings(self):
         """Embeddingy hledání pro položky bez platného (chybí / bez podpisu zdroje / změněný
@@ -2415,7 +2470,7 @@ class BackgroundAIDaemon(QThread):
                 return
             self._status(f"Připravuji chytré hledání ({i + 1}/{total})...")
             src = thumb_path if thumb_path and os.path.exists(thumb_path) else (
-                file_path if media_type != "video" else None)
+                file_path if media_type != "video" and cloud_files.local_ok(file_path) else None)
             emb = compute_image_embedding(src) if src else None
             if emb is None:
                 continue
@@ -2450,7 +2505,7 @@ class BackgroundAIDaemon(QThread):
         # Jen videa, kterým něco chybí – a jejich délky předem: průběh je vážený délkou (dřív
         # „(i/n)“ přes VŠECHNA videa, kde hotová přeskočila hned a jeden 4K HDR převod pak
         # minuty stál na stejném čísle bez známky života)
-        pending = [p for p in videos if p and os.path.exists(p)
+        pending = [p for p in videos if cloud_files.local_ok(p)
                    and not (video_proxy.is_settled(p) and scrub_strip.has_valid_strip(p))]
         if not pending:
             return
@@ -2688,7 +2743,7 @@ class BackgroundAIDaemon(QThread):
             images, meta = [], []
             for media_id, file_path, thumb_path, media_type, sig in rows[k:k + SIGLIP_BATCH]:
                 src = thumb_path if thumb_path and os.path.exists(thumb_path) else (
-                    file_path if media_type != "video" else None)
+                    file_path if media_type != "video" and cloud_files.local_ok(file_path) else None)
                 if not src:
                     continue
                 try:
@@ -3820,8 +3875,8 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _queue_key(item):
-        if isinstance(item, tuple):          # ("files", [cesty]) – přetažené soubory
-            return ("files",) + tuple(os.path.normcase(p) for p in item[1])
+        if isinstance(item, tuple):          # ("files" | "cloud", [cesty]) – přetažené / ze cloudu
+            return (item[0],) + tuple(os.path.normcase(p) for p in item[1])
         return os.path.normcase(os.path.normpath(item))
 
     def _enqueue_background_import(self, items, skip_running=True):
@@ -3858,10 +3913,12 @@ class MainWindow(QMainWindow):
         item = self._background_import.pop(0)
         self._background_current = item
         if isinstance(item, tuple):
-            scanner = MediaScannerThread(None, files=item[1])
+            # ("cloud", …) = uživatel souhlasil se stažením souborů „jen online“ (Gate 0)
+            scanner = MediaScannerThread(None, files=item[1], allow_cloud=item[0] == "cloud")
         else:
             scanner = MediaScannerThread(item)
         self._scanner = scanner
+        scanner.cloud_skipped_signal.connect(self._on_cloud_skipped)
         scanner.status_signal.connect(self.lbl_status.setText)
         scanner.finished_signal.connect(lambda n, s=scanner, it=item: self._on_background_scan_done(s, it, n))
         scanner.finished.connect(lambda: self.lbl_status.setText(""))
@@ -4351,8 +4408,31 @@ class MainWindow(QMainWindow):
         self._ai_daemon.thumbs_repaired.connect(self._load_photos)
         self._ai_daemon.face_crops_repaired.connect(self._on_face_crops_repaired)
         self._ai_daemon.status_changed.connect(self._on_daemon_status)
+        self._ai_daemon.identity_checked.connect(self._on_identity_checked)
         self._ai_daemon.finished.connect(self._on_ai_daemon_finished)
+        power.get().set_policy(self.config.get("battery_policy", power.DEFAULT_POLICY))
         self._ai_daemon.start()
+
+    def _on_cloud_skipped(self, count, size_bytes, files):
+        """Gate 0: sken přeskočil soubory „jen online“ (OneDrive / iCloud). Bez výslovného
+        souhlasu se nic nestahuje – nabídka stáhnout a naimportovat je na pozadí."""
+        if count <= 0 or not files:
+            return
+        size = cloud_files.human_size(size_bytes)
+        show_toast(self, f"Souborů jen v cloudu: {count} ({size}) – bez souhlasu se nestahují", "info",
+                   action_text=f"Stáhnout {size} a importovat",
+                   on_action=lambda f=list(files): self._enqueue_background_import([("cloud", f)]),
+                   timeout_ms=None, dismiss_text="Teď ne")
+
+    def _on_identity_checked(self, stats):
+        """Gate 0: výsledek kontroly dostupnosti – přesunuté disky se tiše přepojily, odpojené
+        jsou Offline (alba, tváře a oblíbené zůstávají; nic se nemaže)."""
+        remapped, offline = int(stats.get("remapped", 0)), int(stats.get("offline", 0))
+        if remapped:
+            self._load_photos()
+        if offline:
+            show_toast(self, f"Offline: {offline} položek (odpojený disk) – nic se nemaže, "
+                             f"po připojení disku se samy vrátí", "info")
 
     def _on_ai_daemon_finished(self):
         if getattr(self, "_ai_daemon_rerun", False) and not getattr(self, "_shutting_down", False):
@@ -6137,6 +6217,7 @@ class MainWindow(QMainWindow):
         self.progress_widget.set_status("Spouštím import...")
 
         self._scanner = MediaScannerThread(folder)
+        self._scanner.cloud_skipped_signal.connect(self._on_cloud_skipped)
         self._scanner.progress_signal.connect(self._on_scan_progress)
         self._scanner.status_signal.connect(self.progress_widget.set_status)
         self._scanner.finished_signal.connect(self._on_scan_finished)

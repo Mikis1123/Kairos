@@ -168,6 +168,7 @@ def find_new_media(folders, known_keys, should_stop=None):
     """Nové soubory ve sledovaných složkách (cesty, které DB nezná). Video Live Photo se
     stejným názvem jako fotka vedle se nepočítá zvlášť – uživatel vidí „fotky“, ne soubory."""
     from scanner import SUPPORTED_EXTS, _path_key
+    import cloud_files
     found = []
     for folder in folders:
         if not folder or not os.path.isdir(folder):
@@ -185,6 +186,8 @@ def find_new_media(folders, known_keys, should_stop=None):
                     continue
                 if ext == ".mov" and Path(f).stem.lower() in stills:
                     continue                       # pohybová část Live Photo
+                if cloud_files.is_placeholder(full):
+                    continue                       # Gate 0: jen v cloudu – nabídne je až sken se souhlasem
                 found.append(full)
     return found
 

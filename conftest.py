@@ -36,3 +36,9 @@ _config_tmp = tempfile.mkdtemp(prefix="omni_test_config_")
 config.CONFIG_FILE = os.path.join(_config_tmp, "config.json")
 config.LEGACY_CONFIG_FILE = os.path.join(_config_tmp, "legacy", "config.json")
 atexit.register(shutil.rmtree, _config_tmp, True)
+
+# Gate 0: governor na baterii zpomaluje / pozastavuje práci na pozadí (power.py) – testy běží
+# vždy „ze sítě“, ať výsledek nezávisí na tom, jestli je notebook právě připojený
+import power  # noqa: E402
+
+power.get().override = power.PowerState()

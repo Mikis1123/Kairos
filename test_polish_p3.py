@@ -213,9 +213,10 @@ class _FakeScanner:
             for s in list(self.slots):
                 s(*a)
 
-    def __init__(self, folder, files=None):
-        self.folder, self.files = folder, files
+    def __init__(self, folder, files=None, allow_cloud=False):
+        self.folder, self.files, self.allow_cloud = folder, files, allow_cloud
         self.status_signal, self.finished_signal, self.finished = self._Sig(), self._Sig(), self._Sig()
+        self.cloud_skipped_signal = self._Sig()          # Gate 0: soubory jen v cloudu
         self.running = False
 
     def start(self):

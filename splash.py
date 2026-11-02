@@ -298,6 +298,10 @@ def boot():
     brand.set_windows_app_id()
     app.setWindowIcon(brand.app_icon())
 
+    # Gate 0: data do AppData (jednorázová migrace) DŘÍV, než config / databáze sáhnou na disk
+    import data_migration
+    data_migration.ensure_ready()
+
     import theme
     from config import load_config
     cfg = load_config()

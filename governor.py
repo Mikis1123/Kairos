@@ -23,8 +23,11 @@ import threading
 import time
 from contextlib import contextmanager
 
+import power
+
 QUIET_S = 2.0
 POLL_S = 0.1
+POWER_POLL_S = 1.0          # na baterii pozastavená těžká práce: jak často se dívat na napájení
 PROCESS_SUSPEND_RESUME = 0x0800
 PROCESS_SET_QUOTA = 0x0100
 PROCESS_TERMINATE = 0x0001
@@ -41,6 +44,8 @@ class Governor:
         self._item_pause = 0.0
         self._leases = {}                  # důvod -> threading.Timer (automatické uvolnění)
         self.suspend_count = 0             # statistika (testy / ladění)
+        self.power_paused = False          # Gate 0: těžká práce čeká na napájení ze sítě
+        self.throttled_items = 0           # Gate 0: položky zpomalené kvůli baterii
 
     # ── interakce (GUI vlákno) ──
     def hold(self, reason):
@@ -121,12 +126,33 @@ class Governor:
             time.sleep(POLL_S)
         return not (should_stop is not None and should_stop())
 
-    def checkpoint(self, should_stop=None):
-        """Volá se mezi položkami práce na pozadí. True = skončit."""
+    def checkpoint(self, should_stop=None, heavy=False):
+        """Volá se mezi položkami práce na pozadí. True = skončit.
+
+        Gate 0 – napájení (power.py): na baterii se těžká práce (heavy: CLIP, SigLIP, tváře,
+        OCR, videa) zpomalí a vlákno přejde do EcoQoS; při Spořiči baterie / slabé baterii
+        (nebo politice „pause“) těžká práce čeká, dokud se notebook nepřipojí."""
         if not self.wait_quiet(should_stop):
             return True
-        if self._item_pause:
-            time.sleep(self._item_pause)
+        mon = power.get()
+        act = mon.action(heavy)
+        power.set_thread_eco(act != power.RUN)
+        if act == power.PAUSE:
+            self.power_paused = True
+            while mon.action(heavy) == power.PAUSE:
+                if should_stop is not None and should_stop():
+                    return True
+                time.sleep(POWER_POLL_S)
+            self.power_paused = False
+            power.set_thread_eco(mon.action(heavy) != power.RUN)
+            if not self.wait_quiet(should_stop):
+                return True
+        pause = self._item_pause
+        if act == power.THROTTLE:
+            pause += power.HEAVY_PAUSE_S if heavy else power.LIGHT_PAUSE_S
+            self.throttled_items += 1
+        if pause:
+            time.sleep(pause)
         return bool(should_stop is not None and should_stop())
 
     # ── procesy (ffmpeg) ──

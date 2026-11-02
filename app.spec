@@ -9,7 +9,9 @@ block_cipher = None
 datas = []
 
 # config.json se NEPŘIBALUJE: obsahoval by předvolby a cesty ke složkám toho, kdo build
-# vytvořil. Aplikace si při prvním spuštění vytvoří výchozí config vedle .exe (paths.CONFIG_PATH).
+# vytvořil. Gate 0: data uživatele nejsou vedle .exe – config.json, photos.db, vault a zálohy
+# vzniknou v %APPDATA%\Kairos, mezipaměť a ořezy tváří v %LOCALAPPDATA%\Kairos (paths.py);
+# instalace do Program Files je tak jen pro čtení. portable.txt vedle .exe = přenosný režim.
 candidates = [
     'ffmpeg.exe',
     'face_detection_yunet_2023mar.onnx',
@@ -71,7 +73,10 @@ hidden_imports = [
     'PyQt6.QtQuick',
     'PyQt6.QtQml',
     'reverse_geocoder',
-    'pillow_heif'
+    'pillow_heif',
+    # Gate 0: obsahový otisk médií (media_identity) – C rozšíření, ať ho analýza nepřehlédne
+    'xxhash',
+    'data_migration',
 ]
 hidden_imports += collect_submodules('pillow_heif')
 # Sprint 3: OCR Windows (ocr_engine) – projekce winrt se načítají dynamicky

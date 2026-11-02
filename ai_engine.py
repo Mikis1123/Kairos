@@ -654,7 +654,8 @@ def _phash_source(media_id, file_path, thumb_path, media_type):
     if thumb_path and os.path.exists(thumb_path) \
             and os.path.basename(thumb_path).lower() == f"thumb_{media_id}.jpg":
         return thumb_path
-    if media_type != "video" and file_path and os.path.exists(file_path):
+    import cloud_files
+    if media_type != "video" and cloud_files.local_ok(file_path):   # Gate 0: ne jen-v-cloudu
         return file_path
     return None
 

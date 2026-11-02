@@ -280,7 +280,14 @@ def init_db():
             # Stage 3: složka Skryté (locked_folder) – mimo knihovnu, hledání, tváře, mapu i sestřihy
             ("is_hidden", "INTEGER DEFAULT 0"),
             ("hidden_at", "TEXT"),
+            # Gate 0: identita nezávislá na cestě (media_identity) – svazek + relativní cesta,
+            # obsahový otisk (velikost + xxh3 prvních 64 kB) a dostupnost originálu
+            ("volume_guid", "TEXT"),
+            ("vol_rel_path", "TEXT"),
+            ("fingerprint", "TEXT"),
+            ("availability", "TEXT"),
         ])
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_fingerprint ON media_items(fingerprint)")
         if "faces_scanned" in added_media:
             # Fotky, které už mají nalezené obličeje, se znovu analyzovat nemusí.
             cursor.execute("""

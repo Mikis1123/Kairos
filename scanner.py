@@ -12,6 +12,8 @@ from datetime import datetime
 from collections import Counter
 from PyQt6.QtCore import QThread, pyqtSignal
 from database import get_connection, db_transaction, upsert_media_item
+import cloud_files
+import media_identity
 import reverse_geocoder as rg
 from PIL import Image, ImageOps
 import color_manage
@@ -289,8 +291,8 @@ def repair_missing_thumbnails(should_stop=None, progress=None, flush_every=50):
             if should_stop and should_stop():
                 stopped = True
                 break
-            if not fp or not os.path.exists(fp):
-                continue  # zdroj chybí (odpojený disk?) - nic neznačit, zkusí se příště
+            if not cloud_files.local_ok(fp):
+                continue  # zdroj chybí (odpojený disk?) / jen v cloudu - nic neznačit, zkusí se příště
             thumb_path = os.path.join(CACHE_DIR, f"thumb_{item_id}.jpg")
             if make_thumbnail(fp, thumb_path, m_type, paired):
                 updates.append((thumb_path, item_id))
@@ -339,13 +341,19 @@ class MediaScannerThread(QThread):
     progress_signal = pyqtSignal(int, int)
     status_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(int)
+    # Gate 0: soubory jen v cloudu (OneDrive / iCloud), které sken přeskočil – (počet, bajty, cesty)
+    cloud_skipped_signal = pyqtSignal(int, float, list)
 
-    def __init__(self, target_folder, exiftool_path=None, batch_size=50, files=None):
+    def __init__(self, target_folder, exiftool_path=None, batch_size=50, files=None, allow_cloud=False):
         """target_folder = složka (rekurzivně), nebo None a files = seznam souborů (přetažené
-        soubory: indexují se na místě, nic se nekopíruje)."""
+        soubory: indexují se na místě, nic se nekopíruje). allow_cloud = uživatel výslovně
+        souhlasil se stažením souborů „jen online“ (jinak se přeskočí a nahlásí)."""
         super().__init__()
         self.target_folder = target_folder
         self.files = list(files) if files is not None else None
+        self.allow_cloud = bool(allow_cloud)
+        self.cloud_files = []            # [(cesta, velikost)] přeskočené zástupné soubory
+        self.reconnected = 0             # Gate 0: přesunuté soubory znovupřipojené k položkám
         self.exiftool_path = exiftool_path if (exiftool_path and os.path.exists(exiftool_path)) else DEFAULT_EXIFTOOL
         self.ffmpeg_path = DEFAULT_FFMPEG
         self.batch_size = batch_size
@@ -377,16 +385,40 @@ class MediaScannerThread(QThread):
 
     # ------------------------------------------------------------------
     def _collect_files(self):
+        """Podporované soubory. Zástupné soubory cloudu (atributy z výpisu složky – nic se
+        neotevírá) jdou bez souhlasu do self.cloud_files místo ke zpracování."""
+        self.cloud_files = []
         if self.files is not None:
-            return with_live_partners(self.files)
+            out = []
+            for p in with_live_partners(self.files):
+                if not self.allow_cloud and cloud_files.is_placeholder(p):
+                    try:
+                        self.cloud_files.append((p, os.stat(p).st_size))
+                    except OSError:
+                        pass
+                    continue
+                out.append(p)
+            return out
         all_files = []
-        for root, _, files in os.walk(self.target_folder):
+        for root, dirs, files in os.walk(self.target_folder):
             if not self._is_running:
                 return None
             for f in files:
                 if Path(f).suffix.lower() in SUPPORTED_EXTS:
                     all_files.append(os.path.join(root, f))
-        return all_files
+        if self.allow_cloud:
+            return all_files
+        out = []
+        for p in all_files:
+            try:
+                st = os.stat(p)            # metadata (atributy) – data souboru se nestahují
+            except OSError:
+                continue
+            if cloud_files.stat_is_placeholder(st):
+                self.cloud_files.append((p, st.st_size))
+            else:
+                out.append(p)
+        return out
 
     def _load_known_media(self):
         """path_key -> (uložená cesta, velikost, mtime) pro všechna média v DB."""
@@ -398,8 +430,11 @@ class MediaScannerThread(QThread):
         finally:
             conn.close()
 
-    def _classify(self, all_files, known):
-        """Rozdělí soubory na nové/změněné (ke zpracování) a beze změny (přeskočit)."""
+    def _classify(self, all_files, known, missing=None):
+        """Rozdělí soubory na nové/změněné (ke zpracování) a beze změny (přeskočit).
+        Prvky to_process: (skutečná cesta, cesta v DB, velikost, mtime[, kandidáti, otisk]).
+        missing = media_identity.MissingIndex (Gate 0): nový soubor s otiskem chybějící
+        položky dostane kandidáty – _insert_item ho po ověření data EXIF připojí k ní."""
         to_process, backfill, skipped = [], [], 0
         for p in all_files:
             try:
@@ -409,7 +444,12 @@ class MediaScannerThread(QThread):
             size, mtime = st.st_size, st.st_mtime
             row = known.get(_path_key(p))
             if row is None:
-                to_process.append((p, os.path.normpath(p), size, mtime))
+                if missing:
+                    fp = media_identity.fingerprint(p, size)
+                    cands = missing.candidates(p, size, fp)
+                    to_process.append((p, os.path.normpath(p), size, mtime, cands, fp))
+                else:
+                    to_process.append((p, os.path.normpath(p), size, mtime))
                 continue
             stored_path, k_size, k_mtime = row
             if k_size == size and (k_mtime is None or abs(k_mtime - mtime) < MTIME_TOLERANCE_SEC):
@@ -430,12 +470,23 @@ class MediaScannerThread(QThread):
             return 0
         if all_files is None:       # zrušeno
             return 0
+        if self.cloud_files:
+            self.cloud_skipped_signal.emit(len(self.cloud_files), float(sum(sz for _, sz in self.cloud_files)),
+                                           [p for p, _ in self.cloud_files])
+            print(f"[Cloud] přeskočeno {len(self.cloud_files)} souborů jen v cloudu (bez souhlasu se nestahují)")
         if not all_files:
             return 0
 
         total_files = len(all_files)
         known = self._load_known_media()
-        to_process, backfill, skipped = self._classify(all_files, known)
+        missing = None
+        if any(_path_key(p) not in known for p in all_files):
+            conn = get_connection()
+            try:
+                missing = media_identity.MissingIndex.load(conn)
+            finally:
+                conn.close()
+        to_process, backfill, skipped = self._classify(all_files, known, missing)
 
         if backfill:
             try:
@@ -455,14 +506,26 @@ class MediaScannerThread(QThread):
             try:
                 with db_transaction() as conn:
                     cursor = conn.cursor()
-                    for real_path, db_path, size, mtime in batch:
+                    for entry in batch:
+                        real_path, db_path, size, mtime = entry[:4]
+                        cands, fp = (entry[4], entry[5]) if len(entry) > 4 else (None, None)
                         meta = meta_by_key.get(_path_key(real_path)) or {"SourceFile": real_path}
-                        self._insert_item(cursor, meta, db_path, size, mtime)
+                        self._insert_item(cursor, meta, db_path, size, mtime, cands=cands, fp=fp,
+                                          missing=missing)
             except Exception as e:
                 print(f"Chyba při dávkovém zápisu metadat: {e}")
 
             done += len(batch)
             self._emit_progress((done / total_files) * 45)
+
+        if self.reconnected:
+            print(f"[Identita] znovupřipojeno {self.reconnected} přesunutých / přejmenovaných souborů "
+                  f"(alba, tváře a oblíbené zůstaly)")
+            try:
+                import locked_folder
+                locked_folder.load_hidden_paths()      # registr Skrytých je podle cesty
+            except Exception as e:
+                print(f"[Identita] registr Skrytých: {e}")
 
         # Sprint 2: nové položky – oblíbené a opravená poloha z XMP sidecarů (knihovna po ztrátě DB)
         if to_process:
@@ -649,8 +712,9 @@ class MediaScannerThread(QThread):
 
         return result
 
-    def _insert_item(self, cursor, meta, db_path, size, mtime):
-        """UPSERT jednoho souboru (nikdy nemaže existující řádek)."""
+    def _insert_item(self, cursor, meta, db_path, size, mtime, cands=None, fp=None, missing=None):
+        """UPSERT jednoho souboru (nikdy nemaže existující řádek). cands = chybějící položky se
+        stejným otiskem (Gate 0): při shodě data pořízení se soubor připojí k té položce."""
         file_path = db_path
         if not file_path:
             return
@@ -664,6 +728,11 @@ class MediaScannerThread(QThread):
                 date_taken = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 date_taken = ""
+
+        if cands and missing is not None:
+            pick = missing.choose(cands, date_taken)
+            if pick is not None and media_identity.rekey(cursor, pick, file_path, fp):
+                self.reconnected += 1
 
         try:
             upsert_media_item(cursor, {
@@ -684,6 +753,11 @@ class MediaScannerThread(QThread):
                 "content_identifier": str(meta.get("ContentIdentifier", "")),
                 "raw_metadata_json": json.dumps(meta, default=str),
             })
+            guid, rel = media_identity.identity_of(file_path)
+            if fp is None:
+                fp = media_identity.fingerprint(file_path, size)
+            cursor.execute("UPDATE media_items SET volume_guid = ?, vol_rel_path = ?, fingerprint = ?, "
+                           "availability = NULL WHERE file_path = ?", (guid, rel, fp, file_path))
         except Exception as err:
             print(f"Chyba zápisu souboru {file_name}: {err}")
 

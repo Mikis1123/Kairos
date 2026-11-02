@@ -45,8 +45,14 @@ CHUNK = 1 << 20
 
 
 def model_dir():
-    """Zapisovatelná složka vedle aplikace (ne _internal balíčku – ten může být jen pro čtení)."""
-    return os.path.join(paths.BASE_DIR, "models", "siglip2")
+    """Zapisovatelná složka modelu (Gate 0: LOCALAPPDATA\Kairos\models, ne složka aplikace – ta
+    může být v Program Files jen pro čtení). Model stažený dřív vedle aplikace se použije,
+    dokud ho migrace nepřesune (jiný disk = zůstává na místě)."""
+    new = os.path.join(paths.MODELS_DIR, "siglip2")
+    legacy = os.path.join(paths.LEGACY_DIR, "models", "siglip2")
+    if not installed(new) and os.path.normcase(legacy) != os.path.normcase(new) and installed(legacy):
+        return legacy
+    return new
 
 
 def installed(folder=None):
