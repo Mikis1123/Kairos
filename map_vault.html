@@ -16,6 +16,7 @@
      WebUrlInterceptor v main.py (ALLOWED_WEB_HOSTS). -->
 <link rel="stylesheet" href="vendor/maplibre/maplibre-gl.css">
 <script src="vendor/maplibre/maplibre-gl.js"></script>
+<script src="map_style.js"></script>
 <script src="director.js"></script>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <style>
@@ -82,6 +83,10 @@
 
   /* Piny fotek kreslí WebGL (vrstva „pins“, obrázky z plátna) – drží přesně na souřadnicích
      i během posunu a přiblížení; HTML značky se k plátnu dorovnávaly se zpožděním („plavaly“) */
+
+  /* Spring split / merge: moving pins as composited sprites over the canvas (runSpring) */
+  #pinSprites { position: absolute; inset: 0; pointer-events: none; z-index: 4; overflow: hidden; contain: strict; }
+  .pin-sprite { position: absolute; left: 0; top: 0; transform-origin: 50% 50%; will-change: transform, opacity; }
 
   /* Náhledová karta při najetí na pin */
   #card { position: absolute; z-index: 12; pointer-events: none; width: 216px; padding: 8px; border-radius: 12px;
@@ -220,9 +225,39 @@
   .chap.now { opacity: 1; transform: translateY(-2px) scale(1.06);
               box-shadow: 0 0 0 2px var(--accent), 0 8px 18px rgba(0,0,0,0.5); }
   .chap:hover { opacity: 1; }
-  #jprogress { position: absolute; left: 10px; right: 10px; bottom: 4px; height: 2px; border-radius: 2px;
-               background: rgba(255,255,255,0.12); overflow: hidden; }
-  #jprogress i { display: block; height: 100%; background: var(--accent); transform-origin: 0 50%; transform: scaleX(0); }
+  /* Seekable timeline: a 2 px line in a 14 px hit area along the bottom of the strip; it grows
+     on hover, a click or drag scrubs the film (director time), day boundaries are ticks */
+  #jprogress { position: absolute; left: 10px; right: 10px; bottom: -2px; height: 14px; cursor: pointer;
+               touch-action: none; outline: none; }
+  #jprogress::before { content: ''; position: absolute; left: 0; right: 0; top: 6px; height: 2px; border-radius: 2px;
+                       background: rgba(255,255,255,0.12); transition: height .15s ease, top .15s ease; }
+  #jprogress i { position: absolute; left: 0; right: 0; top: 6px; display: block; height: 2px; border-radius: 2px;
+                 background: var(--accent); transform-origin: 0 50%; transform: scaleX(0);
+                 transition: height .15s ease, top .15s ease; }
+  #jprogress:hover::before, #jprogress:hover i, #jprogress.drag::before, #jprogress.drag i,
+  #jprogress:focus-visible::before, #jprogress:focus-visible i { top: 5px; height: 4px; }
+  #jprogress b { position: absolute; inset: 0; pointer-events: none; }
+  #jprogress b span { position: absolute; top: 3px; width: 2px; height: 8px; margin-left: -1px; border-radius: 1px;
+                      background: rgba(255,255,255,0.45); }
+  /* Day chapters of a multi-day Journey: "Whole trip" + one pill per day above the dock */
+  #jdays { position: absolute; left: 50%; bottom: 92px; transform: translateX(-50%); max-width: min(980px, calc(100% - 32px));
+           display: flex; gap: 4px; padding: 4px; border-radius: 14px; overflow-x: auto; scrollbar-width: none;
+           pointer-events: auto; box-sizing: border-box; }
+  #jdays[hidden] { display: none; }
+  #jdays::-webkit-scrollbar { display: none; }
+  #jdays button { all: unset; flex: 0 0 auto; cursor: pointer; display: flex; align-items: center; gap: 7px;
+                  padding: 4px 11px 4px 4px; border-radius: 10px; font-size: 12px; color: #F5F5F7; white-space: nowrap;
+                  transition: background .2s ease, box-shadow .2s ease; }
+  #jdays button.whole { padding-left: 11px; font-weight: 650; }
+  #jdays button:hover { background: rgba(255,255,255,0.10); }
+  #jdays button:focus-visible { outline: 2px solid var(--accent); }
+  #jdays button[aria-selected="true"] { background: rgba(255,255,255,0.16); box-shadow: inset 0 0 0 1.5px var(--accent); }
+  #jdays button.here:not([aria-selected="true"]) { box-shadow: inset 0 -2px 0 var(--accent); }
+  #jdays button.solo { opacity: .72; }
+  #jdays .th { width: 24px; height: 24px; border-radius: 7px; background: #2C2C2E center/cover no-repeat; }
+  #jdays .dn { font-weight: 650; }
+  #jdays .dd { color: var(--text-2); }
+  #jctl button[hidden], #jcap .actions [hidden] { display: none; }
   @media (prefers-reduced-motion: reduce) {
     #jcap, .moment, .chap, #jcaption, .moment .meta > *, .comet, .comet .halo { transition: none; }
     .moment.show .ph.on { animation: none; }
@@ -258,23 +293,28 @@
     <h1 id="jtitle"></h1><div class="meta" id="jmeta"></div>
     <div class="highlights" id="jhigh"></div>
     <div class="actions"><button type="button" class="pill" id="jreplay" data-i18n="replay">Play Again</button>
+      <button type="button" class="pill" id="jwhole" data-i18n="whole-trip" hidden>Whole trip</button>
+      <button type="button" class="pill primary" id="jnextday" data-i18n="next-day" hidden>Next day</button>
       <button type="button" class="pill primary" id="jdone" data-i18n="done">Done</button></div>
   </div>
+  <div id="jdays" class="solid" role="tablist" aria-label="Trip days" data-i18n-aria="days-a11y" hidden></div>
   <div id="jdock">
     <div id="jctl" class="solid" role="toolbar" aria-label="Journey playback" data-i18n-aria="controls-a11y">
       <button type="button" id="jprev" aria-label="Previous stop" data-i18n-aria="prev-stop"><svg viewBox="0 0 16 16"><path d="M3 2.5h1.6v11H3zM13.5 2.8v10.4L5.8 8z"/></svg></button>
       <button type="button" id="jplay" aria-label="Pause"><svg viewBox="0 0 16 16"><path id="jplayicon" d="M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z"/></svg></button>
       <button type="button" id="jnext" aria-label="Next stop" data-i18n-aria="next-stop"><svg viewBox="0 0 16 16"><path d="M11.4 2.5H13v11h-1.6zM2.5 2.8v10.4L10.2 8z"/></svg></button>
+      <button type="button" id="jdaynext" aria-label="Next day" data-i18n-aria="next-day" title="Next day (Page Down)" data-i18n-title="next-day-tip" hidden><svg viewBox="0 0 16 16"><path d="M1.5 2.8v10.4L7.6 8zM7.9 2.8v10.4L14 8z"/></svg></button>
       <button type="button" id="jmusic" aria-label="Music" aria-pressed="false" title="Music" hidden><svg viewBox="0 0 16 16"><path d="M6 3.2 13.5 1.5v9.2a2.1 2.1 0 1 1-1.4-2V4.3L7.4 5.4v7.1a2.1 2.1 0 1 1-1.4-2z"/></svg></button>
       <button type="button" id="jclose" aria-label="End Journey (Esc)" data-i18n-aria="end-journey"><svg viewBox="0 0 16 16"><path d="M3.7 2.6 8 6.9l4.3-4.3 1.1 1.1L9.1 8l4.3 4.3-1.1 1.1L8 9.1l-4.3 4.3-1.1-1.1L6.9 8 2.6 3.7z"/></svg></button>
     </div>
     <div id="jstripwrap" class="solid"><div id="jstrip" role="list" aria-label="Journey stops" data-i18n-aria="stops-a11y"></div>
-      <div id="jprogress"><i id="jprogbar"></i></div></div>
+      <div id="jprogress" role="slider" tabindex="0" aria-label="Film position" data-i18n-aria="seek-a11y"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="jprogbar"></i><b id="jdayticks"></b></div></div>
   </div>
 </div>
 <script>
   // ── Gate 1: texty stránky z katalogu aplikace (i18n.page_strings("map-")); angličtina = zdroj ──
-  var DEFAULT_STRINGS = /*I18N-DEFAULTS*/{"controls-a11y": "Journey playback", "count-photos": {"$plural": "count", "forms": {"*": "{count} photos", "one": "{count} photo", "other": "{count} photos"}, "lang": "en"}, "count-stops": {"$plural": "count", "forms": {"*": "{count} stops", "one": "{count} stop", "other": "{count} stops"}, "lang": "en"}, "done": "Done", "empty-body": "Photos with GPS coordinates appear here after import.", "empty-title": "No Photos with a Location", "end-journey": "End Journey (Esc)", "globe": "Globe", "globe-tip": "Back to the globe (Esc)", "journey": "Journey", "journey-end": "End of the Journey", "journeys": "Journeys", "journeys-tip": "Play an event’s Journey", "layer-outdoor": "Outdoor", "layer-outdoor-tip": "Contours, hillshading, and marked trails", "layer-satellite": "Satellite", "layer-satellite-tip": "Aerial imagery (Esri) with vector roads and labels", "layer-standard": "Standard", "layer-standard-tip": "Light vector map with local place names (OpenFreeMap)", "layers-a11y": "Map style", "multiple-places": "Multiple places", "music-off": "Turn music off", "music-on": "Turn music on", "next-stop": "Next stop", "nogl-body": "The globe is drawn with WebGL, which isn’t available here. Your photos and their locations are unaffected.", "nogl-title": "The Map Needs Graphics Acceleration", "pause": "Pause", "phase-dawn": "Dawn", "phase-day": "Day", "phase-dusk": "Dusk", "phase-golden": "Golden hour", "phase-night": "Night", "photos-on-map": {"$plural": "count", "forms": {"*": "{count} photos on the map", "one": "{count} photo on the map", "other": "{count} photos on the map"}, "lang": "en"}, "play": "Play", "play-journey": "Play a Journey", "prev-stop": "Previous stop", "replay": "Play Again", "stop-n": "Stop {n}", "stops-a11y": "Journey stops", "tilt-off": "Top-down view (2D)", "tilt-on": "Tilt (3D)", "unavailable-body": "The map view couldn’t start ({e}). Your photos and their locations are unaffected.", "unavailable-title": "Map Unavailable", "years-ago": {"$plural": "years", "forms": {"*": "{years} years ago", "one": "A year ago", "other": "{years} years ago"}, "lang": "en"}}/*END*/;
+  var DEFAULT_STRINGS = /*I18N-DEFAULTS*/{"controls-a11y": "Journey playback", "count-photos": {"$plural": "count", "forms": {"*": "{count} photos", "one": "{count} photo", "other": "{count} photos"}, "lang": "en"}, "count-stops": {"$plural": "count", "forms": {"*": "{count} stops", "one": "{count} stop", "other": "{count} stops"}, "lang": "en"}, "day-n": "Day {n}", "day-one-place": "one place, plays within the whole trip", "days-a11y": "Days of the trip", "done": "Done", "empty-body": "Photos with GPS coordinates appear here after import.", "empty-title": "No Photos with a Location", "end-journey": "End Journey (Esc)", "globe": "Globe", "globe-tip": "Back to the globe (Esc)", "journey": "Journey", "journey-end": "End of the Journey", "journeys": "Journeys", "journeys-tip": "Play an event’s Journey", "layer-outdoor": "Outdoor", "layer-outdoor-tip": "Contours, hillshading, and marked trails", "layer-satellite": "Satellite", "layer-satellite-tip": "Aerial imagery (Esri) with vector roads and labels", "layer-standard": "Standard", "layer-standard-tip": "Light vector map with local place names (OpenFreeMap)", "layers-a11y": "Map style", "multiple-places": "Multiple places", "music-off": "Turn music off", "music-on": "Turn music on", "next-day": "Next day", "next-day-tip": "Next day (Page Down)", "next-stop": "Next stop", "nogl-body": "The globe is drawn with WebGL, which isn’t available here. Your photos and their locations are unaffected.", "nogl-title": "The Map Needs Graphics Acceleration", "pause": "Pause", "phase-dawn": "Dawn", "phase-day": "Day", "phase-dusk": "Dusk", "phase-golden": "Golden hour", "phase-night": "Night", "photos-on-map": {"$plural": "count", "forms": {"*": "{count} photos on the map", "one": "{count} photo on the map", "other": "{count} photos on the map"}, "lang": "en"}, "play": "Play", "play-journey": "Play a Journey", "prev-stop": "Previous stop", "replay": "Play Again", "seek-a11y": "Position in the Journey", "stop-n": "Stop {n}", "stops-a11y": "Journey stops", "tilt-off": "Top-down view (2D)", "tilt-on": "Tilt (3D)", "unavailable-body": "The map view couldn’t start ({e}). Your photos and their locations are unaffected.", "unavailable-title": "Map Unavailable", "whole-trip": "Whole trip", "years-ago": {"$plural": "years", "forms": {"*": "{years} years ago", "one": "A year ago", "other": "{years} years ago"}, "lang": "en"}}/*END*/;
   var I18N = {};
   var LANG = 'en';
   function T(key, args) {
@@ -472,41 +512,14 @@
     } catch (e) { return false; }
   }
 
-  function clone(o) { return JSON.parse(JSON.stringify(o)); }
-
-  // České názvy: name:cs, jinak latinka, jinak místní název (liberty ukazuje anglické name_en)
-  // názvy míst v jazyce aplikace (OpenMapTiles name:xx), jinak latinkou / místní
-  function nameField() { return ['coalesce', ['get', 'name:' + LANG.split('-')[0]], ['get', 'name:latin'], ['get', 'name']]; }
+  // Founder audit: style transforms live in map_style.js (shared with the viewer's mini-map,
+  // so both surfaces draw the identical Standard map)
+  var MS = window.KairosMapStyle;
+  var clone = MS.clone;
+  function nameField() { return MS.nameField(LANG); }
   var CS_NAME = nameField();
-  function isNameField(tf) {
-    var s = JSON.stringify(tf || '');
-    return s.indexOf('name') >= 0 && s.indexOf('"ref"') < 0;
-  }
-  // Kairos: filtry liberty porovnávají vlastnosti, které část prvků nemá ([">=", ["get", "rank"], 20]
-  // u POI, ["<=", ["get", "ref_length"], 6] u štítků silnic). MapLibre pak za každý takový prvek
-  // vypíše „Expected value to be of type number, but found null instead.“ Stráž typeof (stejná,
-  // jakou styl sám používá u boundary_3) prvek bez hodnoty tiše vyřadí – výsledek je stejný.
-  var NUMERIC_CMP = { '<': 1, '<=': 1, '>': 1, '>=': 1 };
-  function guardNumericFilter(f) {
-    if (!Array.isArray(f)) return f;
-    if (NUMERIC_CMP[f[0]] && f.length === 3) {
-      var guards = [f[1], f[2]].filter(function (a) { return Array.isArray(a) && a[0] === 'get'; })
-        .map(function (a) { return ['==', ['typeof', a], 'number']; });
-      return guards.length ? ['all'].concat(guards, [f]) : f;
-    }
-    if (f[0] === 'all' || f[0] === 'any') {        // pod „!“ by stráž výsledek obrátila – ne
-      return [f[0]].concat(f.slice(1).map(guardNumericFilter));
-    }
-    return f;
-  }
-  function localizeStyle(style) {
-    var s = clone(style);
-    s.layers.forEach(function (l) {
-      if (l.layout && l.layout['text-field'] && isNameField(l.layout['text-field'])) l.layout['text-field'] = CS_NAME;
-      if (l.filter) l.filter = guardNumericFilter(l.filter);
-    });
-    return s;
-  }
+  var isNameField = MS.isNameField;
+  function localizeStyle(style) { return MS.localize(style, CS_NAME); }
 
   // Satelit: snímky Esri + z vektorových dat jen cesty, hranice a názvy (světlé, s tmavým lemem)
   var SAT_ROADS = /^(road|bridge)_(motorway|motorway_link|trunk_primary|secondary_tertiary|link|minor)$/;
@@ -546,35 +559,8 @@
     });
   }
 
-  // Pastelová Základní: lesy a parky (národní parky překrývají celé lesy -> sytě zelená plocha)
-  // jen jemně, ať vynikne obsah – cesty, vody a piny fotek
-  var PASTEL_FILLS = { park: 0.32, landcover_wood: 0.26, landcover_grass: 0.22 };
-  function pastelize(style) {
-    style.layers.forEach(function (l) {
-      if (PASTEL_FILLS[l.id] !== undefined && l.type === 'fill') {
-        l.paint = Object.assign({}, l.paint, { 'fill-opacity': PASTEL_FILLS[l.id] });
-        if (l.id === 'park') delete l.paint['fill-outline-color'];
-      }
-    });
-    return style;
-  }
-
-  // Batch 6: s nakloněnou kamerou má 3D vytažení budov smysl (Patch 12 je kvůli Leafletu
-  // zploštil). Budovy bez výšky hlásily „Expected value to be of type number, but found null“
-  // (render_height = null) -> každé čtení výšky obalit coalesce(…, 0).
-  var HEIGHT_PROPS = { render_height: 1, render_min_height: 1 };
-  function guardHeights(v) {
-    if (!Array.isArray(v)) return v;
-    if (v[0] === 'get' && HEIGHT_PROPS[v[1]] && v.length === 2) return ['coalesce', v, 0];
-    return v.map(guardHeights);
-  }
-  function guardBuildings(style) {
-    style.layers.forEach(function (l) {
-      if (l.type !== 'fill-extrusion' || !l.paint) return;
-      Object.keys(l.paint).forEach(function (k) { l.paint[k] = guardHeights(l.paint[k]); });
-    });
-    return style;
-  }
+  var pastelize = MS.pastelize;               // map_style.js
+  var guardBuildings = MS.guardBuildings;
 
   window.buildVectorStyle = function (name) {      // i pro testy: výsledný styl podkladu (bez zeměkoule)
     if (!vectorStyle) return null;
@@ -926,7 +912,8 @@
       map = new maplibregl.Map({
         container: mapEl, style: built.style, center: [15.5, 49.8], zoom: GLOBE_ZOOM,
         maxZoom: BASE_LAYERS[baseName].maxZoom, maxPitch: MAX_PITCH, attributionControl: { compact: true },
-        fadeDuration: 180, canvasContextAttributes: { antialias: true }, transformRequest: transformRequest
+        fadeDuration: 180, canvasContextAttributes: { antialias: true }, transformRequest: transformRequest,
+        maxTileCacheZoomLevels: TILE_CACHE_ZOOM_LEVELS
       });
     } catch (e) {
       map = null;
@@ -936,6 +923,10 @@
     engine = built.engine;
     window.map = map;
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
+    installOrbitGestures();
+    map.on('terrain', guardTerrainRtt);
+    map.on('rotatestart', function () { warmOrbitRing(); });
+    map.on('pitchstart', function () { warmOrbitRing(); });
     map.addControl(tiltControl, 'bottom-right');
     map.on('pitchend', syncTiltButton);
     map.on('error', function (e) { mapErrors.push(String((e && e.error && e.error.message) || e)); });
@@ -950,16 +941,14 @@
     map.on('zoom', function () {
       if (director.directing) return;
       if (map.getTerrain() && !terrainAllowed()) syncTerrain();
-      else followExaggeration();
+      else { descentTerrain(); followExaggeration(); }
     });
     map.on('moveend', function () {
-      setInteraction('map', false);     // vždy: pohyb začatý před Cestou jinak držel governor navždy
-      if (director.directing) return;   // kamera Cesty jede po trase (jumpTo za snímek)
-      terrainHold = false; syncTerrain(); render();
-      restResolution();
-      settleDetail();
+      if (orbitActive()) return;        // orbit session: one rest at its end (endOrbitSession)
+      cameraRested();
     });
     map.on('movestart', function (e) {
+      if (orbitActive()) return;
       hidePinCard();
       if (e.originalEvent) userActed();
       if (!director.directing) setInteraction('map', true);
@@ -967,7 +956,8 @@
     ['mousedown', 'touchstart', 'wheel'].forEach(function (t) { map.on(t, userActed); });
     map.on('render', function () {
       renderFrames++;
-      if (map.isMoving() || director.directing) {
+      if (descent.rampAt) followExaggeration();             // relief ramping in after descentTerrain
+      if (map.isMoving() || director.directing || orbitActive()) {
         var now = performance.now();
         meterTick(mapMeter, now);
         adaptResolution(now);
@@ -997,6 +987,7 @@
     syncTerrain();
     addPinLayers();
     render();
+    rewarmHotspots();
     if (journey.active) { addRouteLayers(); journey.hidden = []; journey.faded = {}; reliefSpec = null; filmLook(true); }
   }
 
@@ -1038,10 +1029,21 @@
     return s === url ? undefined : { url: s };
   }
 
+  // Raster tiles (DEM, imagery, underlay) are image requests; MapLibre runs at most 16 at once.
+  // Measured 2026-11-03 (bench_map_webview2, 120 Hz, film): raising it to 32 tripled dropped
+  // frames (1-3 % -> 9 %, more tiles landing and uploading per frame). It stays at 16; the
+  // tile store's warm-up queues do the parallel fetching instead, off the page's frame budget.
+  var MAX_IMAGE_REQUESTS = 16;
+  // Decoded tiles kept per source beyond the view (MapLibre default: 5 zoom levels' worth).
+  // More retained parents = more overzoom fallback on the way back in.
+  var TILE_CACHE_ZOOM_LEVELS = 7;
   function setTileWorkers() {
     try {
       if (typeof maplibregl.setWorkerCount === 'function') maplibregl.setWorkerCount(tileWorkerCount(navigator.hardwareConcurrency));
     } catch (e) { /* pool už běží (mapa vznikla dřív) – zůstane výchozí */ }
+    try {
+      if (typeof maplibregl.setMaxParallelImageRequests === 'function') maplibregl.setMaxParallelImageRequests(MAX_IMAGE_REQUESTS);
+    } catch (e) { /* older MapLibre */ }
   }
   window.getTileWorkers = function () { return maplibregl.getWorkerCount ? maplibregl.getWorkerCount() : null; };
 
@@ -1055,6 +1057,116 @@
     } catch (e) { tileLod = null; }
   }
   window.getTileLod = function () { return tileLod; };
+
+  // ── Founder audit: 3D kroužení kamerou ───────────────────────────────────────
+  // Pravé tlačítko (nebo Ctrl + levé) táhne = otáčení a náklon (MapLibre dragRotate; náklon
+  // zapnutý výslovně, ať ho nic nevypne). Touchpad na Windows otočení dvěma prsty prohlížeči
+  // nepošle, proto: Shift + posun dvěma prsty (kolečko) = kroužení – vodorovně otáčí, svisle
+  // naklání; Alt + tažení levým = totéž pro myš bez pravého tlačítka. Pinch zůstává zoom.
+  var ORBIT_DEG_PER_PX = 0.25, ORBIT_PITCH_PER_PX = 0.18;
+  function installOrbitGestures() {
+    if (!map) return;
+    map.dragRotate.enable({ pitchWithRotate: true });
+    map.touchZoomRotate.enableRotation();
+    if (map.touchPitch) map.touchPitch.enable();
+    var canvas = map.getCanvasContainer();
+    canvas.addEventListener('wheel', function (e) {
+      if (!e.shiftKey || e.ctrlKey || director.directing) return;
+      e.preventDefault();
+      e.stopPropagation();
+      var unit = e.deltaMode === 1 ? 16 : 1;       // řádky -> px (klasické kolečko)
+      orbitBy(e.deltaX * ORBIT_DEG_PER_PX * unit, -e.deltaY * ORBIT_PITCH_PER_PX * unit);
+    }, { capture: true, passive: false });
+    var alt = null;
+    canvas.addEventListener('mousedown', function (e) {
+      if (e.button !== 0 || !e.altKey || director.directing) return;
+      alt = { x: e.clientX, y: e.clientY };
+      map.dragPan.disable();
+      e.preventDefault();
+    }, true);
+    window.addEventListener('mousemove', function (e) {
+      if (!alt) return;
+      orbitBy((e.clientX - alt.x) * ORBIT_DEG_PER_PX * 2, -(e.clientY - alt.y) * ORBIT_PITCH_PER_PX * 2);
+      alt = { x: e.clientX, y: e.clientY };
+    });
+    window.addEventListener('mouseup', function () {
+      if (!alt) return;
+      alt = null;
+      map.dragPan.enable();
+      syncTiltButton();
+    });
+  }
+  // Alt+drag and Shift+wheel orbit with one jumpTo per event, and jumpTo fires movestart AND
+  // moveend synchronously every time. Measured (eval/bench_map_orbit.py): each orbit frame ran the
+  // whole "camera came to rest" path. That meant re-clustering the pins plus a setData that
+  // re-tiled them in the worker, terrain sync, full-resolution restore, and detail level 0
+  // (mesh 128) only to drop back to the motion level on the next frame (mesh cache rebuilt
+  // twice). An orbit session now counts as one camera motion. The rest path runs once,
+  // ORBIT_SETTLE_MS after the last orbit step. The adaptive detail sees it as moving.
+  var ORBIT_SETTLE_MS = 160;
+  var orbitSession = { on: false, timer: 0 };
+  function orbitActive() { return orbitSession.on && !window.ORBIT_TUNING_OFF; }
+  function orbitBy(dBearing, dPitch) {
+    if (!map) return;
+    stopSpin();
+    if (!orbitSession.on) {
+      orbitSession.on = true;
+      hidePinCard();
+      if (!director.directing) setInteraction('map', true);
+      warmOrbitRing();
+    }
+    clearTimeout(orbitSession.timer);
+    orbitSession.timer = setTimeout(endOrbitSession, ORBIT_SETTLE_MS);
+    map.jumpTo({ bearing: map.getBearing() + dBearing,
+                 pitch: Math.max(0, Math.min(MAX_PITCH, map.getPitch() + dPitch)) });
+    userActed();
+  }
+  function endOrbitSession() {
+    if (!orbitSession.on) return;
+    orbitSession.on = false;
+    clearTimeout(orbitSession.timer);
+    if (map && !map.isMoving()) cameraRested();
+  }
+  function cameraRested() {
+    setInteraction('map', false);       // vždy: pohyb začatý před Cestou jinak držel governor navždy
+    descent.on = false;
+    if (director.directing) return;     // kamera Cesty jede po trase (jumpTo za snímek)
+    terrainHold = false; syncTerrain(); render();
+    restResolution();
+    settleDetail();
+  }
+  window.orbitBy = orbitBy;
+  window.endOrbitSession = endOrbitSession;
+  window.getOrbitState = function () { return { on: orbitSession.on, ring: orbitRing.last }; };
+
+  // ── Predictive orbit ring ──
+  // An orbit only swings the bearing (and the tilt a little), so the tiles it will need are known
+  // when it starts. Warm the frustum at 8 bearings around the current one, at the current tilt
+  // and at the steepest tilt, through the tile store/HTTP cache (prefetchPoints). That way the
+  // horizon tiles are local before the camera turns toward them. This runs once per orbit
+  // session, or again after the camera moves more than half a screen.
+  var ORBIT_RING_STEPS = 8;
+  var orbitRing = { key: '', last: 0 };
+  function warmOrbitRing() {
+    if (!map || window.ORBIT_TUNING_OFF || map.getZoom() < TERRAIN_MIN_ZOOM - 1) return 0;
+    var c = map.getCenter(), z = map.getZoom();
+    var key = Math.round(z * 2) + ':' + (c.lng * Math.pow(2, z) / 360 * 2).toFixed(0) + ':' +
+              (c.lat * Math.pow(2, z) / 360 * 2).toFixed(0);
+    if (key === orbitRing.key) return 0;
+    orbitRing.key = key;
+    var pts = [], b0 = map.getBearing(), p0 = Math.max(map.getPitch(), 30);
+    try { prefetchTr = map.transform.clone(); } catch (e) { prefetchTr = null; }
+    if (!prefetchTr) return 0;
+    for (var i = 0; i < ORBIT_RING_STEPS; i++) {
+      var b = b0 + i * 360 / ORBIT_RING_STEPS;
+      frustumTiles({ c: [c.lng, c.lat], z: z, p: p0, b: b }, null, pts, 5, 4);
+      if (p0 < MAX_PITCH - 5) frustumTiles({ c: [c.lng, c.lat], z: z, p: MAX_PITCH, b: b }, null, pts, 5, 2);
+    }
+    prefetchTr = null;
+    orbitRing.last = prefetchPoints(pts);
+    return orbitRing.last;
+  }
+  window.forceOrbitRing = function () { orbitRing.key = ''; return warmOrbitRing(); };
 
   // ── 2D / 3D: jedno tlačítko, stav vždy ze skutečného náklonu ────────────────
   // Dřív jen kompas (resetNorthPitch) a tažení pravým tlačítkem: rozjetá animace / setrvačnost
@@ -1127,8 +1239,38 @@
     try { map.setTerrain(want ? { source: 'dem', exaggeration: terrainExaggeration(map.getZoom()) } : null); } catch (e) { /* styl se mění */ }
   }
   function followExaggeration() {     // zoom changed: relief scale follows (no-op without terrain)
-    if (map && map.getTerrain() && !journey.active) setExaggeration(terrainExaggeration(map.getZoom()));
+    if (map && map.getTerrain() && !journey.active) setExaggeration(terrainExaggeration(map.getZoom()) * terrainRampK());
   }
+  // ── Zero-hole descents ──
+  // Measured (eval/bench_map_zoom.py, cold store, cluster click to z18 at 52 deg): with terrain
+  // switched on only at rest, 3D terrain changes the set of tiles MapLibre needs the moment the
+  // camera lands. Nothing fetched during the flight covers that set, so ~3 % of the view stayed
+  // blank for ~1.8 s. With the flight left flat, the same descents have 0 % holes. So a flight
+  // into the landscape turns terrain on during the descent (from TERRAIN_MIN_ZOOM, once the globe
+  // has flattened). The flight then loads exactly the tiles the arrival view needs. The relief
+  // ramps in over TERRAIN_RAMP_MS, so the switch can't be seen.
+  var TERRAIN_RAMP_MS = 600;
+  var DESCENT_TERRAIN_LEAD = +window.DESCENT_LEAD_OVERRIDE || 3;   // zoom levels above the target
+  var DESCENT_DETAIL = 2;
+  var descent = { on: false, at: 99, rampAt: 0 };
+  function terrainRampK() {
+    if (!descent.rampAt) return 1;
+    var k = (performance.now() - descent.rampAt) / TERRAIN_RAMP_MS;
+    if (k >= 1) { descent.rampAt = 0; return 1; }
+    return Math.max(0.01, k * k * (3 - 2 * k));
+  }
+  function descentTerrain() {         // from 'zoom' / 'render' during a flight into the landscape
+    if (!descent.on || !map || map.getTerrain() || !styleReady || !map.getSource('dem')) return;
+    if (map.getZoom() < descent.at || !terrainAllowed() || globeRendering() || PERF.map_terrain === false) return;
+    descent.rampAt = performance.now();
+    // terrain mid-flight is the expensive part of the descent: straight to the lightest motion
+    // detail (canvas at the profile floor, mesh 32); moveend gives full crispness back
+    if (DESCENT_DETAIL > md.level) setDetail(DESCENT_DETAIL);
+    try {
+      map.setTerrain({ source: 'dem', exaggeration: Math.max(0.01, terrainExaggeration(map.getZoom()) * 0.01) });
+    } catch (e) { descent.rampAt = 0; }
+  }
+  window.getDescentState = function () { return { on: descent.on, ramping: !!descent.rampAt }; };
   function holdTerrain() {            // před dlouhým přeletem: rovina bez terénu, zapne se v cíli
     terrainHold = true;
     if (map && map.getTerrain()) { try { map.setTerrain(null); } catch (e) { /* styl se mění */ } }
@@ -1205,7 +1347,7 @@
     clearTimeout(res.restTimer);
     res.restTimer = setTimeout(function () {
       res.lastFrame = 0; res.ema = 0; res.slowSince = res.fastSince = 0;
-      if (map && !map.isMoving() && !director.directing) setRatio(maxRatio());
+      if (map && !map.isMoving() && !director.directing && !orbitActive()) setRatio(maxRatio());
     }, RES_REST_MS);
   }
   // ── Gate 2: adaptive detail while moving (LOD) ─────────────────────────────────
@@ -1270,6 +1412,54 @@
       }, MD_FADE_MS + 30);
     }
   }
+  // ── Terrain render-to-texture guard (eval/bench_map_orbit.py) ──
+  // With 3D terrain, MapLibre first draws the flat layers of each terrain tile into an offscreen
+  // texture, then drapes that texture over the mesh. Its data callback throws those textures away
+  // (freeRtt) whenever ANY source reports a loaded tile, including sources that never draw into
+  // them. An orbit changes the tile cover every frame, so the pins GeoJSON source alone reported
+  // ~12 tile loads per frame. Their low-zoom tiles are parents of the whole view, so every terrain
+  // tile was redrawn every frame (measured: rtt redraws = renderable tiles on 99 % of frames,
+  // 72 fps at 120 Hz, 60 % dropped). GL uploads were 0.01 ms per frame. Only sources with a visible
+  // background/fill/line/raster/hillshade layer can change an RTT texture, plus the terrain source
+  // itself (elevation). Every other tile event is dropped before freeRtt.
+  // Style events (paint changes) still free everything.
+  var RTT_LAYER_TYPES = { background: 1, fill: 1, line: 1, raster: 1, hillshade: 1, 'color-relief': 1 };
+  function sourceDrawsIntoTerrain(sourceId) {
+    var layers = map.style && map.style._layers, z = map.getZoom();
+    if (!layers) return true;
+    for (var id in layers) {
+      var l = layers[id];
+      if (l.source === sourceId && RTT_LAYER_TYPES[l.type] && !(l.isHidden && l.isHidden(z))) return true;
+    }
+    return false;
+  }
+  function guardTerrainRtt() {
+    if (!map || !map.terrain || !map.style || window.ORBIT_TUNING_OFF) return;
+    var cb = map._terrainDataCallback;
+    if (typeof cb !== 'function' || cb.__kairos) return;
+    var guarded = function (e) {
+      if (e && e.dataType === 'source' && e.tile && e.sourceId) {
+        var t = map.getTerrain();
+        if (!t || e.sourceId !== t.source) {
+          if (!sourceDrawsIntoTerrain(e.sourceId)) { rttGuard.skipped++; return; }
+        }
+      }
+      rttGuard.passed++;
+      return cb(e);
+    };
+    guarded.__kairos = true;
+    try {
+      map.style.off('data', cb);
+      map._terrainDataCallback = guarded;
+      map.style.on('data', guarded);
+      rttGuard.installs++;
+    } catch (e) { /* styl se mění: příští 'terrain' to zkusí znovu */ }
+  }
+  var rttGuard = { installs: 0, skipped: 0, passed: 0 };
+  window.getRttGuard = function () {
+    return { installs: rttGuard.installs, skipped: rttGuard.skipped, passed: rttGuard.passed,
+             active: !!(map && map._terrainDataCallback && map._terrainDataCallback.__kairos) };
+  };
   function setMesh(n) {
     var t = map && map.terrain;
     if (!t || t.meshSize === n) return;
@@ -1301,7 +1491,7 @@
       var sg = film.segs[segIndexAt(director.t)];
       return !!sg && sg.kind !== 'dwell';
     }
-    return map.isMoving();
+    return map.isMoving() || orbitActive();
   }
   function motionDetailTick(now) {                      // from 'render' while moving / directing
     hookRenderCost();
@@ -1744,6 +1934,7 @@
     if (keys.length <= PIN_IMAGE_BUDGET) return;
     var inUse = {};
     pinGeo.features.forEach(function (f) { inUse[f.properties.img] = true; });
+    if (pinFade) pinFade.out.features.forEach(function (f) { inUse[f.properties.img] = true; });
     keys.filter(function (k) { return !inUse[k]; })
         .sort(function (a, b) { return pinImages[a].used - pinImages[b].used; })
         .slice(0, keys.length - PIN_IMAGE_BUDGET)
@@ -1769,6 +1960,7 @@
   }
   function setPinsVisible(on) {
     if (!map) return;
+    if (!on && map.getLayer('pins-out')) map.setLayoutProperty('pins-out', 'visibility', 'none');
     ['pins', 'pins-halo'].forEach(function (id) {
       if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', on ? 'visible' : 'none');
     });
@@ -1822,18 +2014,268 @@
   window.hoverCluster = function (i) { if (!clusters[i]) return false; showPinCard(i); return true; };
 
   function render() {
+    var prev = clusters;
     clusters = computeClusters(currentZoom());
     if (!map) return;
-    if (hoverPin !== null) setPinHover(null);          // id prvků se přečíslují
-    pinGeo = { type: 'FeatureCollection', features: clusters.map(function (c, i) {
-      return { type: 'Feature', id: i, properties: { img: pinImageFor(c), count: c.items.length },
+    var old = pinGeo;
+    var next = { type: 'FeatureCollection', features: clusters.map(function (c, i) {
+      return { type: 'Feature', id: i, properties: { img: pinImageFor(c), count: c.items.length, stay: 0 },
                geometry: { type: 'Point', coordinates: [c.lon, c.lat] } };
     }) };
     var src = map.getSource('pins');
+    // Same clusters in the same order (camera rested without a zoom change, a pan inside one
+    // cluster level): no setData. setData re-tiles the source in the worker and reloads every
+    // pin tile. Measured: that was ~12 tile loads per frame when it ran per orbit step.
+    if (src && sameGeo(old, next)) { pinRenders.skipped++; prunePinImages(); return; }
+    pinRenders.applied++;
+    if (hoverPin !== null) setPinHover(null);          // id prvků se přečíslují
+    pinGeo = next;
+    var leaving = src ? markStaying(old, pinGeo) : [];
+    var moves = src ? planSpring(prev, leaving) : null;
     if (src) src.setData(pinGeo);
     else addPinLayers();
+    if (moves) runSpring(moves);
+    else crossFadePins(leaving);
     prunePinImages();
   }
+  var pinRenders = { applied: 0, skipped: 0 };
+  window.getPinRenders = function () { return { applied: pinRenders.applied, skipped: pinRenders.skipped }; };
+  function sameGeo(a, b) {
+    var fa = a.features || [], fb = b.features;
+    if (fa.length !== fb.length) return false;
+    for (var i = 0; i < fa.length; i++) if (pinKey(fa[i]) !== pinKey(fb[i])) return false;
+    return true;
+  }
+
+  // ── Spring split / merge of clusters ──
+  // When the zoom changes the clustering, the pins that move become DOM sprites over the canvas.
+  // Zooming in, a child bursts out of its parent's centroid. Zooming out, a child flies into
+  // its new parent. A damped spring drives each one (zeta ~ 0.6, so it overshoots ~10 % and
+  // settles in ~450 ms), with a small per-pin stagger. Sprites are re-projected every frame, so
+  // they stay anchored to the ground while the camera moves. They are composited layers
+  // (transform/opacity only): no setData and no symbol layout per frame. The GL pins under them
+  // stay hidden (icon-opacity case on `anim`) until each sprite lands on the exact pixel where
+  // its GL pin is drawn. Then the sprites go and the GL pins show at full opacity. Too many
+  // moving pins (SPRING_MAX) or reduced motion falls back to the 240 ms cross-fade.
+  var SPRING_K = 260, SPRING_C = 19;      // stiffness, damping (mass 1): zeta = 19 / (2 * sqrt 260) = 0.59
+  var SPRING_MAX = 90, SPRING_STAGGER_MS = 34, SPRING_MIN_PX = 6, SPRING_TIMEOUT_MS = 1400;
+  var SPRING_START_SCALE = 0.55, SPRING_MERGE_END_SCALE = 0.7;
+  var spring = null, spriteHost = null;
+  function screenOf(ll) {
+    try { var p = map.project(ll); return isFinite(p.x) && isFinite(p.y) ? p : null; } catch (e) { return null; }
+  }
+  function planSpring(prev, leaving) {
+    stopSpring();
+    if (reduceMotion || journey.active || window.PIN_SPRING_OFF || !prev || !prev.length || !map) return null;
+    var was = {}, now = {};
+    prev.forEach(function (c, i) { c.items.forEach(function (m) { was[m.id] = i; }); });
+    clusters.forEach(function (c, i) { c.items.forEach(function (m) { now[m.id] = i; }); });
+    var moves = [], targets = {};
+    function far(a, b) {
+      var pa = screenOf(a), pb = screenOf(b);
+      return !!pa && !!pb && Math.hypot(pa.x - pb.x, pa.y - pb.y) >= SPRING_MIN_PX;
+    }
+    pinGeo.features.forEach(function (f) {                       // zoom in: children leave the parent
+      if (f.properties.stay) return;
+      var c = clusters[f.id], from = c && prev[was[c.items[0].id]];
+      if (!from || !c.items.every(function (m) { return prev[was[m.id]] === from; })) return;   // a re-mix fades
+      if (!far([from.lon, from.lat], [c.lon, c.lat])) return;
+      f.properties.anim = 1;
+      moves.push({ kind: 'split', img: f.properties.img, a: [from.lon, from.lat], b: [c.lon, c.lat] });
+    });
+    leaving.forEach(function (f) {                               // zoom out: children fly into the parent
+      var c = prev[f.id], ti = c ? now[c.items[0].id] : undefined, to = ti === undefined ? null : clusters[ti];
+      if (!to || !c.items.every(function (m) { return now[m.id] === ti; })) return;   // split parent: fades out
+      var a = [c.lon, c.lat], b = [to.lon, to.lat];
+      if (!far(a, b)) return;
+      targets[ti] = true;
+      moves.push({ kind: 'merge', img: f.properties.img, a: a, b: b, src: f });
+    });
+    if (!moves.length || moves.length > SPRING_MAX) {
+      pinGeo.features.forEach(function (f) { delete f.properties.anim; });
+      return null;
+    }
+    pinGeo.features.forEach(function (f) { if (targets[f.id] && !f.properties.stay) f.properties.anim = 2; });
+    // leaving pins that do not fly anywhere fade out in place, as sprites too
+    leaving.forEach(function (f) {
+      if (moves.some(function (m) { return m.src === f; })) return;
+      var c = f.geometry.coordinates;
+      moves.push({ kind: 'fade', img: f.properties.img, a: c, b: c });
+    });
+    return moves;
+  }
+  function spriteFor(key, cache) {
+    var src = cache[key];
+    if (!src) {
+      var im = pinImages[key];
+      if (!im || !im.data) return null;
+      src = document.createElement('canvas');
+      src.width = im.data.width;
+      src.height = im.data.height;
+      src.getContext('2d').putImageData(im.data, 0, 0);
+      cache[key] = src;
+    }
+    var c = document.createElement('canvas');
+    c.width = src.width;
+    c.height = src.height;
+    c.getContext('2d').drawImage(src, 0, 0);
+    c.style.width = (src.width / PIN_DPR) + 'px';
+    c.style.height = (src.height / PIN_DPR) + 'px';
+    c.className = 'pin-sprite';
+    return c;
+  }
+  function springStep(s, dt) {               // semi-implicit Euler in 4 ms sub-steps (stable at 30-240 Hz)
+    for (var h = dt; h > 1e-6; h -= 1 / 240) {
+      var d = Math.min(1 / 240, h), acc = SPRING_K * (1 - s.u) - SPRING_C * s.v;
+      s.v += acc * d;
+      s.u += s.v * d;
+    }
+  }
+  function runSpring(moves) {
+    if (!spriteHost) {
+      spriteHost = document.createElement('div');
+      spriteHost.id = 'pinSprites';
+      map.getCanvasContainer().appendChild(spriteHost);
+    }
+    var cache = {}, t0 = performance.now(), n = 0;
+    var sprites = moves.map(function (m) {
+      var el = spriteFor(m.img, cache);
+      if (!el) return null;
+      el.style.opacity = '0';
+      spriteHost.appendChild(el);
+      var delay = m.kind === 'fade' ? 0 : Math.min(n++, 6) * SPRING_STAGGER_MS * (0.5 + 0.5 * Math.random());
+      return { m: m, el: el, u: 0, v: 0, delay: delay, done: false,
+               w: src_half(el.style.width), h: src_half(el.style.height) };
+    }).filter(Boolean);
+    function src_half(px) { return parseFloat(px) / 2; }
+    map.setPaintProperty('pins', 'icon-opacity-transition', { duration: 0, delay: 0 });
+    if (map.getLayer('pins-out')) map.setLayoutProperty('pins-out', 'visibility', 'none');
+    if (pinFade) { cancelAnimationFrame(pinFade.raf); pinFade = null; }
+    spring = { sprites: sprites, t0: t0, last: t0, raf: 0, frames: 0, maxOvershoot: 0 };
+    var run = spring;
+    function glOpacity(k, kt) {              // k: fresh pins fade in, kt: merge targets appear
+      return ['case', ['==', ['get', 'stay'], 1], 1,
+              ['==', ['get', 'anim'], 1], 0,
+              ['==', ['get', 'anim'], 2], +kt.toFixed(3), +k.toFixed(3)];
+    }
+    map.setPaintProperty('pins', 'icon-opacity', glOpacity(0, 0));
+    function step(now) {
+      if (spring !== run || !map || !map.getLayer('pins')) return;
+      var dt = Math.min(1 / 30, Math.max(0, (now - run.last) / 1000));
+      run.last = now;
+      run.frames++;
+      var el = now - t0, all = true, mergeU = 1, anyMerge = false;
+      run.sprites.forEach(function (s) {
+        if (s.done) return;
+        if (el >= s.delay) {
+          if (s.m.kind === 'fade') s.u = Math.min(1, (el - s.delay) / PIN_FADE_MS);
+          else springStep(s, dt);
+        }
+        run.maxOvershoot = Math.max(run.maxOvershoot, s.u - 1);
+        var settled = s.m.kind === 'fade' ? s.u >= 1 : (el >= s.delay && Math.abs(1 - s.u) < 0.004 && Math.abs(s.v) < 0.03);
+        if (s.m.kind === 'merge') { anyMerge = true; mergeU = Math.min(mergeU, s.u); }
+        var ll = [s.m.a[0] + (s.m.b[0] - s.m.a[0]) * s.u, s.m.a[1] + (s.m.b[1] - s.m.a[1]) * s.u];
+        var p = screenOf(ll), sc = 1, op = 1;
+        if (s.m.kind === 'split') {
+          sc = SPRING_START_SCALE + (1 - SPRING_START_SCALE) * Math.min(1.06, s.u);
+          op = el < s.delay ? 0 : Math.min(1, 0.35 + s.u);
+        } else if (s.m.kind === 'merge') {
+          sc = 1 - (1 - SPRING_MERGE_END_SCALE) * Math.min(1, s.u);
+          op = Math.max(0, Math.min(1, (1 - s.u) / 0.35));
+        } else {
+          op = 1 - s.u;
+        }
+        if (p) s.el.style.transform = 'translate3d(' + (p.x - s.w).toFixed(2) + 'px,' + (p.y - s.h).toFixed(2) +
+                                      'px,0) scale(' + sc.toFixed(4) + ')';
+        s.el.style.opacity = p ? op.toFixed(3) : '0';
+        if (settled) s.done = true;
+        else all = false;
+      });
+      var k = Math.min(1, el / PIN_FADE_MS), e = 1 - Math.pow(1 - k, 3);
+      var kt = anyMerge ? Math.max(0, Math.min(1, (mergeU - 0.55) / 0.4)) : 1;
+      if ((all && k >= 1) || el > SPRING_TIMEOUT_MS) { springStats.last = { frames: run.frames, ms: Math.round(el),
+        sprites: run.sprites.length, overshoot: +run.maxOvershoot.toFixed(3) }; stopSpring(); return; }
+      map.setPaintProperty('pins', 'icon-opacity', glOpacity(e, kt));
+      run.raf = requestAnimationFrame(step);
+    }
+    run.raf = requestAnimationFrame(step);
+  }
+  var springStats = { last: null };
+  function stopSpring() {                    // finish now: GL pins at full opacity, sprites gone
+    if (!spring) return;
+    cancelAnimationFrame(spring.raf);
+    spring = null;
+    if (spriteHost) spriteHost.textContent = '';
+    if (map && map.getLayer('pins')) map.setPaintProperty('pins', 'icon-opacity', 1);
+  }
+  window.getPinSpring = function () {        // tests / bench
+    if (!spring) return { active: false, last: springStats.last };
+    var kinds = { split: 0, merge: 0, fade: 0 };
+    spring.sprites.forEach(function (s) { kinds[s.m.kind]++; });
+    return { active: true, sprites: spring.sprites.length, split: kinds.split, merge: kinds.merge, fade: kinds.fade,
+             frames: spring.frames, ms: Math.round(performance.now() - spring.t0), last: springStats.last };
+  };
+
+  // ── Founder audit: shluky pinů se při zoomu prolínají místo skokového (dis)appear ─────────
+  // Shluk, který zůstal stejný (obrázek i místo), svítí dál naplno (stay = 1). Nové shluky
+  // naběhnou z průhlednosti, zaniklé dohrají ve vlastní vrstvě „pins-out“ a zmizí. Jen barva
+  // (icon-opacity) – žádné nové rozvržení symbolů za snímek.
+  var PIN_FADE_MS = 240, pinFade = null;
+  function pinKey(f) {
+    var c = f.geometry.coordinates;
+    return f.properties.img + '@' + c[0].toFixed(5) + ',' + c[1].toFixed(5);
+  }
+  function markStaying(oldGeo, newGeo) {
+    var before = {};
+    (oldGeo.features || []).forEach(function (f) { before[pinKey(f)] = f; });
+    newGeo.features.forEach(function (f) {
+      var k = pinKey(f);
+      if (before[k]) { f.properties.stay = 1; delete before[k]; }
+    });
+    return Object.keys(before).map(function (k) { return before[k]; });
+  }
+  function pinOpacity(v) { return ['case', ['==', ['get', 'stay'], 1], 1, v]; }
+  function crossFadePins(leaving) {
+    if (!map || !map.getLayer('pins')) return;
+    var fresh = pinGeo.features.some(function (f) { return !f.properties.stay; });
+    if (pinFade) { cancelAnimationFrame(pinFade.raf); pinFade = null; }
+    if (reduceMotion || journey.active || (!fresh && !leaving.length)) {
+      map.setPaintProperty('pins', 'icon-opacity', 1);
+      if (map.getLayer('pins-out')) map.setLayoutProperty('pins-out', 'visibility', 'none');
+      return;
+    }
+    var out = { type: 'FeatureCollection', features: leaving.map(function (f, i) {
+      return { type: 'Feature', id: i, properties: f.properties, geometry: f.geometry };
+    }) };
+    if (!map.getSource('pins-out')) {
+      map.addSource('pins-out', { type: 'geojson', data: out });
+      map.addLayer({ id: 'pins-out', type: 'symbol', source: 'pins-out',
+                     layout: { 'icon-image': ['get', 'img'], 'icon-allow-overlap': true, 'icon-ignore-placement': true,
+                               'icon-pitch-alignment': 'viewport', 'icon-rotation-alignment': 'viewport',
+                               'symbol-sort-key': ['get', 'count'] },
+                     paint: { 'icon-opacity': 1, 'icon-opacity-transition': { duration: 0 } } }, 'pins-halo');
+    } else {
+      map.getSource('pins-out').setData(out);
+      map.setLayoutProperty('pins-out', 'visibility', 'visible');
+    }
+    map.setPaintProperty('pins', 'icon-opacity-transition', { duration: 0, delay: 0 });
+    pinFade = { out: out, t0: performance.now(), raf: 0 };
+    var fade = pinFade;
+    (function step(now) {
+      if (pinFade !== fade || !map.getLayer('pins')) return;
+      var k = Math.min(1, Math.max(0, (now - fade.t0) / PIN_FADE_MS)), e = 1 - Math.pow(1 - k, 3);
+      map.setPaintProperty('pins', 'icon-opacity', k >= 1 ? 1 : pinOpacity(+e.toFixed(3)));
+      if (map.getLayer('pins-out')) map.setPaintProperty('pins-out', 'icon-opacity', +(1 - e).toFixed(3));
+      if (k < 1) { fade.raf = requestAnimationFrame(step); return; }
+      if (map.getLayer('pins-out')) map.setLayoutProperty('pins-out', 'visibility', 'none');
+      pinFade = null;
+    })(fade.t0);
+  }
+  window.getPinFade = function () {          // testy
+    return { active: !!pinFade, leaving: pinFade ? pinFade.out.features.length : 0,
+             staying: pinGeo.features.filter(function (f) { return f.properties.stay; }).length,
+             total: pinGeo.features.length };
+  };
 
   // ── Kamera: přelety ke shlukům, návrat na zeměkouli, klidové otáčení ─────────
   function flyIn(items) {
@@ -1846,7 +2288,10 @@
                  pitch: zoom >= TERRAIN_MIN_ZOOM ? FLY_PITCH : (zoom >= 5 ? 25 : 0),
                  bearing: zoom >= TERRAIN_MIN_ZOOM ? map.getBearing() : 0 };
     stopSpin();
+    warmView(opts);                                         // the arrival view, into the tile store now
     if (reduceMotion || !hasSize()) { map.jumpTo(opts); return; }
+    descent.on = zoom >= TERRAIN_MIN_ZOOM;                  // terrain during the descent (descentTerrain)
+    descent.at = Math.max(TERRAIN_MIN_ZOOM, zoom - DESCENT_TERRAIN_LEAD);
     var hops = Math.abs(zoom - map.getZoom());
     map.flyTo(Object.assign(opts, { duration: Math.min(4200, 1400 + hops * 260), curve: 1.5, essential: true }));
   }
@@ -1873,6 +2318,11 @@
                                                 lat: c.lat, lon: c.lon, card: tipHtml(c) }; });
   };
   window.clickCluster = function (i) { if (clusters[i]) openCluster(clusters[i]); return !!clusters[i]; };
+  window.flyToPhotos = function (items) {               // bench / tests: the cluster-click flight
+    if (!map || !Array.isArray(items) || !items.length) return false;
+    flyIn(items);
+    return true;
+  };
 
   function centroid() {            // střed fotek na zeměkouli (kruhový průměr délek – přes 180° poledník)
     if (!markers.length) return [15.5, 49.8];
@@ -1965,6 +2415,7 @@
     document.getElementById('empty').style.display = markers.length ? 'none' : 'flex';
     initialView();
     render();
+    rewarmHotspots();
     return markers.length;
   };
   window.getMarkerCount = function () { return markers.length; };
@@ -2289,8 +2740,7 @@
     if (!pts) return false;
     trails[i] = pts;
     if (journey.legs) journey.legs[i] = null;
-    var all = map && map.getSource('j-all');
-    if (all) all.setData(lineFeature(allRouteCoords()));
+    refreshAhead();
     return true;
   }
   // routeTrail je jako deklarace funkce už window.routeTrail (přepsání = nekonečná rekurze)
@@ -2362,8 +2812,7 @@
   function applyLegPath(leg, path) {
     (journey.trails || (journey.trails = {}))[leg] = path;
     if (journey.legs && journey.i < leg) journey.legs[leg] = null;   // běžící úsek nepřekreslovat
-    var all = map && map.getSource('j-all');
-    if (all) all.setData(lineFeature(allRouteCoords()));
+    refreshAhead();
     var g = travelSegOf(leg);         // C1: dráha kamery jen v okolí změněného úseku
     if (g && film) {
       resampleCamera(film, g.t0 - 1, g.t0 + g.dur + 1);
@@ -2374,8 +2823,9 @@
   // Gate 2 C: legs routed by the app along the whole corridor (route_corridor.py), independent
   // of what the camera has loaded and of leg length. Arrives in the background; a leg the
   // camera is already travelling keeps its curve, a GPX leg keeps its recorded line.
-  window.corridorRoute = function (journeyId, leg, path) {
+  window.corridorRoute = function (journeyId, leg, path, day) {
     if (!journey.active || !journey.data || journey.data.id !== journeyId) return false;
+    if ((day === undefined ? -1 : day) !== journey.day) return false;      // routed for another day's film
     if (!Array.isArray(path) || path.length < 2 || leg < 1 || leg >= journey.data.stops.length) return false;
     if (journey.trueLegs && journey.trueLegs[leg]) return false;
     var trails = journey.trails || (journey.trails = {});
@@ -2436,31 +2886,76 @@
     return pts;
   }
   function stopLL(s) { return [s.lon, s.lat]; }
-  function routeCoords(upTo, frac) {       // projetá část trasy: celé úseky do upTo-1 + zlomek dalšího
-    var st = journey.data.stops, out = [stopLL(st[0])];
-    for (var i = 1; i <= upTo && i < st.length; i++) {
-      var pts = legPath(i);
-      if (i === upTo && frac < 1) {
-        var pos = Math.max(0, frac) * (pts.length - 1), k = Math.floor(pos), f = pos - k;
-        var a = pts[k], b = pts[Math.min(k + 1, pts.length - 1)];
-        pts = pts.slice(0, k + 1).concat([[a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]]);
-      }
-      out = out.concat(pts.slice(1));
-    }
-    return out.length > 1 ? out : [out[0], out[0]];
-  }
   // Čára MapLibre rezervuje 10 vrcholů na bod a jeden segment unese 65 535 -> trasa po cestách
   // (tisíce bodů) jde po kusech jako MultiLineString, každý kus má vlastní segment
   var LINE_CHUNK = 2000;
-  function lineFeature(coords) {
+  function lineFeature(coords, props) {
+    props = props || {};
     if (coords.length <= LINE_CHUNK) {
-      return { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } };
+      return { type: 'Feature', properties: props, geometry: { type: 'LineString', coordinates: coords } };
     }
     var parts = [];
     for (var i = 0; i < coords.length - 1; i += LINE_CHUNK - 1) parts.push(coords.slice(i, i + LINE_CHUNK));
-    return { type: 'Feature', properties: {}, geometry: { type: 'MultiLineString', coordinates: parts } };
+    return { type: 'Feature', properties: props, geometry: { type: 'MultiLineString', coordinates: parts } };
   }
-  function allRouteCoords() {
+
+  // ── Founder audit: čitelná trasa výletu se základnou ─────────────────────────
+  // Výlet s ubytováním (hub) jezdí tam a zpět: ze základny k místu a zpět, každý den jinam.
+  // Dřív se kreslily VŠECHNY úseky (budoucí čárkovaně, projeté plně) přes sebe – pavučina
+  // přímek kolem základny. Teď: (1) stejná dvojice míst (tam i zpět) se kreslí jen jednou –
+  // nejnovější průjezd; (2) projeté úseky blednou s věkem a úseky jiných dnů výrazně víc,
+  // takže vystupuje jen právě probíhající tok; (3) před kamerou jen tlumený náznak cesty.
+  var ROUTE_FADE_PER_LEG = 0.14, ROUTE_MIN_O = 0.16, ROUTE_OTHER_DAY = 0.4;
+  function legKey(i) {
+    var st = journey.data.stops, a = stopLL(st[i - 1]), b = stopLL(st[i]);
+    var ka = a[0].toFixed(3) + ',' + a[1].toFixed(3), kb = b[0].toFixed(3) + ',' + b[1].toFixed(3);
+    return ka < kb ? ka + '|' + kb : kb + '|' + ka;
+  }
+  function legDay(i) {                // den celého výletu, do kterého úsek přijíždí (bez dnů = 0)
+    var days = journey.day < 0 ? tripDays() : [], k = 0;
+    for (var j = 0; j < days.length; j++) if (days[j].first <= i) k = j;
+    return k;
+  }
+  function doneOpacity(age, otherDay) {
+    var o = Math.max(ROUTE_MIN_O, 1 - ROUTE_FADE_PER_LEG * Math.max(0, age));
+    return otherDay ? o * ROUTE_OTHER_DAY : o;
+  }
+  function doneFeatures(upTo) {       // projeté úseky 1..upTo, z každé dvojice míst jen nejnovější
+    var seen = {}, feats = [], now = legDay(upTo + 1);
+    for (var i = Math.min(upTo, journey.data.stops.length - 1); i >= 1; i--) {
+      var k = legKey(i);
+      if (seen[k]) continue;
+      seen[k] = 1;
+      var age = upTo - i, o = doneOpacity(age, legDay(i) !== now);
+      feats.push(lineFeature(legPath(i), { o: +o.toFixed(3), age: age, glow: age <= 1 ? 1 : 0 }));
+    }
+    return { type: 'FeatureCollection', features: feats.reverse() };
+  }
+  function aheadFeatures(cur) {       // úseky před kamerou: tlumeně, bez těch, co už jsou plně
+    var st = journey.data.stops, seen = {}, feats = [], now = legDay(Math.max(1, cur));
+    for (var i = 1; i <= cur && i < st.length; i++) seen[legKey(i)] = 1;
+    for (i = cur + 1; i < st.length; i++) {
+      var k = legKey(i);
+      if (seen[k]) continue;
+      seen[k] = 1;
+      var o = Math.max(0.1, 0.5 - 0.06 * (i - cur - 1));
+      if (legDay(i) !== now) o *= 0.5;
+      feats.push(lineFeature(legPath(i), { o: +o.toFixed(3) }));
+    }
+    return { type: 'FeatureCollection', features: feats };
+  }
+  function refreshAhead() {
+    var all = map && map.getSource('j-all');
+    if (all && journey.data) all.setData(aheadFeatures(Math.max(0, journey.curLeg != null ? journey.curLeg : journey.i)));
+  }
+  window.getRouteLayout = function () {   // testy: co se kreslí (bez geometrie)
+    if (!map || !map.getSource('j-done')) return null;
+    var cur = Math.max(0, journey.curLeg || 0);
+    var d = doneFeatures(cur - 1), a = aheadFeatures(cur);
+    return { done: d.features.map(function (f) { return f.properties; }),
+             ahead: a.features.map(function (f) { return f.properties; }), legs: journey.data.stops.length - 1 };
+  };
+  function allRouteCoords() {          // celá trasa jako jedna čára (testy, odhady délky)
     var st = journey.data.stops, all = [stopLL(st[0])];
     for (var i = 1; i < st.length; i++) all = all.concat(legPath(i).slice(1));
     return all;
@@ -2475,8 +2970,8 @@
   function addRouteLayers() {
     if (!map || !journey.data || !styleReady || map.getSource('j-all')) return;
     var cur = Math.max(0, journey.i);
-    map.addSource('j-all', { type: 'geojson', data: lineFeature(allRouteCoords()) });
-    map.addSource('j-done', { type: 'geojson', data: lineFeature(routeCoords(cur - 1, 1)) });
+    map.addSource('j-all', { type: 'geojson', data: aheadFeatures(cur) });
+    map.addSource('j-done', { type: 'geojson', data: doneFeatures(cur - 1) });
     // Projížděný úsek: vlastní zdroj s délkou čáry (lineMetrics) – projetá část je přechod barvy
     // na line-progress, posouvaný za snímek přes setPaintProperty (žádné setData za snímek)
     map.addSource('j-cur', { type: 'geojson', lineMetrics: true, data: curLegFeature(cur) });
@@ -2485,11 +2980,12 @@
     journey.curLeg = cur;
     journey.curFrac = -1;
     map.addLayer({ id: 'j-all', type: 'line', source: 'j-all', layout: cap,
-                   paint: { 'line-color': a, 'line-opacity': 0.5, 'line-width': 2.4, 'line-dasharray': [1.2, 1.6] } });
-    map.addLayer({ id: 'j-glow', type: 'line', source: 'j-done', layout: cap,
+                   paint: { 'line-color': a, 'line-opacity': ['get', 'o'], 'line-width': 2.2, 'line-dasharray': [1.2, 1.6] } });
+    map.addLayer({ id: 'j-glow', type: 'line', source: 'j-done', layout: cap, filter: ['==', ['get', 'glow'], 1],
                    paint: { 'line-color': a, 'line-opacity': 0.35, 'line-width': 12, 'line-blur': 8 } });
     map.addLayer({ id: 'j-done', type: 'line', source: 'j-done', layout: cap,
-                   paint: { 'line-color': a, 'line-width': 4 } });
+                   paint: { 'line-color': a, 'line-opacity': ['get', 'o'],
+                            'line-width': ['interpolate', ['linear'], ['get', 'age'], 0, 4, 4, 2.6] } });
     map.addLayer({ id: 'j-cur-glow', type: 'line', source: 'j-cur', layout: cap,
                    paint: { 'line-width': 12, 'line-blur': 8, 'line-gradient': progressGradient(hexA(a, 0.35), 0) } });
     map.addLayer({ id: 'j-cur', type: 'line', source: 'j-cur', layout: cap,
@@ -2534,8 +3030,9 @@
       journey.curLeg = i;
       journey.curFrac = -1;
       journey.stopsShown = -2;
-      if (d) d.setData(lineFeature(routeCoords(i - 1, 1)));
+      if (d) d.setData(doneFeatures(i - 1));
       if (c) c.setData(curLegFeature(i));
+      refreshAhead();
     }
     frac = Math.max(0, Math.min(1, frac));
     if (map.getLayer('j-cur') && Math.abs(frac - journey.curFrac) > 0.002) {
@@ -2754,10 +3251,10 @@
     if (i > 0) return bearingDeg(stopLL(st[i - 1]), stopLL(st[i]));
     return st.length > 1 ? bearingDeg(stopLL(st[0]), stopLL(st[1])) : 0;
   }
-  function planFilm(data, from, pad) {
+  function planFilm(data, from, pad, introS) {
     var st = data.stops, segs = [], pose = from;
     var overview = overviewPose(st, pad);
-    segs.push({ kind: 'intro', from: from, to: overview, dur: reduceMotion ? 1.2 : FILM_INTRO_S,
+    segs.push({ kind: 'intro', from: from, to: overview, dur: reduceMotion ? 1.2 : (introS || FILM_INTRO_S),
                 vw: vanWijk(from.c, overview.c, worldW(from.z), worldW(overview.z), VW_RHO) });
     pose = overview;
     for (var i = 0; i < st.length; i++) {
@@ -2992,6 +3489,7 @@
       journey.i = i;
       if (i >= 0) captionFor(i);
       markChapters(i);
+      markDays();
     }
     var travel = seg.kind === 'glide' || seg.kind === 'hop';
     showCaption(travel && u > 0.06 && u < CARD_IN_U && i >= 0);
@@ -3005,11 +3503,14 @@
     if (seg.kind === 'outro' && !journey.ended) beginEnding();
     if (seg.kind === 'outro' && u >= 0.55 && !cap.classList.contains('show')) {
       cap.classList.add('show');
-      var done = document.getElementById('jdone');
-      if (done) done.focus();
+      var nd = document.getElementById('jnextday'), done = document.getElementById('jdone');
+      if (nd && !nd.hidden) nd.focus();          // a day of a trip: the next day is one key away
+      else if (done) done.focus();
     }
     var bar = document.getElementById('jprogbar');
     if (bar) bar.style.transform = 'scaleX(' + (director.t / film.total).toFixed(4) + ')';
+    var pct = Math.round(100 * director.t / film.total);
+    if (pct !== journey.pct) { journey.pct = pct; document.getElementById('jprogress').setAttribute('aria-valuenow', pct); }
     if (seg.kind === 'dwell' && u < 0.05 && !journey.trailAsked[seg.i]) {
       journey.trailAsked[seg.i] = true;
       requestTrail(seg.i + 1);        // trasa dalšího úseku po cestách – na pozadí (Web Worker)
@@ -3392,6 +3893,150 @@
   }
   window.bakeFilm = bakeFilm;
 
+  // ── Fidelity: keep what the user will look at on disk before they look ─────
+  // tile_store.py has three queues: urgent (a flight's arrival view), film (bakeFilm) and
+  // background (regions). Keys go in order of importance: lower zooms (parents) first, so
+  // overzoomed fallback is always there before the detail.
+  var REGION_FULL_MAX_Z = 13;         // up to here the whole (padded) bounding box
+  var REGION_LEVEL_MAX = 900;         // a level with more tiles than this falls back to points only
+  var REGION_MAX_KEYS = 9000, REGION_MAX_POINTS = 160;
+  var WARM_VIEW_COLS = 16, WARM_VIEW_ROWS = 11;
+  var WARM_VIEW_VARIANTS = [[0, 0], [0, 12], [-0.6, 0]];     // [zoom offset, extra pitch]
+  function storeKey(url) {
+    var u = storeUrl(url);
+    if (u === url || u.indexOf('http://127.0.0.1') !== 0) return null;
+    var cut = u.indexOf('/', u.indexOf('//') + 2);           // http://127.0.0.1:port/
+    return u.slice(u.indexOf('/', cut + 1) + 1);              // without /token/
+  }
+  function warmSources() {            // tiled sources of the current style worth keeping on disk
+    var out = [], layers = (map.getStyle() || {}).layers || [];
+    tileSourceIds.forEach(function (id) {
+      var s = map.getSource(id);
+      if (!s || !Array.isArray(s.tiles) || !s.tiles.length || id === 'pins' || id.indexOf('j-') === 0) return;
+      var minz = 99;
+      layers.forEach(function (l) { if (l.source === id) minz = Math.min(minz, l.minzoom || 0); });
+      if (s.type === 'raster-dem') minz = HILLSHADE_MIN_ZOOM;    // terrain has no layer of its own
+      if (minz < 99) out.push({ id: id, s: s, minz: minz });
+    });
+    return out;
+  }
+  function warmPost(keys, priority) {
+    if (!keys.length || !TILE_STORE) return 0;
+    fetch(TILE_STORE.bases[0] + '_warm', { method: 'POST', body: JSON.stringify({ keys: keys, priority: priority }) })
+      .catch(function () {});
+    return keys.length;
+  }
+  // spec: {bbox: [w, s, e, n] | null, points: [[lon, lat], ...], zmin, zmax}
+  function regionTileKeys(spec) {
+    if (!map || !TILE_STORE || !styleReady || !spec) return [];
+    var bb = Array.isArray(spec.bbox) && spec.bbox.length === 4 && spec.bbox.every(isFinite) ? spec.bbox : null;
+    var pts = (spec.points || []).filter(function (p) { return p && isFinite(p[0]) && isFinite(p[1]) && Math.abs(p[1]) < 85; })
+      .slice(0, REGION_MAX_POINTS);
+    var zmin = Math.max(0, +spec.zmin || 10), zmax = Math.min(18, +spec.zmax || 16);
+    var keys = [], seen = {}, levels = {}, srcs = warmSources(), cap = +spec.max || REGION_MAX_KEYS;
+    var w, so, e, no;
+    if (bb) {
+      var px = Math.max(0.01, (bb[2] - bb[0]) * 0.15), py = Math.max(0.01, (bb[3] - bb[1]) * 0.15);
+      w = bb[0] - px; so = Math.max(-85, bb[1] - py); e = bb[2] + px; no = Math.min(85, bb[3] + py);
+    }
+    function add(s, z, x, y) {
+      var n = Math.pow(2, z);
+      if (y < 0 || y >= n || keys.length >= cap) return;
+      x = ((x % n) + n) % n;
+      var k = storeKey(s.tiles[0].replace('{z}', z).replace('{x}', x).replace('{y}', y));
+      if (k && !seen[k]) { seen[k] = true; keys.push(k); }
+    }
+    for (var vz = zmin; vz <= zmax && keys.length < cap; vz++) {
+      srcs.forEach(function (src) {
+        if (vz < src.minz) return;
+        var z = sourceTiles(src.s, vz), lvl = src.id + '/' + z;
+        if (levels[lvl]) return;                              // overzoomed: this level is done already
+        levels[lvl] = true;
+        if (bb && vz <= REGION_FULL_MAX_Z) {
+          var x0 = lon2tile(w, z), x1 = lon2tile(e, z), y0 = lat2tile(no, z), y1 = lat2tile(so, z);
+          if ((x1 - x0 + 1) * (y1 - y0 + 1) <= REGION_LEVEL_MAX) {
+            for (var y = y0; y <= y1; y++) for (var x = x0; x <= x1; x++) add(src.s, z, x, y);
+            return;
+          }
+        }
+        pts.forEach(function (p) {                            // around each photo place: 3 × 3 tiles
+          var cx = lon2tile(p[0], z), cy = lat2tile(p[1], z);
+          for (var dy = -1; dy <= 1; dy++) for (var dx = -1; dx <= 1; dx++) add(src.s, z, cx + dx, cy + dy);
+        });
+      });
+    }
+    return keys;
+  }
+  window.regionTileKeys = regionTileKeys;
+  window.warmRegion = function (spec, priority) {     // app: an event / trip was opened
+    return warmPost(regionTileKeys(spec), priority === 'urgent' ? 'urgent' : 'background');
+  };
+  // The arrival view of a flight, computed from the target camera the moment the flight starts
+  // (1.4-4.2 s ahead): exact frustum tiles plus two parent levels, urgent queue.
+  function warmViewKeys(opts) {
+    if (!map || !TILE_STORE || !styleReady || !opts || !opts.center) return [];
+    var c = maplibregl.LngLat.convert(opts.center), pts = [], ok = false;
+    try { prefetchTr = map.transform.clone(); } catch (e) { prefetchTr = null; }
+    // 3D terrain (on at arrival) covers more than the flat frustum: the ground rises toward
+    // the horizon and MapLibre asks for tiles behind it. Union of the flat view with a steeper
+    // and a wider (half a level out) one.
+    WARM_VIEW_VARIANTS.forEach(function (v) {
+      ok = frustumTiles({ c: [c.lng, c.lat], z: opts.zoom + v[0], p: Math.min(72, (opts.pitch || 0) + v[1]), b: opts.bearing || 0 },
+                        null, pts, WARM_VIEW_COLS, WARM_VIEW_ROWS) || ok;
+    });
+    prefetchTr = null;
+    if (!ok) return [];
+    var keys = [], seen = {}, srcs = warmSources();
+    [0, 1, 2].forEach(function (up) {
+      srcs.forEach(function (src) {
+        if (src.id === 'dem-film') return;
+        pts.forEach(function (pt) {
+          var vz = pt.z - up;
+          if (vz < src.minz) return;
+          var z = sourceTiles(src.s, vz), n = Math.pow(2, z);
+          var x = ((lon2tile(pt.ll[0], z) % n) + n) % n, y = lat2tile(pt.ll[1], z);
+          if (y < 0 || y >= n) return;
+          var k = storeKey(src.s.tiles[0].replace('{z}', z).replace('{x}', x).replace('{y}', y));
+          if (k && !seen[k]) { seen[k] = true; keys.push(k); }
+        });
+      });
+    });
+    return keys;
+  }
+  function warmView(opts) { return warmPost(warmViewKeys(opts), 'urgent'); }
+  window.warmViewKeys = warmViewKeys;
+  // The library's photo places: the busiest z12 cells, z10-15, background queue. The app asks
+  // for it once the markers are in, and again after a base-layer change (new sources).
+  var HOTSPOT_CELLS = 120, HOTSPOT_KEYS = 5000, hotspotsWanted = false, hotspotTimer = 0;
+  function hotspotKeys(limit) {
+    if (!markers.length) return [];
+    var cells = {};
+    markers.forEach(function (m) {
+      var k = lon2tile(m.lon, 12) + '/' + lat2tile(m.lat, 12);
+      var c = cells[k] || (cells[k] = { n: 0, lon: 0, lat: 0 });
+      c.n++; c.lon += m.lon; c.lat += m.lat;
+    });
+    var pts = Object.keys(cells).map(function (k) { return cells[k]; })
+      .sort(function (a, b) { return b.n - a.n; }).slice(0, HOTSPOT_CELLS)
+      .map(function (c) { return [c.lon / c.n, c.lat / c.n]; });
+    return regionTileKeys({ bbox: null, points: pts, zmin: 10, zmax: 15, max: limit || HOTSPOT_KEYS });
+  }
+  window.hotspotKeys = hotspotKeys;
+  window.warmPhotoHotspots = function (limit) {
+    hotspotsWanted = true;
+    clearTimeout(hotspotTimer);
+    if (!styleReady || !markers.length) return 0;          // style.load / setMarkers ask again
+    return warmPost(hotspotKeys(limit), 'background');
+  };
+  function rewarmHotspots() {          // new style or markers: queue again after the first paint
+    if (!hotspotsWanted) return;
+    clearTimeout(hotspotTimer);
+    hotspotTimer = setTimeout(function () { window.warmPhotoHotspots(); }, 4000);
+  }
+  window.getWarmState = function () {
+    return TILE_STORE ? fetch(TILE_STORE.bases[0] + '_state').then(function (r) { return r.json(); }) : null;
+  };
+
   // ── Mapa ve filmu: bez terénu, bez šumu popisků, výchozí LOD ───────────────
   // Sprint 1: žádné přenačtení zdroje při startu filmu. setLayoutProperty (visibility) volá
   // ve MapLibre Style._updateLayer -> „reload“ CELÉHO zdroje vrstvy: každá vektorová dlaždice
@@ -3505,19 +4150,59 @@
     } catch (e) { /* vnitřní API MapLibre */ }
   }
 
+  function journeyRegion(d) {         // bounding box + places of a Journey (whole trip, all days)
+    var pts = [];
+    (d.stops || []).forEach(function (s) {
+      pts.push([s.lon, s.lat]);
+      if (s.entry) pts.push([s.entry.lon, s.entry.lat]);
+      if (s.exit) pts.push([s.exit.lon, s.exit.lat]);
+    });
+    (d.days || []).forEach(function (day) {
+      (day.stops || []).forEach(function (s) { pts.push([s.lon, s.lat]); });
+    });
+    var lons = pts.map(function (p) { return p[0]; }), lats = pts.map(function (p) { return p[1]; });
+    return { bbox: [Math.min.apply(null, lons), Math.min.apply(null, lats), Math.max.apply(null, lons), Math.max.apply(null, lats)],
+             points: pts, zmin: 10, zmax: 16 };
+  }
+  window.journeyRegion = journeyRegion;
   function validJourney(d) {
     return d && Array.isArray(d.stops) && d.stops.length >= 2 && d.stops.every(function (s) {
       return isFinite(s.lat) && isFinite(s.lon) && Math.abs(s.lat) <= 90 && Math.abs(s.lon) <= 180;
     });
   }
 
+  // A Journey with "days" (journey.py build_days) is a trip: the film plays the whole trip
+  // (day -1) or a single day (dayFilm). journey.trip keeps the trip data across day switches.
   window.playJourney = function (data) {
+    return startFilm(data, data && Array.isArray(data.days) && data.days.length > 1 ? { trip: data, day: -1 } : null);
+  };
+  // Founder audit: přepnutí dne (pilulky Den 1, Den 2 …) bylo trhané – startFilm nejdřív celé
+  // Cestu ukončil (terén pryč, rozlišení, odsazení skokem, piny na snímek vidět, obloha) a pak
+  // ji postavil znovu. Ve stejném výletu se teď jen vymění film: vzhled filmu zůstane a úvod
+  // nového dne je let van Wijk z aktuální kamery (oblouk výšky + plynulý náklon) nad celý den.
+  var DAY_SWITCH_INTRO_S = 2.6;
+  function softHandOver() {
+    directorStop();
+    if (journey.trailPending) journey.trailPending = {};
+    if (map) map.stop();
+    removeRouteLayers();
+    film = null;
+    return { faded: journey.faded, hidden: journey.hidden, hadTerrain: journey.hadTerrain, tint: journey.tint };
+  }
+  function startFilm(data, ctx) {
     if (!validJourney(data)) return false;
-    if (journey.active) stopJourney(true);
+    var carry = null;
+    if (journey.active && ctx && ctx.trip && journey.trip === ctx.trip && film) carry = softHandOver();
+    else if (journey.active) stopJourney(true);
     toggleList(false);
     stopSpin(); hideCard();
     journey = { active: true, data: data, i: -1, paused: false, ended: false, card: null, trailAsked: {},
-                tint: validHex(data.accent) ? data.accent : null, trails: {}, trueLegs: {} };
+                tint: validHex(data.accent) ? data.accent : null, trails: {}, trueLegs: {},
+                trip: ctx ? ctx.trip : null, day: ctx ? ctx.day : -1 };
+    if (carry) {                                   // vzhled filmu běží dál (terén, vrstvy, rozlišení)
+      journey.faded = carry.faded; journey.hidden = carry.hidden; journey.hadTerrain = carry.hadTerrain;
+      journey.switched = true;
+    }
     // Gate 2 C: GPX legs (recorded line, 1:1) take precedence over any reconstruction
     if (data.tracks && typeof data.tracks === 'object') {
       Object.keys(data.tracks).forEach(function (k) {
@@ -3536,8 +4221,10 @@
     var cap = document.getElementById('jcap');
     cap.classList.remove('end');
     document.getElementById('jago').textContent = yearsAgo(data.start);
-    document.getElementById('jtitle').textContent = data.title || T('journey');
-    document.getElementById('jmeta').textContent = [data.location, dateRange([{ date: data.start }, { date: data.end }])]
+    var dayInfo = journey.trip && journey.day >= 0 ? journey.trip.days[journey.day] : null;
+    document.getElementById('jtitle').textContent = dayInfo
+      ? T('day-n', { n: dayInfo.n }) + ' · ' + (dayInfo.city || data.title || T('journey')) : (data.title || T('journey'));
+    document.getElementById('jmeta').textContent = [dayInfo ? data.title : data.location, dateRange([{ date: data.start }, { date: data.end }])]
       .filter(Boolean).join(' · ') + ' · ' + czStops(data.stops.length) + ' · ' + czCount(data.count || 0);
     var high = document.getElementById('jhigh');
     high.innerHTML = highlights(data).map(function (u) { return '<div' + bg(u) + '></div>'; }).join('');
@@ -3545,28 +4232,32 @@
     document.getElementById('jcaption').classList.remove('show');
     buildChapters();
     addRouteLayers();
-    filmLook(true);
+    if (!carry) filmLook(true);
     setInteraction('map', false);                  // pohyb kamery řídí od teď Cesta
     setInteraction('journey', true);               // aplikace: práce na pozadí počká do konce Cesty
     journeyMeter = makeMeter();
     lastSky = { el: null, az: null };
     if (map) map.stop();
     director.heading = map ? map.getBearing() : 0;
-    film = planFilm(data, cameraNow(), filmPadding());
+    film = planFilm(data, cameraNow(), filmPadding(), carry ? DAY_SWITCH_INTRO_S : null);
     // Gate 2 C: the app routes every ground leg along its corridor in the background
-    if (bridge && bridge.routeJourney) bridge.routeJourney(data.id, vectorTileTemplate());
+    if (journey.day >= 0) { if (bridge && bridge.routeJourneyDay) bridge.routeJourneyDay(data.id, journey.day, vectorTileTemplate()); }
+    else if (bridge && bridge.routeJourney) bridge.routeJourney(data.id, vectorTileTemplate());
     music.loops = 0; music.lastT = 0; beatClock.reset();
     buildCamera(film);                             // C1: celá dráha kamery předem (~750 vzorků, < 10 ms)
+    buildDays();                                   // day pills + day ticks on the timeline (needs the plan)
+    syncEndActions();
     director.t = 0;
     director.pfAt = 0;
     director.pfUpTo = 0;
     setPlayIcon(false);
     journey.baked = bakeFilm();                    // C7e: celý film do úložiště, souběžně s úvodem
+    journey.warmed = window.warmRegion(journeyRegion(journey.trip || data));   // later zooms into any stop: warm
     prefetchAhead(0, PREFETCH_AHEAD_S + 4);        // úvod + první přesun, než se kamera rozjede (C7a)
     directorStart();
     syncMusic();                                   // C6: náběh hudby s úvodem (je-li zapnutá)
     return true;
-  };
+  }
 
   function beginEnding() {
     journey.ended = true;
@@ -3574,6 +4265,7 @@
     document.getElementById('jago').textContent = T('journey-end');
     document.getElementById('jcap').classList.add('end');
     markChapters(journey.data.stops.length);       // všechny kapitoly viděné
+    syncEndActions();
     setPlayIcon(true);
     syncMusic();                                   // doznění se závěrem
   }
@@ -3684,10 +4376,173 @@
     seekStop(Math.max(0, target));
   }
   function replay() {
-    var d = journey.data;
+    var d = journey.data, ctx = journey.trip ? { trip: journey.trip, day: journey.day } : null;
     stopJourney(true);
-    window.playJourney(d);
+    startFilm(d, ctx);
   }
+  // ── Day chapters (multi-day Journey) ─────────────────────────────────────────
+  // Pills above the dock: "Whole trip" plus one per day. A day with two or more places plays
+  // as its own short film (its stops, from journey.py build_days). A one-place day jumps to its
+  // stop inside the whole-trip film. Next/previous day: the ⏭ button, Page Down / Page Up,
+  // the end card. Number keys 1-9 pick a day, 0 the whole trip.
+  function tripDays() { return journey.trip && Array.isArray(journey.trip.days) ? journey.trip.days : []; }
+  function dayPlayable(day) { return !!day && Array.isArray(day.stops) && day.stops.length >= 2; }
+  function fmtDay(s) {               // '2026-07-07' -> 'Tue 7/7' / 'út 7. 7.' (app language)
+    var d = parseLocal((s || '') + ' 12:00');
+    if (!d || isNaN(d)) return '';
+    try { return new Intl.DateTimeFormat(LANG, { weekday: 'short', day: 'numeric', month: 'numeric' }).format(d); }
+    catch (e) { return s; }
+  }
+  function buildDays() {
+    var box = document.getElementById('jdays'), days = tripDays(), ticks = document.getElementById('jdayticks');
+    document.getElementById('jdaynext').hidden = !days.length;
+    ticks.innerHTML = '';
+    box.hidden = !days.length;
+    if (!days.length) { box.innerHTML = ''; return; }
+    var html = '<button type="button" role="tab" class="whole" data-day="-1">' + esc(T('whole-trip')) + '</button>';
+    days.forEach(function (d, k) {
+      var tip = [T('day-n', { n: d.n }), fmtDay(d.date), d.city].filter(Boolean).join(' · ')
+        + (dayPlayable(d) ? '' : ' – ' + T('day-one-place'));
+      html += '<button type="button" role="tab" data-day="' + k + '"' + (dayPlayable(d) ? '' : ' class="solo"')
+        + ' title="' + esc(tip) + '"><span class="th"' + bg(d.thumb) + '></span><span class="dn">'
+        + esc(T('day-n', { n: d.n })) + '</span><span class="dd">' + esc(fmtDay(d.date)) + '</span></button>';
+    });
+    box.innerHTML = html;
+    Array.prototype.forEach.call(box.querySelectorAll('button'), function (b) {
+      b.setAttribute('aria-selected', +b.dataset.day === journey.day ? 'true' : 'false');
+      b.addEventListener('click', function () { playDay(+b.dataset.day); });
+    });
+    // whole trip: where each day begins on the timeline
+    if (journey.day < 0 && film) {
+      days.forEach(function (d, k) {
+        var dw = k > 0 && film.dwells[d.first];
+        if (!dw) return;
+        var t = document.createElement('span');
+        t.style.left = (100 * dw.t0 / film.total).toFixed(2) + '%';
+        ticks.appendChild(t);
+      });
+    }
+  }
+  function currentDay() {             // day of the whole-trip film at the current stop
+    var days = tripDays(), i = Math.max(0, journey.i), k = 0;
+    if (journey.day >= 0) return journey.day;
+    days.forEach(function (d, j) { if (d.first <= i) k = j; });
+    return k;
+  }
+  function markDays() {
+    var box = document.getElementById('jdays');
+    if (box.hidden) return;
+    var here = currentDay();
+    Array.prototype.forEach.call(box.querySelectorAll('button'), function (b) {
+      var k = +b.dataset.day;
+      b.classList.toggle('here', journey.day < 0 && k === here);
+    });
+  }
+  function playDay(k) {
+    var trip = journey.trip, days = tripDays();
+    if (!trip || k >= days.length) return false;
+    if (k < 0) return journey.day < 0 ? true : startFilm(trip, { trip: trip, day: -1 });
+    var day = days[k];
+    if (!dayPlayable(day)) {          // one place that day: its moment inside the whole trip
+      if (journey.day >= 0 && !startFilm(trip, { trip: trip, day: -1 })) return false;
+      seekStop(day.first);
+      return true;
+    }
+    if (journey.day === k && !journey.ended) return true;
+    var d = Object.assign({}, trip, { stops: day.stops, start: day.start, end: day.end, count: day.count });
+    delete d.days;
+    delete d.tracks;
+    if (day.tracks) d.tracks = day.tracks;
+    return startFilm(d, { trip: trip, day: k });
+  }
+  function stepDay(delta) {
+    var days = tripDays();
+    if (!days.length || !journey.active) return false;
+    var k = currentDay();
+    if (journey.day < 0 && delta > 0) {           // whole trip: the next day that starts later
+      for (var j = k + 1; j < days.length; j++) if (days[j].first > Math.max(0, journey.i)) { seekStop(days[j].first); return true; }
+      finishJourney();
+      return true;
+    }
+    if (journey.day < 0) {                        // back: to this day's start, or the one before
+      var start = days[k].first;
+      seekStop(journey.i > start || k === 0 ? start : days[k - 1].first);
+      return true;
+    }
+    var next = k + delta;
+    if (next < 0) return playDay(0);
+    if (next >= days.length) { finishJourney(); return true; }
+    return playDay(next);
+  }
+  window.journeyPlayDay = playDay;              // tests / app: -1 = whole trip
+  window.journeyStepDay = stepDay;
+  window.getJourneyDays = function () {
+    return { day: journey.day, here: journey.active && journey.trip ? currentDay() : null,
+             days: tripDays().map(function (d) { return { n: d.n, date: d.date, playable: dayPlayable(d), first: d.first,
+                                                         stops: (d.stops || []).length }; }),
+             pills: document.querySelectorAll('#jdays button').length, ticks: document.querySelectorAll('#jdayticks span').length };
+  };
+  function syncEndActions() {         // end card: next day / back to the whole trip
+    var days = tripDays(), inDay = journey.day >= 0;
+    document.getElementById('jnextday').hidden = !(inDay && journey.day + 1 < days.length);
+    document.getElementById('jwhole').hidden = !inDay;
+  }
+  // ── Seekable timeline ──
+  function seekTo(t) {
+    if (!journey.active || !film) return false;
+    t = Math.max(0, Math.min(film.total - 0.05, +t || 0));
+    var sg = film.segs[segIndexAt(t)];
+    if (sg && sg.kind === 'dwell') sg.held = TILE_HOLD_MAX_S;     // a cut: no waiting for tiles
+    if (journey.ended) {
+      journey.ended = false;
+      document.getElementById('jcap').classList.remove('show', 'end');
+      document.getElementById('jago').textContent = yearsAgo(journey.data.start);
+    }
+    director.t = t;
+    director.pfUpTo = undefined;
+    lastSky = { el: null, az: null };
+    director.directing = true;
+    prefetchAhead(t, PREFETCH_AHEAD_S);
+    renderFilm(0);
+    syncMusic();
+    if (!journey.paused) directorStart();
+    else map.triggerRepaint();
+    return true;
+  }
+  window.journeySeekTo = seekTo;
+  (function seekBar() {
+    var bar = document.getElementById('jprogress'), drag = null;
+    function frac(e) {
+      var r = bar.getBoundingClientRect();
+      return Math.max(0, Math.min(1, (e.clientX - r.left) / Math.max(1, r.width)));
+    }
+    bar.addEventListener('pointerdown', function (e) {
+      if (!film) return;
+      e.preventDefault();
+      drag = { wasPaused: journey.paused && !journey.ended };
+      seekTo(frac(e) * film.total);                // also leaves the end card
+      if (!journey.paused) togglePause();          // hold the film still while scrubbing
+      bar.classList.add('drag');
+      try { bar.setPointerCapture(e.pointerId); } catch (x) { /* ignore */ }
+    });
+    bar.addEventListener('pointermove', function (e) { if (drag && film) seekTo(frac(e) * film.total); });
+    function end() {
+      if (!drag) return;
+      var resume = !drag.wasPaused;
+      drag = null;
+      bar.classList.remove('drag');
+      if (resume && journey.paused) togglePause();
+    }
+    bar.addEventListener('pointerup', end);
+    bar.addEventListener('pointercancel', end);
+    bar.addEventListener('keydown', function (e) {
+      if (!film || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      seekTo(director.t + (e.key === 'ArrowRight' ? 5 : -5));
+    });
+  })();
+
   function openFromJourney(id) {
     if (journey.active && !journey.paused && !journey.ended) togglePause();
     if (bridge) bridge.openPhotoFromMap(id);
@@ -3830,6 +4685,9 @@
   document.getElementById('jclose').addEventListener('click', function () { stopJourney(false); });
   document.getElementById('jdone').addEventListener('click', function () { stopJourney(false); });
   document.getElementById('jreplay').addEventListener('click', replay);
+  document.getElementById('jdaynext').addEventListener('click', function () { stepDay(1); });
+  document.getElementById('jnextday').addEventListener('click', function () { stepDay(1); });
+  document.getElementById('jwhole').addEventListener('click', function () { playDay(-1); });
 
   window.journeyState = function () {
     var seg = film ? film.segs[segIndexAt(director.t)] : null;
@@ -3840,7 +4698,8 @@
              card: journey.card === undefined ? null : journey.card,
              place: document.getElementById('jplace').textContent,
              route: !!(map && map.getLayer('j-done')), sky: skyNow.sky || null,
-             t: director.t, total: film ? film.total : 0, segment: seg ? seg.kind : null };
+             t: director.t, total: film ? film.total : 0, segment: seg ? seg.kind : null,
+             day: journey.day, days: tripDays().length };
   };
   window.journeyPause = togglePause;
   window.journeySkip = skip;
@@ -3855,9 +4714,13 @@
 
   document.addEventListener('keydown', function (e) {
     if (journey.active) {
+      if (e.target && e.target.id === 'jprogress' && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) return;
       if (e.key === ' ') { e.preventDefault(); togglePause(); }
       else if (e.key === 'ArrowRight') skip(1);
       else if (e.key === 'ArrowLeft') skip(-1);
+      else if (e.key === 'PageDown') { e.preventDefault(); stepDay(1); }
+      else if (e.key === 'PageUp') { e.preventDefault(); stepDay(-1); }
+      else if (/^[0-9]$/.test(e.key) && tripDays().length) playDay(+e.key - 1);
       else if (e.key === 'Escape') stopJourney(false);
       return;
     }

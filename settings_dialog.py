@@ -19,8 +19,8 @@ from PyQt6.QtWidgets import (
     QFrame, QTabWidget, QWidget, QListWidget, QListWidgetItem,
     QCheckBox, QComboBox, QScrollArea
 )
-from PyQt6.QtCore import Qt
-from ui_controls import AccentPicker, KButton, SegmentedControl, ToggleSwitch
+from PyQt6.QtCore import QEventLoop, Qt
+from ui_controls import AccentPicker, InfoDot, KButton, SegmentedControl, ToggleSwitch, guard_wheel
 from config import load_config, save_config, DEFAULT_CONFIG
 from paths import THUMB_DIR, FACE_DIR
 from cache_tools import clear_thumbnail_cache
@@ -134,10 +134,23 @@ class ConfirmSheet(QDialog):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
+    """Předvolby. as_sheet=True (hlavní okno): list v okně (ui_sheets.PanelSheet) se ztlumeným
+    pozadím místo samostatného systémového okna; rozhraní exec() / accept() / reject() a
+    výsledné příznaky zůstávají stejné. Bez rodiče (testy) klasický QDialog."""
+
+    def __init__(self, parent=None, as_sheet=False):
         super().__init__(parent)
+        self._sheet = None
+        self._sheet_done = False
+        if as_sheet and parent is not None:
+            from ui_sheets import PanelSheet
+            self.setWindowFlags(Qt.WindowType.Widget)
+            self.setObjectName("settingsSheet")
+            self._sheet = PanelSheet(parent, self)
+            self._sheet.request_close = self.reject       # klik vedle karty = Zrušit
         self.setWindowTitle(tr("settings-window-title", APP_NAME=brand.APP_NAME))
-        self.resize(660, 560)
+        if self._sheet is None:
+            self.resize(660, 560)
         # Styl z tokenů (tokens.build_qss "settings"): motiv, zvýraznění, fajfka v zaškrtávátku
         tokens.apply_stylesheet(self, "settings")
 
@@ -152,6 +165,41 @@ class SettingsDialog(QDialog):
         self.hidden_requested = False       # Předvolby › Skryté › Otevřít
         self._stats = self._read_library_stats()
         self.init_ui()
+        # Founder audit: kolečko nad posuvníkem / seznamem posouvá stránku, dokud prvek nemá fokus
+        guard_wheel(self)
+
+    # ── list v okně ──
+    @property
+    def sheet(self):
+        return self._sheet
+
+    def exec(self):
+        if self._sheet is None:
+            return super().exec()
+        loop = QEventLoop()
+        self.finished.connect(lambda _r: loop.quit())
+        self._sheet.open()
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        if not self._sheet_done:
+            loop.exec()
+        return self.result()
+
+    def done(self, r):
+        """V listu se karta nesmí schovat hned (prázdná karta při odjezdu): výsledek a signály
+        hned, odjezd listu animovaně; list pak smaže i tento widget."""
+        if self._sheet is None:
+            return super().done(r)
+        if self._sheet_done:
+            return None
+        self._sheet_done = True
+        self.setResult(int(r))
+        self._sheet._close(bool(r))
+        if r == QDialog.DialogCode.Accepted:
+            self.accepted.emit()
+        else:
+            self.rejected.emit()
+        self.finished.emit(int(r))
+        return None
 
     # ── data pro náhled dopadu ──
     def _read_library_stats(self):
@@ -173,7 +221,24 @@ class SettingsDialog(QDialog):
         return stats
 
     def _confirm(self, title, body, impact_lines=(), options=(), action_text=None, destructive=True):
-        """Potvrzovací list; vrací (potvrzeno, {volba: bool}). V testech se nahrazuje."""
+        """Potvrzovací list; vrací (potvrzeno, {volba: bool}). V testech se nahrazuje.
+        V listu Předvoleb jako další list v okně (žádné systémové okno)."""
+        if self._sheet is not None:
+            from ui_sheets import Sheet
+            sheet = Sheet(self.parentWidget(), title, body, action_text or tr("action-continue"),
+                          destructive=destructive)
+            for line in impact_lines:
+                sheet.content.addWidget(_impact("• " + line))
+            boxes = {}
+            for key, label, checked in options:
+                chk = QCheckBox(label)
+                chk.setChecked(checked)
+                boxes[key] = chk
+                sheet.content.addWidget(chk)
+            values = {}
+            sheet.done.connect(lambda _ok: values.update({k: c.isChecked() for k, c in boxes.items()}))
+            ok = sheet.exec()
+            return ok, values
         sheet = ConfirmSheet(title, body, impact_lines, options, action_text, destructive, self)
         ok = sheet.exec() == QDialog.DialogCode.Accepted
         return ok, sheet.values()
@@ -193,6 +258,10 @@ class SettingsDialog(QDialog):
         self.tab_switch = SegmentedControl([(self.tabs.tabText(i), i) for i in range(self.tabs.count())], current=0)
         self.tab_switch.changed.connect(self.tabs.setCurrentIndex)
         self.tabs.currentChanged.connect(self.tab_switch.set_current)
+        if self._sheet is not None:
+            title = QLabel(tr("nav-settings"))
+            title.setObjectName("sheetHeader")
+            main_layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignHCenter)
         main_layout.addWidget(self.tab_switch, alignment=Qt.AlignmentFlag.AlignHCenter)
         main_layout.addWidget(self.tabs)
 
@@ -215,16 +284,30 @@ class SettingsDialog(QDialog):
     def _scroll(self, page):
         page.setObjectName("page")
         area = QScrollArea()
+        area.setFrameShape(QFrame.Shape.NoFrame)        # bez tvrdé linky kolem stránky
         area.setWidgetResizable(True)
         area.setWidget(page)
         return area
 
     # ── skupiny a řádky (macOS: popisek vlevo, ovládání vpravo, oddělovač odsazený) ──
     @staticmethod
-    def _group(layout, title):
+    def _group(layout, title, info=None):
+        """Skupina s nadpisem; info = vysvětlení v (i) vedle nadpisu (Founder audit: žádné
+        odstavce textu pod skupinou)."""
         cap = QLabel(title.upper())
         cap.setObjectName("groupTitle")
-        layout.addWidget(cap)
+        if info:
+            head = QHBoxLayout()
+            head.setContentsMargins(0, 0, 0, 0)
+            head.setSpacing(2)
+            head.addWidget(cap)
+            dot = InfoDot(info)
+            dot.setObjectName("groupInfo")
+            head.addWidget(dot, 0, Qt.AlignmentFlag.AlignBottom)
+            head.addStretch(1)
+            layout.addLayout(head)
+        else:
+            layout.addWidget(cap)
         frame = QFrame()
         frame.setObjectName("group")
         frame.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -235,9 +318,10 @@ class SettingsDialog(QDialog):
         return frame
 
     @staticmethod
-    def _row(group, label=None, control=None, value=None, stacked=None):
+    def _row(group, label=None, control=None, value=None, stacked=None, info=None):
         """Řádek skupiny. label + control = vedle sebe; stacked = widget přes celou šířku pod
-        popiskem (posuvník, seznam). value = QLabel s hodnotou vpravo od popisku."""
+        popiskem (posuvník, seznam). value = QLabel s hodnotou vpravo od popisku.
+        info = vysvětlení v (i) hned za popiskem."""
         box = group.layout()
         if box.count():
             sep = QFrame()
@@ -255,8 +339,13 @@ class SettingsDialog(QDialog):
             if isinstance(label, str):
                 label = QLabel(label)
             if label is not None:
-                label.setWordWrap(True)
-                line.addWidget(label, 1)
+                label.setWordWrap(not info)      # s (i) na jednom řádku (jinak se zalomí do úzka)
+                if info:
+                    line.addWidget(label, 0)
+                    line.addWidget(InfoDot(info), 0, Qt.AlignmentFlag.AlignVCenter)
+                    line.addStretch(1)
+                else:
+                    line.addWidget(label, 1)
             if value is not None:
                 value.setObjectName("rowValue")
                 line.addWidget(value, 0, Qt.AlignmentFlag.AlignRight)
@@ -284,7 +373,7 @@ class SettingsDialog(QDialog):
         layout = self._tab_layout(tab)
 
         # Knihovna + chytrý import
-        g = self._group(layout, tr("settings-library"))
+        g = self._group(layout, tr("settings-library"), info=tr("settings-folders-hint"))
         self.list_folders = QListWidget()
         self.list_folders.setMinimumHeight(96)
         self.list_folders.setToolTip(tr("settings-watched-tooltip"))
@@ -304,10 +393,9 @@ class SettingsDialog(QDialog):
         self.chk_autoscan = ToggleSwitch(tr("settings-scan-on-start"))
         self.chk_autoscan.setChecked(self.config.get("auto_scan_on_startup", True))
         self._row(g, stacked=self.chk_autoscan)
-        layout.addWidget(_hint(tr("settings-folders-hint")))
 
         # Vzhled
-        g = self._group(layout, tr("settings-appearance"))
+        g = self._group(layout, tr("settings-appearance"), info=tr("settings-appearance-hint"))
         # Gate 1: jazyk rozhraní – přepne se hned po uložení, bez restartu
         self.combo_language = QComboBox()
         self.combo_language.setObjectName("combo_language")
@@ -325,7 +413,7 @@ class SettingsDialog(QDialog):
                                           self.config.get("accent_custom", ""))
         self._row(g, tr("settings-accent"), self.accent_picker)
         self.chk_adaptive = ToggleSwitch(tr("settings-adaptive"))
-        self.chk_adaptive.setToolTip(tr("settings-adaptive-tooltip"))
+        self.chk_adaptive.set_info(tr("settings-adaptive-tooltip"))
         self.chk_adaptive.setChecked(bool(self.config.get("adaptive_accent", True)))
         self._row(g, stacked=self.chk_adaptive)
         self.chk_reduce_motion = ToggleSwitch(tr("settings-reduce-motion"))
@@ -334,10 +422,9 @@ class SettingsDialog(QDialog):
         self.chk_memories = ToggleSwitch(tr("settings-show-memories"))
         self.chk_memories.setChecked(bool(self.config.get("show_memories", True)))
         self._row(g, stacked=self.chk_memories)
-        layout.addWidget(_hint(tr("settings-appearance-hint")))
 
         # Gate 2 D: hudba pro Cestu - vlastní skladby v %APPDATA%/Kairos/music
-        g = self._group(layout, tr("settings-music"))
+        g = self._group(layout, tr("settings-music"), info=tr("settings-music-hint"))
         self.list_music = QListWidget()
         self.list_music.setObjectName("list_music")
         self.list_music.setMinimumHeight(72)
@@ -354,10 +441,9 @@ class SettingsDialog(QDialog):
         music_box.addStretch()
         self._row(g, tr("settings-music-own"), stacked=self.list_music)
         self._row(g, stacked=music_box)
-        layout.addWidget(_hint(tr("settings-music-hint")))
 
         # Řazení
-        g = self._group(layout, tr("settings-photo-library"))
+        g = self._group(layout, tr("settings-photo-library"), info=tr("settings-tile-size-hint"))
         self.combo_default_sort = QComboBox()
         for value, label in SORT_CHOICES:
             self.combo_default_sort.addItem(tr(label), value)
@@ -372,21 +458,19 @@ class SettingsDialog(QDialog):
         self.chk_ocr = ToggleSwitch(tr("settings-ocr"))
         self.chk_ocr.setChecked(bool(self.config.get("ocr_text", True)))
         self._row(g, stacked=self.chk_ocr)
-        layout.addWidget(_hint(tr("settings-tile-size-hint")))
 
         # Koš
-        g = self._group(layout, tr("nav-trash"))
+        g = self._group(layout, tr("nav-trash"), info=tr("settings-trash-hint"))
         self.lbl_trash = QLabel()
         self.lbl_trash.setWordWrap(True)
         self.btn_empty_trash = KButton(tr("settings-empty-trash"), compact=True)
         self.btn_empty_trash.setObjectName("btnReset")
         self.btn_empty_trash.clicked.connect(self.empty_trash)
         self._row(g, self.lbl_trash, self.btn_empty_trash)
-        layout.addWidget(_hint(tr("settings-trash-hint")))
         self.refresh_trash_label()
 
         # Stage 3: složka Skryté
-        g = self._group(layout, tr("nav-locked"))
+        g = self._group(layout, tr("nav-locked"), info=tr("settings-locked-hint"))
         self.chk_hidden_entry = ToggleSwitch(tr("settings-show-locked"))
         self.chk_hidden_entry.setChecked(bool(self.config.get("show_hidden_folder", True)))
         self._row(g, stacked=self.chk_hidden_entry)
@@ -396,14 +480,12 @@ class SettingsDialog(QDialog):
         self.btn_hidden_pass = KButton(tr("settings-change-passcode"), compact=True)
         self.btn_hidden_pass.clicked.connect(self.change_hidden_passcode)
         self._row(g, tr("settings-locked-passcode-row"), self.btn_hidden_pass)
-        layout.addWidget(_hint(tr("settings-locked-hint")))
 
         # Nápověda (Polish P2) – otevře stránku Tipy a průvodce v hlavním okně
-        g = self._group(layout, tr("guide-where-help"))
+        g = self._group(layout, tr("guide-where-help"), info=tr("settings-guide-hint"))
         self.btn_guide = KButton(tr("action-open-ellipsis"), compact=True, icon="sparkle")
         self.btn_guide.clicked.connect(self.open_guide)
         self._row(g, tr("settings-guide-row"), self.btn_guide)
-        layout.addWidget(_hint(tr("settings-guide-hint")))
         layout.addStretch()
         return tab
 
@@ -434,16 +516,16 @@ class SettingsDialog(QDialog):
         self.slider_threshold.setRange(30, 90)   # 0.30 – 0.90
         self.slider_threshold.setValue(self._saved_threshold)
         self.slider_threshold.valueChanged.connect(self._update_threshold_impact)
-        row = self._row(g, tr("settings-face-threshold"), value=self.lbl_threshold, stacked=self.slider_threshold)
+        row = self._row(g, tr("settings-face-threshold"), value=self.lbl_threshold, stacked=self.slider_threshold,
+                        info=tr("settings-face-threshold-hint"))
         self.lbl_threshold_impact = _impact()
         row.layout().addWidget(self.lbl_threshold_impact)
-        row.layout().addWidget(_hint(tr("settings-face-threshold-hint")))
         self.btn_recluster = KButton(tr("settings-regroup"), compact=True)
         self.btn_recluster.clicked.connect(self.request_recluster)
         self._row(g, tr("settings-regroup-row"), self.btn_recluster)
         self._update_threshold_impact(self.slider_threshold.value())
 
-        g = self._group(layout, tr("settings-memory-caches"))
+        g = self._group(layout, tr("settings-memory-caches"), info=tr("settings-caches-hint"))
         lru_val = int(self.config.get("thumbnail_lru_capacity", 1200))
         self.lbl_lru = QLabel()
         self.slider_lru = QSlider(Qt.Orientation.Horizontal)
@@ -480,7 +562,6 @@ class SettingsDialog(QDialog):
         cache_row.addStretch()
         self._row(g, stacked=self.lbl_cache_size)
         self._row(g, stacked=cache_row)
-        layout.addWidget(_hint(tr("settings-caches-hint")))
         self.refresh_cache_size_label()
 
         # Gate 0: umístění dat a přesun mezipaměti na jiný disk (provede se při dalším startu)
@@ -490,24 +571,24 @@ class SettingsDialog(QDialog):
         self.lbl_cache_dir.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.btn_move_cache = KButton(tr("settings-move-ellipsis"), compact=True)
         self.btn_move_cache.clicked.connect(self.choose_cache_dir)
-        self._row(g, tr("settings-cache-location"), self.btn_move_cache)
+        self._row(g, tr("settings-cache-location"), self.btn_move_cache,
+                  info=tr("settings-cache-location-hint", DATA_DIR=paths.DATA_DIR, FACE_DIR=paths.FACE_DIR))
         self._row(g, stacked=self.lbl_cache_dir)
-        self._row(g, stacked=_hint(tr("settings-cache-location-hint", DATA_DIR=paths.DATA_DIR, FACE_DIR=paths.FACE_DIR)))
         self._update_cache_dir_label()
 
         # Fáze 1: adaptivní škálování a proxy videí (rozhodnutí C: limit úložiště v Předvolbách)
         g = self._group(layout, tr("settings-perf-video"))
         tier = self.config.get("performance_tier", "auto")
         self.perf_switch = SegmentedControl(_choices(PERF_CHOICES), current=tier if tier in dict(PERF_CHOICES).values() else "auto")
-        self._row(g, tr("settings-performance"), self.perf_switch)
+        detected = perf_profile.classify(os.cpu_count() or 4, perf_profile.total_ram_gb())
+        tier_label = {k: t for t, k in PERF_CHOICES}.get(detected)
+        self._row(g, tr("settings-performance"), self.perf_switch,
+                  info=tr("settings-perf-hint", tier=tr(tier_label) if tier_label else detected))
         pol = self.config.get("battery_policy", power.DEFAULT_POLICY)
         self.battery_switch = SegmentedControl(_choices(BATTERY_CHOICES),
                                                current=pol if pol in dict(BATTERY_CHOICES).values() else "throttle")
-        self._row(g, tr("settings-battery-ai"), self.battery_switch)
-        self._row(g, stacked=_hint(tr("settings-battery-hint", pct=power.LOW_BATTERY_PCT, now=power.get().describe())))
-        detected = perf_profile.classify(os.cpu_count() or 4, perf_profile.total_ram_gb())
-        tier_label = {k: t for t, k in PERF_CHOICES}.get(detected)
-        self._row(g, stacked=_hint(tr("settings-perf-hint", tier=tr(tier_label) if tier_label else detected)))
+        self._row(g, tr("settings-battery-ai"), self.battery_switch,
+                  info=tr("settings-battery-hint", pct=power.LOW_BATTERY_PCT, now=power.get().describe()))
 
         self.lbl_proxy_mb = QLabel()
         self.slider_proxy_mb = QSlider(Qt.Orientation.Horizontal)
@@ -525,26 +606,27 @@ class SettingsDialog(QDialog):
         self._row(g, tr("settings-video-copies-row"), self.btn_clear_proxies)
         self._update_proxy_impact(self.slider_proxy_mb.value())
 
-        # Stage 2: správa barev – výstupní profil fotek (Display P3 z iPhonu -> displej)
+        # Barvy: výchozí = kontrakt Windows (color_manage.MODE_SYSTEM); přepínač = volitelný
+        # převod do nativního gamutu panelu (MODE_PANEL)
         g = self._group(layout, tr("settings-colors"))
         import color_manage
         self.chk_color_display = ToggleSwitch(tr("settings-color-display"))
-        self.chk_color_display.setChecked(self.config.get("color_output", "auto") != color_manage.MODE_SRGB)
-        self._row(g, stacked=self.chk_color_display)
+        self.chk_color_display.setChecked(
+            color_manage.normalize_mode(self.config.get("color_output")) == color_manage.MODE_PANEL)
         tgt = color_manage.target()
-        self._row(g, stacked=_hint(
-            tr("settings-color-hint", name=tgt['name'], reason=tr(tgt['reason']) if i18n.has(tgt['reason']) else tgt['reason'])))
+        self.chk_color_display.set_info(
+            tr("settings-color-hint", name=tgt['name'], reason=tr(tgt['reason']) if i18n.has(tgt['reason']) else tgt['reason']))
+        self._row(g, stacked=self.chk_color_display)
 
         # Sprint 4.0: přesné hledání (SigLIP 2) – volitelné, výchozí lehký CLIP
         g = self._group(layout, tr("settings-precise-search"))
         import siglip_engine
         self.chk_precise = ToggleSwitch(tr("settings-precise-search-toggle"))
         self.chk_precise.setChecked(bool(self.config.get("search_precise", False)))
-        self._row(g, stacked=self.chk_precise)
         state = (tr("settings-model-downloaded") if siglip_engine.installed()
                  else tr("settings-model-download-size", value=fmt_number(siglip_engine.DOWNLOAD_MB / 1000, 1)))
-        self._row(g, stacked=_hint(
-            tr("settings-precise-search-hint") + state))
+        self.chk_precise.set_info(tr("settings-precise-search-hint") + state)
+        self._row(g, stacked=self.chk_precise)
 
         g = self._group(layout, tr("settings-recovery"))
         self.lbl_factory = _hint("")
@@ -663,20 +745,23 @@ class SettingsDialog(QDialog):
 
     # ── akce ──
     def clean_cache(self):
-        reply = QMessageBox.question(
-            self,
-            tr("settings-delete-thumbs-q"),
-            tr("settings-delete-thumbs-body"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        ok, _ = self._confirm(tr("settings-delete-thumbs-q"), tr("settings-delete-thumbs-body"),
+                              action_text=tr("settings-delete-thumbs"))
+        if not ok:
             return
         ok, message = clear_thumbnail_cache()
         self.refresh_cache_size_label()
         if ok:
             self.cache_cleaned = True
-            QMessageBox.information(self, tr("common-done"), message + tr("settings-thumbs-regen"))
+        self._notify(message + (tr("settings-thumbs-regen") if ok else ""), ok)
+
+    def _notify(self, message, ok=True):
+        """Výsledek akce: v listu toast v hlavním okně, jinak (samostatné okno) zpráva."""
+        if self._sheet is not None:
+            from ui_toast import show_toast
+            show_toast(self.parentWidget(), message.strip(), "success" if ok else "error")
+        elif ok:
+            QMessageBox.information(self, tr("common-done"), message)
         else:
             QMessageBox.warning(self, tr("common-error"), message)
 
@@ -821,7 +906,7 @@ class SettingsDialog(QDialog):
         self.chk_borrow.setChecked(DEFAULT_CONFIG.get("borrow_location", True))
         self.chk_ocr.setChecked(DEFAULT_CONFIG.get("ocr_text", True))
         self.chk_precise.setChecked(DEFAULT_CONFIG.get("search_precise", False))
-        self.chk_color_display.setChecked(DEFAULT_CONFIG.get("color_output", "auto") != "srgb")
+        self.chk_color_display.setChecked(DEFAULT_CONFIG.get("color_output") == "panel")
         self.chk_memories.setChecked(DEFAULT_CONFIG.get("show_memories", True))
         self.chk_adaptive.setChecked(DEFAULT_CONFIG.get("adaptive_accent", True))
         self.chk_hidden_entry.setChecked(DEFAULT_CONFIG.get("show_hidden_folder", True))
@@ -868,7 +953,7 @@ class SettingsDialog(QDialog):
         self.config["borrow_location"] = self.chk_borrow.isChecked()
         self.config["ocr_text"] = self.chk_ocr.isChecked()
         self.config["search_precise"] = self.chk_precise.isChecked()
-        self.config["color_output"] = "auto" if self.chk_color_display.isChecked() else "srgb"
+        self.config["color_output"] = "panel" if self.chk_color_display.isChecked() else "system"
         self.config["show_memories"] = self.chk_memories.isChecked()
         self.config["adaptive_accent"] = self.chk_adaptive.isChecked()
         self.config["show_hidden_folder"] = self.chk_hidden_entry.isChecked()

@@ -33,13 +33,13 @@ class _ShortcutBlocker(QObject):
         return False
 
 
-class Sheet(QWidget):
-    """Překryv přes celé okno: ztlumené pozadí a karta uprostřed (titulek, text, obsah, tlačítka)."""
+class _SheetBase(QWidget):
+    """Překryv přes celé okno: ztlumené pozadí, měkký stín a karta, která přijede pružinou.
+    Podtřídy naplní self.card a určí její obdélník (_card_rect)."""
     done = pyqtSignal(bool)
+    RISE = RISE_PX
 
-    def __init__(self, host, title, body="", action_text=None, cancel_text=None, destructive=False):
-        action_text = action_text or tr("action-ok")
-        cancel_text = cancel_text or tr("action-cancel")
+    def __init__(self, host, card_name="sheetCard"):
         window = host.window() if host is not None else None
         super().__init__(window)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
@@ -47,34 +47,8 @@ class Sheet(QWidget):
         self._closing = False
         self._finished = False
         self.card = QFrame(self)
-        self.card.setObjectName("sheetCard")
+        self.card.setObjectName(card_name)
         self.card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.card.setFixedWidth(CARD_WIDTH)
-        lay = QVBoxLayout(self.card)
-        lay.setContentsMargins(22, 20, 22, 18)
-        lay.setSpacing(8)
-        self.lbl_title = QLabel(title)
-        self.lbl_title.setObjectName("sheetTitle")
-        self.lbl_title.setWordWrap(True)
-        lay.addWidget(self.lbl_title)
-        self.lbl_body = QLabel(body)
-        self.lbl_body.setObjectName("sheetBody")
-        self.lbl_body.setWordWrap(True)
-        self.lbl_body.setVisible(bool(body))
-        lay.addWidget(self.lbl_body)
-        self.content = QVBoxLayout()
-        self.content.setSpacing(8)
-        lay.addLayout(self.content)
-        lay.addSpacing(6)
-        row = QHBoxLayout()
-        row.addStretch()
-        self.btn_cancel = KButton(cancel_text, self.card)
-        self.btn_cancel.clicked.connect(self.reject)
-        self.btn_action = KButton(action_text, self.card, variant="danger" if destructive else "primary")
-        self.btn_action.clicked.connect(self.accept)
-        row.addWidget(self.btn_cancel)
-        row.addWidget(self.btn_action)
-        lay.addLayout(row)
         self._effect = QGraphicsOpacityEffect(self.card)
         self.card.setGraphicsEffect(self._effect)
         self._progress = motion.Tween(0.0, self._step, self)
@@ -86,14 +60,15 @@ class Sheet(QWidget):
 
     # ── rozvržení a kreslení ──
     def _card_rect(self):
-        self.card.adjustSize()
-        w, h = self.card.width(), self.card.sizeHint().height()
-        return (self.width() - w) // 2, max(16, (self.height() - h) // 2 - 20), h
+        """(x, y, w, h) karty v klidu."""
+        raise NotImplementedError
 
     def _step(self, v):
         v = float(v)
-        x, y, h = self._card_rect()
-        self.card.setGeometry(x, y + round(RISE_PX * (1.0 - v)), self.card.width(), h)
+        x, y, w, h = self._card_rect()
+        self.card.setGeometry(x, y + round(self.RISE * (1.0 - v)), w, h)
+        # v klidu bez efektu: velký obsah (Předvolby) se pak posouvá bez kreslení přes pixmapu
+        self._effect.setEnabled(not (v >= 1.0 and not self._closing))
         self._effect.setOpacity(max(0.0, min(1.0, v)))
         self.update()
 
@@ -123,6 +98,9 @@ class Sheet(QWidget):
         p.end()
 
     # ── otevření / zavření ──
+    def _initial_focus(self):
+        return None
+
     def open(self):
         parent = self.parentWidget()
         if parent is not None:
@@ -132,9 +110,9 @@ class Sheet(QWidget):
         QApplication.instance().installEventFilter(self._blocker)
         self._step(0.0)
         self._progress.to(1.0, "spring")
-        focus = next((w for w in self.card.findChildren(QWidget)
-                      if isinstance(w, (QLineEdit, QComboBox))), self.btn_action)
-        focus.setFocus(Qt.FocusReason.OtherFocusReason)
+        focus = self._initial_focus()
+        if focus is not None:
+            focus.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def accept(self):
         self._close(True)
@@ -151,6 +129,7 @@ class Sheet(QWidget):
         if self._progress.value == 0.0 and not self._progress.is_running():
             self._finish()
         else:
+            self._effect.setEnabled(True)
             self._progress.to(0.0, "standard")
 
     def _on_tween_done(self):
@@ -165,14 +144,6 @@ class Sheet(QWidget):
         self.done.emit(self.result)
         self.deleteLater()
 
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Escape:
-            self.reject()
-        elif e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.btn_action.isEnabled():
-            self.accept()
-        else:
-            super().keyPressEvent(e)
-
     def mousePressEvent(self, e):
         e.accept()                        # klik mimo kartu nic nespustí (list je modální)
 
@@ -185,6 +156,90 @@ class Sheet(QWidget):
         if not answer:
             loop.exec()
         return bool(answer and answer[0])
+
+
+class Sheet(_SheetBase):
+    """Dotaz / potvrzení: titulek, text, obsah, tlačítka."""
+
+    def __init__(self, host, title, body="", action_text=None, cancel_text=None, destructive=False):
+        action_text = action_text or tr("action-ok")
+        cancel_text = cancel_text or tr("action-cancel")
+        super().__init__(host)
+        self.card.setFixedWidth(CARD_WIDTH)
+        lay = QVBoxLayout(self.card)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(8)
+        self.lbl_title = QLabel(title)
+        self.lbl_title.setObjectName("sheetTitle")
+        self.lbl_title.setWordWrap(True)
+        lay.addWidget(self.lbl_title)
+        self.lbl_body = QLabel(body)
+        self.lbl_body.setObjectName("sheetBody")
+        self.lbl_body.setWordWrap(True)
+        self.lbl_body.setVisible(bool(body))
+        lay.addWidget(self.lbl_body)
+        self.content = QVBoxLayout()
+        self.content.setSpacing(8)
+        lay.addLayout(self.content)
+        lay.addSpacing(6)
+        row = QHBoxLayout()
+        row.addStretch()
+        self.btn_cancel = KButton(cancel_text, self.card)
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_action = KButton(action_text, self.card, variant="danger" if destructive else "primary")
+        self.btn_action.clicked.connect(self.accept)
+        row.addWidget(self.btn_cancel)
+        row.addWidget(self.btn_action)
+        lay.addLayout(row)
+
+    def _card_rect(self):
+        self.card.adjustSize()
+        w, h = self.card.width(), self.card.sizeHint().height()
+        return (self.width() - w) // 2, max(16, (self.height() - h) // 2 - 20), w, h
+
+    def _initial_focus(self):
+        return next((w for w in self.card.findChildren(QWidget)
+                     if isinstance(w, (QLineEdit, QComboBox))), self.btn_action)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.reject()
+        elif e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.btn_action.isEnabled():
+            self.accept()
+        else:
+            super().keyPressEvent(e)
+
+
+PANEL_MAX = (720, 820)       # Předvolby jako list v okně: nejvýš tak velká karta (logické px)
+PANEL_MARGIN = 40
+
+
+class PanelSheet(_SheetBase):
+    """Founder audit: velký list v okně pro celé obrazovky (Předvolby) místo samostatného
+    systémového okna. Obsah (widget) vyplní kartu; klik do ztlumeného pozadí = request_close
+    (obsah si ho může přesměrovat, např. na Zrušit)."""
+    RISE = 28
+
+    def __init__(self, host, content, max_size=PANEL_MAX):
+        super().__init__(host, card_name="panelCard")
+        self._max = max_size
+        lay = QVBoxLayout(self.card)
+        lay.setContentsMargins(1, 1, 1, 1)       # vlasová hrana karty zůstane vidět
+        lay.setSpacing(0)
+        self.content_widget = content
+        content.setParent(self.card)
+        lay.addWidget(content)
+        self.request_close = self.reject
+
+    def _card_rect(self):
+        w = max(320, min(self._max[0], self.width() - 2 * PANEL_MARGIN))
+        h = max(320, min(self._max[1], self.height() - 2 * PANEL_MARGIN))
+        return (self.width() - w) // 2, max(16, (self.height() - h) // 2), w, h
+
+    def mousePressEvent(self, e):
+        if not self.card.geometry().contains(e.position().toPoint()):
+            self.request_close()                  # klik vedle karty = Zrušit (jako Esc)
+        e.accept()
 
 
 class InWindowDialog:

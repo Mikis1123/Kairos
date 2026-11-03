@@ -105,6 +105,7 @@ class TestMiniMapPage(unittest.TestCase):
     def test_vector_style_with_czech_names(self):
         self.js("showPlace(49.2, 16.6); 0")
         self.assertTrue(_until(lambda: self.state()["ready"]))
+        self.js("setStrings({}, 'cs'); 0")             # jazyk aplikace (viewer.py po načtení)
         self.assertTrue(self.js(f"setMiniStyle({json.dumps(FIXTURE_STYLE)})"))
         self.assertTrue(_until(lambda: self.js("map.isStyleLoaded() === true || map.getStyle().layers.length > 1")))
         self.assertEqual(self.state()["engine"], "vector")
@@ -122,7 +123,7 @@ class TestMiniMapPage(unittest.TestCase):
         self.assertTrue(remote, "styl / dlaždice se zkoušely stáhnout")
         for u in remote:
             self.assertTrue(main.is_allowed_web_url(u), u)
-        self.assertTrue(any("tiles.openfreemap.org/styles/dark" in u for u in remote), remote)
+        self.assertTrue(any("tiles.openfreemap.org/styles/liberty" in u for u in remote), remote)
 
 
 @unittest.skipUnless(HAS_QT, "Qt není dostupné")

@@ -1,4 +1,4 @@
-"""Stage 2: jednorázové přegenerování obrazových cache knihovny novou cestou (bez spuštění aplikace).
+"""Jednorázové přegenerování obrazových cache knihovny novou cestou (bez spuštění aplikace).
 
 Totéž udělá démon aplikace na pozadí sám (verze miniatur / náhledů / ořezů se změnila); tento
 skript to provede hned a změří to. Spustit jen když aplikace neběží:
@@ -22,7 +22,9 @@ def main():
     import preview_cache
     from config import load_config
     cfg = load_config()
-    tgt = color_manage.configure(cfg.get("color_output", color_manage.MODE_AUTO))
+    tgt = color_manage.configure(cfg.get("color_output", color_manage.MODE_SYSTEM))
+    import imaging
+    print(f"vyřazené cache (tón Live, značky přebarvení): {imaging.purge_retired_caches()}")
     scr = app.primaryScreen()
     edge = preview_cache.configure_for_display(round(max(scr.size().width(), scr.size().height())
                                                      * scr.devicePixelRatio()))
@@ -42,8 +44,13 @@ def main():
 
     import face_engine
     t = time.perf_counter()
-    k = face_engine.recolor_face_crops()
-    print(f"ořezy tváří převedené do profilu displeje: {k} za {time.perf_counter() - t:.1f} s")
+    k = face_engine.rerender_face_crops()
+    print(f"ořezy tváří přeřezané z originálů: {k} za {time.perf_counter() - t:.1f} s")
+    t = time.perf_counter()
+    k = face_engine.restore_missing_video_face_crops()
+    print(f"chybějící ořezy z videí obnovené (embedding): {k} za {time.perf_counter() - t:.1f} s")
+    k = face_engine.purge_orphan_face_files()
+    print(f"osiřelé soubory ořezů smazány: {k}")
 
     if "--no-previews" not in sys.argv:
         removed = preview_cache.sweep_legacy()

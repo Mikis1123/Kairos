@@ -52,10 +52,11 @@ class TestAllowlistCsp(unittest.TestCase):
 
 
 class TestMessageBridge(unittest.TestCase):
-    def test_slot_names_are_the_eight_bridge_methods(self):
+    def test_slot_names_are_the_nine_bridge_methods(self):
         self.assertEqual(map_host.bridge_slot_names(main.MapBridge),
                          sorted(["openPhotoFromMap", "setInteraction", "setMapLayer", "openPhotosFromMap",
-                                 "requestJourney", "routeJourney", "journeyClosed", "setJourneyMusic"]))
+                                 "requestJourney", "routeJourney", "routeJourneyDay", "journeyClosed",
+                                 "setJourneyMusic"]))
         self.assertNotIn("release_all", map_host.bridge_slot_names(main.MapBridge), "not callable from the page")
 
     def test_dispatch(self):

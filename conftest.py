@@ -26,6 +26,20 @@ paths.BACKUP_DIR = os.path.join(_preview_tmp, "backups")     # denní zálohy DB
 paths.TILE_STORE_PATH = os.path.join(_preview_tmp, "tiles.sqlite")   # úložiště dlaždic (C7e)
 paths.HIGHLIGHT_DIR = os.path.join(_preview_tmp, "highlights")       # klipy karet Cesty
 paths.VAULT_DIR = os.path.join(_preview_tmp, "vault")                # složka Skryté (Stage 3)
+# Nativní pipeline: ani miniatury, ořezy tváří a kořen mezipaměti. Dřív testy s hlavním oknem
+# pouštěly démona údržby proti DOČASNÉ DB, ale SKUTEČNÝM složkám – zapsal značku verze miniatur
+# a úklid ořezů by smazal skutečné ořezy (žádný odkaz v dočasné DB). Moduly si cesty berou při
+# importu, proto se nastavují tady, před importem testů (a pro jistotu i v už načtených).
+paths.CACHE_ROOT = paths.DEFAULT_CACHE_ROOT = os.path.join(_preview_tmp, "cache")
+paths.THUMB_DIR = os.path.join(paths.CACHE_ROOT, "thumbnails")
+paths.FACE_DIR = os.path.join(_preview_tmp, "faces")
+for _d in (paths.THUMB_DIR, paths.FACE_DIR):
+    os.makedirs(_d, exist_ok=True)
+import sys as _sys  # noqa: E402
+if "scanner" in _sys.modules:
+    _sys.modules["scanner"].CACHE_DIR = paths.THUMB_DIR
+if "face_engine" in _sys.modules:
+    _sys.modules["face_engine"].FACE_CACHE_DIR = paths.FACE_DIR
 atexit.register(shutil.rmtree, _preview_tmp, True)
 
 # Patch 11: ani config.json aplikace – load_config() jinak při chybějícím souboru sáhl na

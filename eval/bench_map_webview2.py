@@ -135,8 +135,8 @@ def start_tile_store():
 
 # ── localhost server: project files + injected config + thumbnails ────────────
 
-def serve(store_cfg, workers):
-    head = (f"<script>window.TILE_STORE_CONFIG = {json.dumps(store_cfg)};"
+def serve(store_cfg, workers, extra_head=""):
+    head = extra_head + (f"<script>window.TILE_STORE_CONFIG = {json.dumps(store_cfg)};"
             + (f"window.TILE_WORKERS_OVERRIDE = {int(workers)};" if workers else "") + "</script>")
 
     class H(http.server.SimpleHTTPRequestHandler):
@@ -165,6 +165,10 @@ def serve(store_cfg, workers):
             if u.path == "/map_vault.html":
                 with open(os.path.join(ROOT, "map_vault.html"), encoding="utf-8") as f:
                     html = f.read().replace("<head>", "<head>" + head, 1)
+                # the app loads the page from file: (CSP allows file: scripts); here it is served
+                # over localhost, so the bench widens the same directives to this origin
+                for d in ("script-src", "style-src", "worker-src", "font-src", "media-src"):
+                    html = html.replace(d + " file:", d + " http://127.0.0.1:* file:", 1)
                 body = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")

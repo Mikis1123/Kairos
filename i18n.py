@@ -813,6 +813,12 @@ def event_place(text):
     m = _TRIP_AREA.match(text or "")
     if m:
         return tr("event-city-area", city=m.group(1))
+    import regions                       # natural region (trips.region_name): "Šumava" -> UI language
+    reg = regions.localized(text, current())
+    if isinstance(reg, tuple):
+        return tr("event-region-pair", a=reg[0], b=reg[1])
+    if reg:
+        return reg
     if text == STORED_UNKNOWN_PLACE:
         return tr("place-unknown")
     return text

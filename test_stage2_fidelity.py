@@ -1,6 +1,7 @@
 """Stage 2 (Fidelity): správa barev, miniatury 840 px s úrovněmi v RAM, náhledy podle displeje,
 verze cache a hluboké přiblížení v prohlížeči."""
 import io
+import math
 import os
 import shutil
 import tempfile
@@ -103,7 +104,7 @@ class TestColorManage(ColorTargetMixin, unittest.TestCase):
         self.assertIsNone(icc)
         self.assertIn("Windows", reason)
 
-    def test_detect_output_uses_wide_edid_when_unmanaged(self):
+    def test_detect_output_uses_wide_edid_only_in_panel_mode(self):
         edid = bytearray(128)
         edid[:8] = b"\x00\xff\xff\xff\xff\xff\xff\x00"
         # chromatičnosti P3 do bajtů 25–34
@@ -116,7 +117,9 @@ class TestColorManage(ColorTargetMixin, unittest.TestCase):
         with mock.patch.object(color_manage, "_advanced_color_active", return_value=False), \
                 mock.patch.object(color_manage, "_assigned_icc", return_value=None), \
                 mock.patch.object(color_manage, "_internal_display_edid", return_value=bytes(edid)):
-            icc, name, reason = color_manage.detect_output()
+            sys_icc, _n, _r = color_manage.detect_output()                     # kontrakt Windows
+            icc, name, reason = color_manage.detect_output(color_manage.MODE_PANEL)
+        self.assertIsNone(sys_icc, "výchozí kontrakt = sRGB jako zbytek Windows, ne EDID")
         self.assertIsNotNone(icc)
         self.assertIn("EDID", name)
         prim = color_manage._edid_primaries(bytes(edid))
@@ -500,6 +503,129 @@ class TestCanvasZoom(unittest.TestCase):
         u = self.zoom.u
         self.assertTrue(self.zoom.wheel(_FakeWheel(dx=-40, dy=0, pixel=QPoint(-40, 0))))
         self.assertGreater(self.zoom.u, u)
+
+
+class TestZoomDivisionGuards(unittest.TestCase):
+    """ZeroDivisionError v zoom_about: cíl animace „vešlé“ = w 0.0 se stal základem dalšího zubu."""
+
+    def test_zoom_about_invalid_sizes_return_input(self):
+        import viewer_zoom as z
+        for args in [(0.0, 3000.0, 1440, 900, 0.75), (3000.0, 0.0, 1440, 900, 0.75),
+                     (-5.0, 3000.0, 1440, 900, 0.75), (3000.0, -1.0, 1440, 900, 0.75),
+                     (3000.0, 6000.0, 0, 900, 0.75), (3000.0, 6000.0, 1440, 0, 0.75),
+                     (3000.0, 6000.0, -10, -10, 0.75), (3000.0, 6000.0, 1440, 900, 0.0),
+                     (1e-9, 3000.0, 1440, 900, 0.75), (float("nan"), 3000.0, 1440, 900, 0.75)]:
+            w, new_w, vw, vh, aspect = args
+            self.assertEqual(z.zoom_about(0.3, 0.7, w, new_w, 100.0, 100.0, vw, vh, aspect), (0.3, 0.7), args)
+
+    def test_clamp_center_invalid_sizes_centre(self):
+        import viewer_zoom as z
+        self.assertEqual(z.clamp_center(0.1, 0.9, 0.0, 0.75, 1440, 900), (0.5, 0.5))
+        self.assertEqual(z.clamp_center(0.1, 0.9, 4000, 0.0, 1440, 900), (0.5, 0.5))
+        self.assertEqual(z.clamp_center(0.1, 0.9, 4000, 0.75, 0, 0), (0.5, 0.5))
+        self.assertEqual(z.fit_width(0.75, 0, 900), 0.0)
+        self.assertEqual(z.fit_width(0.0, 1440, 900), 0.0)
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6")
+class TestCanvasZoomAnimated(unittest.TestCase):
+    """S animacemi (dosavadní testy běží s omezeným pohybem a cestu přes _anim_to nepokryjí)."""
+
+    def setUp(self):
+        app()
+        import viewer_hud
+        import motion
+        self._rm = motion.reduced()
+        motion.set_reduce_motion(False)
+        self.canvas = viewer_hud.MediaCanvas(with_video=False)
+        self.canvas.resize(1200, 800)
+        self.canvas.show()
+        QApplication.processEvents()
+        self.zoom = self.canvas.zoom
+        self.zoom.set_photo("x.jpg", (8000, 6000))
+        self.zoom.set_enabled(True)
+        img = QImage(2400, 1800, QImage.Format.Format_RGB32)
+        img.fill(QColor(90, 120, 150))
+        self.canvas.set_image(QPixmap.fromImage(img))
+
+    def tearDown(self):
+        import motion
+        self.zoom._stop_motion()
+        motion.set_reduce_motion(self._rm)
+        self.canvas.close()
+
+    def notch(self, dy):
+        self.assertTrue(self.zoom.wheel(_FakeWheel(dy=dy)))
+
+    def finish(self):
+        self.zoom._anim_t0 -= 10.0                          # animace hotová při dalším tiku
+        self.zoom._tick()
+
+    def test_notch_after_zoom_out_to_fit_during_animation(self):
+        self.notch(120)                                     # dovnitř (animuje)
+        self.notch(-120 * 3)                                # ven za vešlé -> cíl w = 0.0
+        self.assertEqual(self.zoom._anim_to[0], 0.0)
+        self.notch(-120)                                    # dřív ZeroDivisionError
+        self.notch(120)
+        self.finish()
+        self.assertTrue(self.zoom.is_zoomed())
+
+    def test_rapid_notches_to_both_limits(self):
+        for _ in range(60):
+            self.notch(120)
+            self.zoom._tick()
+        self.finish()
+        self.assertAlmostEqual(self.zoom.w, self.zoom.max_w(), delta=1)
+        for _ in range(60):
+            self.notch(-120)
+            self.zoom._tick()
+        self.finish()
+        self.assertFalse(self.zoom.is_zoomed())
+        for dy in (120, -120) * 40:                         # střídání bez tiků (zběsilé kolečko)
+            self.notch(dy)
+        self.finish()
+        self.assertTrue(math.isfinite(self.zoom.u) and math.isfinite(self.zoom.v))
+
+    def test_extreme_factors_ignored_or_clamped(self):
+        for f in (0.0, -1.0, float("nan"), float("inf"), 1e-300, 1e300):
+            self.zoom.zoom_by(f, animate=False)
+        self.assertTrue(math.isfinite(self.zoom.w))
+        self.assertLessEqual(self.zoom.w, self.zoom.max_w() + 1e-6)
+
+    def test_viewport_collapses_mid_animation(self):
+        self.notch(120 * 4)
+        real_fit = self.zoom.fit_w
+        with mock.patch.object(self.zoom, "fit_w", return_value=0.0):
+            self.zoom._anim_from = (0.0, 0.5, 0.5)          # start „vešlé“ při nulové ploše
+            self.zoom._tick()                                # dřív math.log(0) ValueError
+            self.notch(-120)
+            self.zoom.resized()
+        self.assertTrue(math.isfinite(self.zoom.w))
+        self.assertGreater(real_fit(), 0)
+
+    def test_wheel_before_layout(self):
+        import viewer_hud
+        c = viewer_hud.MediaCanvas(with_video=False)       # nezobrazené, bez obrazu
+        try:
+            zm = c.zoom
+            zm.set_photo("x.jpg", (8000, 6000))
+            zm.set_enabled(True)
+            self.assertTrue(zm.wheel(_FakeWheel(dy=120)))   # aspect 0: nic, žádná výjimka
+            self.assertFalse(zm.is_zoomed())
+            img = QImage(2400, 1800, QImage.Format.Format_RGB32)
+            c.set_image(QPixmap.fromImage(img))
+            vp = mock.MagicMock()
+            vp.width.return_value = 0
+            vp.height.return_value = 0
+            with mock.patch.object(c, "viewport", return_value=vp):
+                self.assertTrue(zm.wheel(_FakeWheel(dy=120)))
+                self.assertTrue(zm.wheel(_FakeWheel(dy=120, mods=Qt.KeyboardModifier.ControlModifier)))
+                zm.gesture_zoom(0.3, QPointF(0, 0))
+                zm.toggle_one_to_one()
+                zm.pan_by(10, 10)
+            self.assertFalse(zm.is_zoomed())
+        finally:
+            c.close()
 
 
 class _FakeWheel:

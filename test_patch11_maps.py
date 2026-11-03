@@ -128,8 +128,10 @@ class TestMapPolicy(unittest.TestCase):
     def test_page_uses_local_libraries(self):
         with open(os.path.join(HERE, "map_vault.html"), encoding="utf-8") as f:
             html = f.read()
+        with open(os.path.join(HERE, "map_style.js"), encoding="utf-8") as f:   # sdílené styly (founder audit)
+            html += f.read()
         for needle in ('src="vendor/maplibre/maplibre-gl.js"', 'href="vendor/maplibre/maplibre-gl.css"',
-                       "https://tiles.openfreemap.org/", "'styles/liberty'", "name:cs",
+                       "https://tiles.openfreemap.org/", "'styles/liberty'", "['get', 'name:' + ",
                        "type: GLOBE_PROJECTION", "'vertical-perspective'", "elevation-tiles-prod.s3.amazonaws.com/terrarium"):
             self.assertTrue(needle in html, needle)
         self.assertNotIn("vendor/leaflet", html)

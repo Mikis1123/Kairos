@@ -18,6 +18,14 @@ za letu (desítky dlaždic naráz) byl úzkým hrdlem. URL se na port mapuje det
 
 Rozpočet: config „tile_store_mb“ (výchozí 1 GB), LRU podle posledního použití. Zápisy (nové
 dlaždice, čas použití, mazání) dělá jedno vlákno; čtení jde paralelně (WAL).
+
+Fidelity pass (2026-11-03): three download queues by priority, worked by one pool.
+  * urgent: the arrival view of a flight into photos (sent when the flight starts, ~1.5-4 s ahead)
+  * film: the whole Journey film (_bake, replaces the previous film)
+  * background: regions to keep warm (a trip's bounding box z10-16, the library's photo
+    hotspots). Lowest priority, at most BACKGROUND_PER_HOST at once per server.
+The most recently used tiles also stay in RAM (HOT_CACHE_MB), so a hot tile is served without
+touching SQLite. There are 8 ports (8 × 6 Chromium connections).
 """
 import http.client
 import http.server
@@ -30,16 +38,24 @@ import sqlite3
 import threading
 import time
 import zlib
+from collections import OrderedDict
 from urllib.parse import urlsplit
 
 import paths
 
 DEFAULT_BUDGET_MB = 1024
 EVICT_TO = 0.9                      # po překročení rozpočtu smazat nejdéle nepoužité na 90 %
-SHARDS = 4                          # portů (× 6 spojení Chromia)
+SHARDS = 8                          # portů (× 6 spojení Chromia = 48 souběžných dlaždic)
 UPSTREAM_PER_HOST = 12              # souběžná stahování z jednoho serveru (slušnost k OFM / Esri)
-BAKE_WORKERS = 8                    # předpečení / ukládání na pozadí (vlastní strop vedle mapy)
+BAKE_WORKERS = 12                   # pool for the three queues (urgent, film, background)
+BAKE_PER_HOST = 8                   # film + urgent downloads per server
+BACKGROUND_PER_HOST = 3             # background warm-up per server: never crowds the camera
+WARM_MAX_KEYS = 12000               # one warm request (a trip region z10-16 is ~2-6k)
+BACKGROUND_MAX_QUEUE = 30000        # oldest background work is dropped beyond this
+HOT_CACHE_MB = 96                   # RAM copy of the most recently used tiles
+BACKGROUND_THREADS = 4              # of BAKE_WORKERS; the rest stay free for urgent / film
 BAKE_BODY_MAX = 2 * 1024 * 1024     # seznam klíčů jedné Cesty (~6000 × 80 B)
+PRIORITIES = ("urgent", "film", "background")
 UPSTREAM_TIMEOUT_S = 20
 RASTER_TTL_S = 30 * 24 * 3600       # neverzované rastry (Esri, OpenTopoMap, trasy)
 TOUCH_EVERY_S = 3600                # čas použití se zapisuje nejvýš jednou za hodinu na dlaždici
@@ -69,9 +85,14 @@ def is_immutable(key):
 class TileStore:
     """SQLite tabulka tiles(key = host/cesta?dotaz). Čtení z libovolného vlákna, zápisy frontou."""
 
-    def __init__(self, path=None, budget_mb=DEFAULT_BUDGET_MB):
+    def __init__(self, path=None, budget_mb=DEFAULT_BUDGET_MB, hot_mb=HOT_CACHE_MB):
         self.path = path or store_path()
         self.budget = int(budget_mb) * 1024 * 1024
+        self.hot_budget = max(0, int(hot_mb)) * 1024 * 1024
+        self._hot = OrderedDict()           # key -> row (data, ctype, enc, fetched), LRU order
+        self._hot_bytes = 0
+        self._hot_lock = threading.Lock()
+        self.hot_hits = 0
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self._local = threading.local()
         self._writes = queue.Queue()
@@ -96,12 +117,55 @@ class TileStore:
             self._local.conn = c
         return c
 
+    def _hot_put(self, key, row):
+        if not self.hot_budget or row is None or len(row[0]) > self.hot_budget // 8:
+            return
+        with self._hot_lock:
+            old = self._hot.pop(key, None)
+            if old is not None:
+                self._hot_bytes -= len(old[0])
+            self._hot[key] = row
+            self._hot_bytes += len(row[0])
+            while self._hot_bytes > self.hot_budget and self._hot:
+                _, gone = self._hot.popitem(last=False)
+                self._hot_bytes -= len(gone[0])
+
+    def _hot_get(self, key):
+        with self._hot_lock:
+            row = self._hot.get(key)
+            if row is not None:
+                self._hot.move_to_end(key)
+            return row
+
+    def hot_stats(self):
+        with self._hot_lock:
+            return {"tiles": len(self._hot), "bytes": self._hot_bytes, "budget": self.hot_budget, "hits": self.hot_hits}
+
+    def has(self, key):
+        """Fresh copy stored? (no touch, no RAM copy: queue checks)."""
+        row = self._hot_get(key)
+        if row is None:
+            try:
+                row = self._conn().execute("SELECT fetched FROM tiles WHERE key = ?", (key,)).fetchone()
+            except sqlite3.Error:
+                return False
+            if row is None:
+                return False
+            return is_immutable(key) or (time.time() - row[0]) < RASTER_TTL_S
+        return self.fresh(row, key)
+
     def get(self, key):
         """(data, ctype, enc, fetched) nebo None."""
-        try:
-            row = self._conn().execute("SELECT data, ctype, enc, fetched FROM tiles WHERE key = ?", (key,)).fetchone()
-        except sqlite3.Error:
-            return None
+        row = self._hot_get(key)
+        if row is not None:
+            self.hot_hits += 1
+        else:
+            try:
+                row = self._conn().execute("SELECT data, ctype, enc, fetched FROM tiles WHERE key = ?", (key,)).fetchone()
+            except sqlite3.Error:
+                return None
+            if row is not None:
+                self._hot_put(key, row)
         if row is not None:
             now = time.time()
             if now - self._touched.get(key, 0) > TOUCH_EVERY_S:
@@ -113,7 +177,13 @@ class TileStore:
         return is_immutable(key) or ((now or time.time()) - row[3]) < RASTER_TTL_S
 
     def put(self, key, data, ctype, enc):
-        self._writes.put(("put", key, bytes(data), ctype, enc, time.time()))
+        now = time.time()
+        data = bytes(data)
+        with self._hot_lock:
+            cached = key in self._hot
+        if cached:                                      # a refreshed copy replaces the RAM one
+            self._hot_put(key, (data, ctype, enc, now))
+        self._writes.put(("put", key, data, ctype, enc, now))
 
     def flush(self, timeout=5.0):
         """Počká, než writer zapíše vše z fronty (testy, ukončení aplikace)."""
@@ -168,6 +238,9 @@ class TileStore:
                         conn.execute("DELETE FROM tiles")
                         self.bytes = 0
                         self._touched.clear()
+                        with self._hot_lock:
+                            self._hot.clear()
+                            self._hot_bytes = 0
                         events.append(op[1])
                     elif kind == "sync":
                         events.append(op[1])
@@ -198,6 +271,10 @@ class TileStore:
                 doomed.append((k,))
                 self.bytes -= s
                 self._touched.pop(k, None)
+                with self._hot_lock:
+                    old = self._hot.pop(k, None)
+                    if old is not None:
+                        self._hot_bytes -= len(old[0])
             conn.executemany("DELETE FROM tiles WHERE key = ?", doomed)
 
 
@@ -212,8 +289,8 @@ class _Upstream:
 
     def _limit(self, host, lane):
         with self._lock:
-            return self._limits.setdefault((host, lane), threading.BoundedSemaphore(
-                BAKE_WORKERS if lane == "bake" else UPSTREAM_PER_HOST))
+            n = {"bake": BAKE_PER_HOST, "background": BACKGROUND_PER_HOST}.get(lane, UPSTREAM_PER_HOST)
+            return self._limits.setdefault((host, lane), threading.BoundedSemaphore(n))
 
     def fetch(self, host, path, lane="map"):
         """(status, data, ctype, enc). Výjimka = síť nedostupná. lane: mapa má vlastní strop,
@@ -261,9 +338,13 @@ class TileServer:
         self._inflight_lock = threading.Lock()
         self._bake_lock = threading.Lock()
         self._bake_gen = 0
-        self._bake_queue = []
+        # pop() from the end = next. urgent: flight arrival views + tiles the map is fetching
+        # itself; film: the Journey being played; background: regions kept warm
+        self._queues = {p: [] for p in PRIORITIES}
         self._bake_threads = 0
+        self._bg_active = 0
         self.baking = {"total": 0, "done": 0, "gen": 0}
+        self.warming = {p: {"total": 0, "done": 0} for p in ("urgent", "background")}
         self._servers = []
         handler = self._handler_class()
         for _ in range(max(1, shards)):
@@ -283,29 +364,63 @@ class TileServer:
     def owns(self, host, port):
         return host == "127.0.0.1" and port in self.ports
 
+    def _valid_keys(self, keys):
+        return [k for k in keys if isinstance(k, str) and k.partition("/")[0].lower() in self.hosts]
+
+    def _spawn(self):
+        """Caller holds _bake_lock. Enough workers for what is queued (at most BAKE_WORKERS)."""
+        want = min(BAKE_WORKERS, sum(len(q) for q in self._queues.values()))
+        while self._bake_threads < want:
+            self._bake_threads += 1
+            threading.Thread(target=self._bake_loop, name="tile-store-bake", daemon=True).start()
+
     def bake(self, keys):
         """Předpečení: stáhne chybějící dlaždice v daném pořadí (BAKE_WORKERS souběžně).
         Nový seznam ruší zbytek předchozího (jiná Cesta). Vrací počet přijatých klíčů."""
-        keys = [k for k in keys if isinstance(k, str) and k.partition("/")[0].lower() in self.hosts]
+        keys = self._valid_keys(keys)
         with self._bake_lock:
             self._bake_gen += 1
             gen = self._bake_gen
-            self._bake_queue = list(reversed(keys))       # pop() z konce = v pořadí filmu
+            self._queues["film"] = list(reversed(keys))   # pop() z konce = v pořadí filmu
             self.baking = {"total": len(keys), "done": 0, "gen": gen}
-            for _ in range(BAKE_WORKERS - self._bake_threads):
-                self._bake_threads += 1
-                threading.Thread(target=self._bake_loop, name="tile-store-bake", daemon=True).start()
+            self._spawn()
+        return len(keys)
+
+    def warm(self, keys, priority="background"):
+        """Keeps tiles on disk ahead of need. keys in order of importance (first = soonest).
+        urgent goes ahead of everything (a flight's arrival view). background runs behind the
+        film, newest region first, at most BACKGROUND_THREADS workers and BACKGROUND_PER_HOST
+        downloads per server. Stored keys are skipped by the workers. Returns how many were taken."""
+        if priority not in ("urgent", "background"):
+            priority = "background"
+        keys = self._valid_keys(keys)[:WARM_MAX_KEYS]
+        if not keys:
+            return 0
+        with self._bake_lock:
+            q = self._queues[priority]
+            q.extend(reversed(keys))
+            if len(q) > BACKGROUND_MAX_QUEUE:
+                del q[:len(q) - BACKGROUND_MAX_QUEUE]     # the oldest, least important work
+            self.warming[priority]["total"] += len(keys)
+            self._spawn()
         return len(keys)
 
     def persist_async(self, key):
         """Dlaždici, kterou si mapa právě stahuje sama (přesměrování), uložit na pozadí –
-        přednostně před zbytkem předpečení (konec fronty = další na řadě)."""
+        přednostně před vším ostatním (je na obrazovce teď)."""
         with self._bake_lock:
-            self._bake_queue.append(key)
-            self.baking["total"] += 1
-            if self._bake_threads < BAKE_WORKERS:
-                self._bake_threads += 1
-                threading.Thread(target=self._bake_loop, name="tile-store-bake", daemon=True).start()
+            self._queues["urgent"].append(key)
+            self.warming["urgent"]["total"] += 1
+            self._spawn()
+
+    def state(self):
+        with self._bake_lock:
+            queued = {p: len(q) for p, q in self._queues.items()}
+            film = dict(self.baking)
+            warming = {p: dict(v) for p, v in self.warming.items()}
+            threads = self._bake_threads
+        return {"queued": queued, "film": film, "warming": warming, "threads": threads,
+                "store": self.store.stats(), "hot": self.store.hot_stats(), "ports": len(self.ports)}
 
     def route(self, key):
         """Co udělat s požadavkem mapy: ('serve', výsledek) nebo ('redirect', https adresa).
@@ -328,21 +443,37 @@ class TileServer:
         self.persist_async(key)
         return "redirect", "https://" + key
 
+    def _next_job(self):
+        """Caller holds _bake_lock: (priority, key) or None. Background work only while fewer
+        than BACKGROUND_THREADS workers do it, so urgent and film always find a free worker."""
+        for p in ("urgent", "film"):
+            if self._queues[p]:
+                return p, self._queues[p].pop()
+        if self._queues["background"] and self._bg_active < BACKGROUND_THREADS:
+            self._bg_active += 1
+            return "background", self._queues["background"].pop()
+        return None
+
     def _bake_loop(self):
         while True:
             with self._bake_lock:
-                if not self._bake_queue or not self._servers:
+                job = self._next_job() if self._servers else None
+                if job is None:
                     self._bake_threads -= 1
                     return
-                key = self._bake_queue.pop()
+            prio, key = job
             try:
-                row = self.store.get(key)
-                if row is None or not self.store.fresh(row, key):
-                    self.resolve(key, lane="bake")
+                if not self.store.has(key):
+                    self.resolve(key, lane="background" if prio == "background" else "bake")
             except Exception:
                 pass
             with self._bake_lock:
-                self.baking["done"] += 1
+                if prio == "film":
+                    self.baking["done"] += 1
+                else:
+                    self.warming[prio]["done"] += 1
+                if prio == "background":
+                    self._bg_active -= 1
 
     def shutdown(self):
         for s in self._servers:
@@ -417,6 +548,8 @@ class TileServer:
                 parts = urlsplit(self.path)
                 token, _, key = parts.path.lstrip("/").partition("/")
                 host = key.partition("/")[0].lower()
+                if token == ts.token and key == "_state":            # queues, RAM cache (bench, tests)
+                    return self._send(200, json.dumps(ts.state()).encode(), "application/json", None)
                 if token != ts.token or host not in ts.hosts:
                     return self._send(403, b"", "text/plain", None)
                 if parts.query:
@@ -439,17 +572,24 @@ class TileServer:
                 except (ConnectionError, OSError):
                     pass
 
-            def do_POST(self):               # /<token>/_bake  tělo = JSON [klíč, ...]
+            def do_POST(self):
+                # /<token>/_bake  body = JSON [key, ...]  (the Journey film, replaces the last one)
+                # /<token>/_warm  body = JSON {"keys": [...], "priority": "urgent" | "background"}
                 ts = self.server.tile_server
                 token, _, rest = urlsplit(self.path).path.lstrip("/").partition("/")
-                if token != ts.token or rest != "_bake":
+                if token != ts.token or rest not in ("_bake", "_warm"):
                     return self._send(403, b"", "text/plain", None)
                 try:
                     n = min(int(self.headers.get("Content-Length") or 0), BAKE_BODY_MAX)
-                    keys = json.loads(self.rfile.read(n).decode("utf-8"))
+                    body = json.loads(self.rfile.read(n).decode("utf-8"))
                 except (ValueError, OSError):
                     return self._send(400, b"", "text/plain", None)
-                accepted = ts.bake(keys if isinstance(keys, list) else [])
+                if rest == "_bake":
+                    accepted = ts.bake(body if isinstance(body, list) else [])
+                else:
+                    body = body if isinstance(body, dict) else {}
+                    keys = body.get("keys")
+                    accepted = ts.warm(keys if isinstance(keys, list) else [], str(body.get("priority") or ""))
                 self._send(200, json.dumps({"accepted": accepted}).encode(), "application/json", None)
 
             def do_OPTIONS(self):

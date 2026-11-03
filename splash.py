@@ -20,7 +20,8 @@ import motion
 import tokens
 
 INTRO_MS = 1500
-FADE_MS = 260
+FADE_MS = 250
+REVEAL_TIMEOUT_MS = 2200     # nejdéle tak dlouho čeká splash na první hotový snímek mřížky
 WORDMARK_PX = 60
 BIG_MARK = 148
 CARD = (520, 300)
@@ -112,25 +113,64 @@ class KairosSplash(QWidget):
         loop.exec()
         timer.stop()
 
+    def hand_off(self, window, first_frame, timeout_ms=None):
+        """Founder audit: splash zůstane, dokud mřížka nenakreslí první hotový snímek
+        (first_frame = signál firstFrameRendered), pak se prolne do okna. Pojistka: timeout."""
+        timeout_ms = REVEAL_TIMEOUT_MS if timeout_ms is None else timeout_ms
+        done = [False]
+
+        def go():
+            if done[0]:
+                return
+            done[0] = True
+            try:
+                first_frame.disconnect(go)
+            except (TypeError, RuntimeError):
+                pass
+            self.finish(window)
+
+        first_frame.connect(go)
+        QTimer.singleShot(int(timeout_ms), go)
+        return go
+
     def finish(self, window=None):
-        """Okno aplikace je venku: splash plynule zmizí nad ním a zruší se."""
+        """Okno aplikace je připravené: prolnutí (cross-dissolve, FADE_MS) – splash mizí, okno
+        (pokud čekalo neviditelné s průhledností 0) se zároveň vynoří. Opakované volání nic nedělá."""
+        if self._fade is not None or getattr(self, "_finished", False):
+            return
+        self._finished = True
         if window is not None:
             window.raise_()
             window.activateWindow()
         self.raise_()
+        reveal = window is not None and window.windowOpacity() < 1.0
         ms = 0 if motion.reduced() else FADE_MS
         if ms <= 0:
+            if reveal:
+                window.setWindowOpacity(1.0)
             self.close()
             self.deleteLater()
             return
+        curve = QEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        def step(v):
+            k = curve.valueForProgress(float(v))
+            self.setWindowOpacity(1.0 - k)
+            if reveal:
+                window.setWindowOpacity(max(0.0, min(1.0, k)))
+
+        def done():
+            if reveal:
+                window.setWindowOpacity(1.0)        # 1.0 => Qt zruší WS_EX_LAYERED (plný výkon)
+            self.close()
+            self.deleteLater()
+
         self._fade = QVariantAnimation(self)
-        self._fade.setStartValue(1.0)
-        self._fade.setEndValue(0.0)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
         self._fade.setDuration(ms)
-        self._fade.setEasingCurve(QEasingCurve(QEasingCurve.Type.OutCubic))
-        self._fade.valueChanged.connect(lambda v: self.setWindowOpacity(float(v)))
-        self._fade.finished.connect(self.close)
-        self._fade.finished.connect(self.deleteLater)
+        self._fade.valueChanged.connect(step)
+        self._fade.finished.connect(done)
         self._fade.start()
 
     # ── kreslení ──

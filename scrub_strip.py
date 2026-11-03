@@ -37,6 +37,7 @@ from PyQt6.QtGui import QImage
 
 import governor
 import paths
+import video_clap
 import preview_cache
 import video_proxy
 
@@ -52,7 +53,8 @@ SHORT_QUALITY = 3
 DENSE_MAX_S = 90                 # hustý průchod jen pro krátká videa (4K dekód ~0,45 s / s videa)
 DENSE_FPS = 12
 STRIP_MAGIC = b"OPVS"
-STRIP_VERSION = 2               # 2 = HDR originál (bez proxy) převedený na SDR jako přehrávání
+STRIP_VERSION = 3               # 2 = HDR originál (bez proxy) převedený na SDR jako přehrávání
+                                # 3 = celý kódovaný snímek jako Qt a fotka (bez kontejnerového clap, video_clap)
 DECODED_CACHE = 48               # dekódované QImage v RAM na pás
 _PTS = re.compile(r"pts_time:\s*(-?[0-9.]+)")
 _DURATION = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
@@ -233,6 +235,7 @@ def _ffmpeg_cmd(source, keyframes_only, hw, threads=2, edge=STRIP_EDGE, sdr=""):
         cmd += ["-hwaccel", "d3d11va"]
     if keyframes_only:
         cmd += ["-skip_frame", "nokey"]
+    cmd += video_clap.ffmpeg_full_frame_args(paths.FFMPEG_PATH)   # framing = Qt přehrávání = fotka
     cmd += ["-i", source, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf]
     if keyframes_only:
         cmd += ["-fps_mode", "passthrough"]

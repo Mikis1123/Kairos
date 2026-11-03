@@ -41,6 +41,7 @@ cache-unexpected-path = Ruta de caché inesperada: eliminación cancelada.
 ## color_manage
 
 color-reason-default = predeterminado
+color-reason-system = Windows (sRGB, como Fotos, el navegador y los vídeos)
 color-reason-manual = configurado manualmente
 color-reason-profile = perfil asignado a la pantalla en Windows
 color-reason-wide-gamut = pantalla de gama amplia sin gestión del color
@@ -514,8 +515,8 @@ settings-cache-pending = {"  "}→  { $pending_cache_dir }  (tras guardar y rein
 settings-cache-usage = Miniaturas (se pueden eliminar): <b>{ $thumbs_mb } MB</b><br>Vistas previas de 2048 px (se pueden eliminar): <b>{ $previews_mb } MB</b><br>Recortes de caras (datos permanentes, nunca se eliminan): <b>{ $faces_mb } MB</b>
 settings-caches-hint = Ambas cachés se regeneran solas en segundo plano. Los recortes de caras, las personas, la biblioteca y tus fotos no se ven afectados.
 settings-change-passcode = Cambiar código…
-settings-color-display = Ajustar los colores de las fotos a la pantalla
-settings-color-hint = Ahora: { $name } – { $reason }. Desactivado = siempre sRGB (para pantallas que convierten los colores por sí mismas). Tras un cambio, las vistas previas se regeneran en segundo plano.
+settings-color-display = Gama amplia del panel (P3 exacto)
+settings-color-hint = Ahora: { $name } – { $reason }. Desactivado (recomendado) = colores según Windows, igual que Fotos, el navegador y los vídeos. Activado = conversión a la gama nativa del panel (EDID): los tonos Display P3 fuera de sRGB se distinguen, pero todo se ve más apagado que en el resto de Windows. Tras un cambio, las vistas previas se regeneran en segundo plano.
 settings-default-sort = Orden predeterminado
 settings-delete-previews = Eliminar vistas previas de 2048 px
 settings-delete-thumbs = Eliminar miniaturas
@@ -610,6 +611,7 @@ splash-preparing = Preparando tu biblioteca…
 accent-custom = Color personalizado…
 accent-custom-dialog = Color de realce personalizado
 accent-custom-tooltip = Color personalizado { $custom_hex }
+accent-classic = Azul clásico
 
 ## ui_nav
 
@@ -728,6 +730,7 @@ person-unknown = Persona desconocida
 place-unknown = Lugar desconocido
 event-kicker-trip = Viaje
 event-city-area = { $city } y alrededores
+event-region-pair = { $a } y { $b }
 moments-no-date = Sin fecha
 events-journey-hint = J: reproducir el viaje en el mapa
 key-click = clic
@@ -964,6 +967,13 @@ map-nogl-body = El globo se dibuja con WebGL, que no está disponible aquí. Tus
 map-journey = Viaje
 map-replay = Volver a reproducir
 map-done = Listo
+map-whole-trip = Viaje completo
+map-day-n = Día { $n }
+map-days-a11y = Días del viaje
+map-next-day = Día siguiente
+map-next-day-tip = Día siguiente (Av Pág)
+map-day-one-place = un solo lugar, se reproduce dentro del viaje completo
+map-seek-a11y = Posición en el viaje
 map-controls-a11y = Reproducción del viaje
 map-prev-stop = Parada anterior
 map-next-stop = Parada siguiente
@@ -1031,3 +1041,15 @@ music-added = { $count ->
    *[other] { $count } pistas añadidas. Los recorridos ya pueden usarlas.
 }
 music-add-failed = No se pudo añadir la música
+info-more = Más información
+dup-mode-side = En paralelo
+dup-mode-split = Deslizador
+dup-side-left = Izquierda
+dup-side-right = Derecha
+dup-badge-recommended = Recomendada
+dup-badge-higher-res = Mayor resolución
+dup-badge-same-res = Misma resolución
+dup-badge-larger = Archivo más grande
+dup-megapixels = { $mp } MP
+dup-file-size = { $mb } MB
+dup-mode-tooltip = Comparar en paralelo o superpuestas con un deslizador (tecla S)

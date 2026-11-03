@@ -18,6 +18,8 @@ try:
     pillow_heif.register_heif_opener()
 except ImportError:
     pass
+import raw_decode  # noqa: E402  ProRAW / camera RAW through every Image.open (raw_decode.py)
+raw_decode.register()
 
 # Moduly InsightFace: detekce + rozpoznání stačí (3D landmarky a genderage se nepoužívají).
 # Pro budoucí filtr podle natočení hlavy (yaw) přidej "landmark_3d_68".
@@ -185,11 +187,9 @@ def _get_images_from_media(file_path):
         return frames
     else:
         try:
-            with Image.open(file_path) as pil_img:
-                pil_img = ImageOps.exif_transpose(pil_img)
-                rgb_img = pil_img.convert("RGB")
-                arr = np.array(rgb_img)
-                return [cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)]
+            import imaging                      # stejný dekodér jako zbytek aplikace
+            arr = np.asarray(imaging.flatten(imaging.open_oriented(file_path).image))
+            return [cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)]
         except Exception:
             img = cv_io.imread(file_path)
             return [img] if img is not None else []
@@ -213,6 +213,11 @@ def _is_valid_face_geometry(face):
 # Verze algoritmu ořezu; starší ořezy u obličejů u okraje fotky byly deformované (viz níže).
 # 3 = opravené i obličeje z videí (verze 2 je jen označila – protažené avatary v Osobách zůstaly)
 CROP_VERSION = 3
+# Avatar v rozlišení, které stačí i největšímu použití (profil osoby 200 log. px × DPR 2 ≈ 400,
+# karta 137 × 2 = 275) – dřív 256 px (a staré 112/224 px), takže se na HiDPI zvětšoval = rozmazaný
+AVATAR_PX = 384
+FACE_RENDER_VERSION = 1        # 1 = imaging pipeline: Lanczos3 384 px, ostření jasu, 4:4:4
+FACE_RENDER_MARKER = "FACE_RENDER"
 VIDEO_EXTS = {".mov", ".mp4", ".m4v"}
 CROP_MATCH_TOL = 22.0          # průměrný rozdíl jasu (0–255) na 64×64: uložený ořez pochází z tohoto snímku
 
@@ -234,7 +239,7 @@ def square_crop_window(img_w, img_h, bbox, pad_ratio=0.50):
     return x, y, side
 
 
-def _extract_apple_avatar_crop(img, bbox, target_size=256, pad_ratio=0.50):
+def _extract_apple_avatar_crop(img, bbox, target_size=AVATAR_PX, pad_ratio=0.50):
     """
     MODUL 2.1: Dynamický ořez obličeje rozšířený o 50% okraj (hlava, vlasy a ramena jako v Apple Photos).
     Vždy čtvercový výřez -> zmenšení na target_size beze změny poměru stran.
@@ -247,15 +252,27 @@ def _extract_apple_avatar_crop(img, bbox, target_size=256, pad_ratio=0.50):
     crop = img[y:y + side, x:x + side]
     if crop is None or crop.size == 0 or crop.shape[0] != crop.shape[1]:
         return None
-    interp = cv2.INTER_AREA if side > target_size else cv2.INTER_CUBIC
-    return cv2.resize(crop, (target_size, target_size), interpolation=interp)
+    # imaging: Lanczos3 + ostření jasu (barvy zdroje; převod do kontraktu displeje dělá
+    # _avatar_to_output, u videí žádný)
+    import imaging
+    rgb = Image.fromarray(cv2.cvtColor(np.ascontiguousarray(crop), cv2.COLOR_BGR2RGB))
+    out = imaging.render_avatar(rgb, int(target_size), output=False)
+    return cv2.cvtColor(np.asarray(out), cv2.COLOR_RGB2BGR)
 
 
-# ── Stage 2: barvy avatarů ───────────────────────────────────────────────────
-# Ořezy tváří z FOTEK jsou v profilu displeje (color_manage), stejně jako miniatury; z videí ne
-# (video se kreslí bez správy barev). Převádí se jen hotový ořez 256 px, ne celá fotka.
+def _write_avatar(path, avatar_bgr):
+    """Uloží hotový avatar (BGR) jako cache JPEG 4:4:4 (imaging) – atomicky. True = OK."""
+    if avatar_bgr is None or avatar_bgr.size == 0:
+        return False
+    import imaging
+    rgb = Image.fromarray(cv2.cvtColor(np.ascontiguousarray(avatar_bgr), cv2.COLOR_BGR2RGB))
+    return imaging.write_jpeg(rgb, path)
 
-CROP_COLOR_MARKER = "CROP_COLOR"
+
+# ── barvy avatarů ────────────────────────────────────────────────────────────
+# Ořezy tváří z FOTEK jsou v kontraktu displeje (color_manage), stejně jako miniatury; z videí ne
+# (video se kreslí bez správy barev). Jediný převod: ze zdrojového profilu hotového ořezu.
+# Změna kontraktu = nový ořez z originálu (rerender_face_crops), nikdy převod převodu.
 
 
 def _source_icc(path):
@@ -280,75 +297,273 @@ def _avatar_to_output(avatar_bgr, source_path, src_icc=False):
         return avatar_bgr
 
 
-def recolor_face_crops(should_stop=None):
-    """Jednorázově převede uložené ořezy tváří z fotek do výstupního profilu – přímo z ořezu
-    (256 px), bez dekódování originálů. Ořezy bez značky jsou v profilu fotky (stav před
-    Stage 2); po změně displeje se převádí z dřívějšího výstupního profilu (uložený .icc).
-    Přerušitelné: hotová id se průběžně zapisují. Vrací počet převedených ořezů."""
-    import json
+def _face_render_key():
     import color_manage
-    marker = os.path.join(FACE_CACHE_DIR, CROP_COLOR_MARKER)
-    cur = color_manage.target_fingerprint()
+    return {"v": FACE_RENDER_VERSION, "fp": color_manage.target_fingerprint()}
+
+
+def _rerender_video_faces(path, media_rows, size=AVATAR_PX, pad_ratio=0.50):
+    """Ořezy z videa znovu (nová pipeline): snímek, ze kterého ořez vznikl, se najde porovnáním
+    uloženého ořezu s ořezem každého snímku (stejné časy jako při skenování). Bez shody se ořez
+    nechá být. Video se barevně nepřevádí. Vrací počet přeřezaných."""
+    todo = []
+    for fid, crop_path, bx, by, bw, bh, _, media_id in media_rows:
+        stored = resolve_face_path(crop_path, FACE_CACHE_DIR)
+        if stored and None not in (bx, by, bw, bh):
+            sig = _crop_signature(cv_io.imread(stored))
+            if sig is not None:
+                todo.append((stored, (bx, by, bw, bh), sig))
+    if not todo:
+        return 0
+    frames = _get_images_from_media(path)
+    done = 0
+    for stored, (bx, by, bw, bh), sig in todo:
+        best = None
+        for frame in frames:
+            fh, fw = frame.shape[:2]
+            bbox = (int(bx * fw), int(by * fh), int((bx + bw) * fw), int((by + bh) * fh))
+            cand = _extract_apple_avatar_crop(frame, bbox, size, pad_ratio)
+            csig = _crop_signature(cand)
+            if csig is None:
+                continue
+            d = float(np.mean(np.abs(csig - sig)))
+            if best is None or d < best[0]:
+                best = (d, cand)
+        if best is not None and best[0] <= CROP_MATCH_TOL and _write_avatar(stored, best[1]):
+            done += 1
+    return done
+
+
+def rerender_face_crops(should_stop=None):
+    """Přeřízne všechny ořezy tváří z ORIGINÁLŮ, když se změnila pipeline ořezů
+    (FACE_RENDER_VERSION) nebo kontrakt barev displeje – nikdy nepřevádí hotový ořez podruhé.
+    Fotka se dekóduje jednou pro všechny své tváře. Obličeje z videí jen při nové verzi pipeline
+    (barevně se nepřevádějí). Přerušitelné: hotová id se průběžně zapisují do značky.
+    Vrací počet přeřezaných ořezů."""
+    import json
+    import imaging
+    marker = os.path.join(FACE_CACHE_DIR, FACE_RENDER_MARKER)
+    cur = _face_render_key()
     try:
         with open(marker, encoding="utf-8") as f:
             state = json.load(f)
     except (OSError, ValueError):
-        state = {"fp": None, "pending": None, "done": []}
-    if state.get("fp") == cur and not state.get("pending"):
+        state = {}
+    last = state.get("done_key")
+    if last == cur:
         return 0
-    if state.get("pending") != cur:                  # nový průchod
-        state = {"fp": state.get("fp"), "pending": cur, "done": []}
-    prev_icc = False                                 # False = ořezy jsou v profilu své fotky
-    if state.get("fp"):
-        try:
-            with open(marker + ".icc", "rb") as f:
-                prev_icc = f.read() or None
-        except OSError:
-            prev_icc = None                          # dřívější výstup byl sRGB
-    done = set(state.get("done") or [])
-    conn = get_connection()
-    try:
-        rows = conn.execute("""
-            SELECT f.id, f.face_crop_path, m.file_path FROM face_instances f
-            JOIN media_items m ON m.id = f.media_id WHERE f.face_crop_path IS NOT NULL
-        """).fetchall()
-    finally:
-        conn.close()
+    if state.get("pending") != cur:
+        state = {"done_key": last, "pending": cur, "ids": []}
+    videos_too = (last or {}).get("v") != FACE_RENDER_VERSION
+    done = set(state.get("ids") or [])
 
     def save_state(final=False):
         os.makedirs(FACE_CACHE_DIR, exist_ok=True)
-        data = {"fp": cur, "pending": None, "done": []} if final else dict(state, done=sorted(done))
-        with open(marker, "w", encoding="utf-8") as f:
+        data = ({"done_key": cur, "pending": None, "ids": []} if final
+                else dict(state, ids=sorted(done)))
+        tmp = marker + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f)
-        if final:
-            with open(marker + ".icc", "wb") as f:
-                f.write(color_manage.target()["icc"] or b"")
+        os.replace(tmp, marker)
 
-    converted, icc_cache = 0, {}
-    for i, (fid, crop_path, file_path) in enumerate(rows):
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT f.id, f.face_crop_path, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h, m.file_path, f.media_id
+            FROM face_instances f JOIN media_items m ON m.id = f.media_id
+            WHERE f.face_crop_path IS NOT NULL ORDER BY f.media_id
+        """).fetchall()
+    finally:
+        conn.close()
+    by_media = {}
+    for row in rows:
+        if row[0] not in done:
+            by_media.setdefault(row[7], []).append(row)
+    rendered = 0
+    for k, media_rows in enumerate(by_media.values()):
         if should_stop and should_stop():
             save_state()
-            return converted
-        if fid in done:
-            continue
-        path = resolve_face_path(crop_path, FACE_CACHE_DIR)
-        if path and os.path.splitext(file_path or "")[1].lower() not in VIDEO_EXTS:
-            if prev_icc is False:
-                if file_path not in icc_cache:
-                    icc_cache[file_path] = _source_icc(file_path) if file_path and os.path.exists(file_path) else None
-                src = icc_cache[file_path]
+            return rendered
+        path = media_rows[0][6]
+        ext = os.path.splitext(path or "")[1].lower()
+        try:
+            if not path or not os.path.exists(path):
+                pass
+            elif ext in VIDEO_EXTS:
+                if videos_too:
+                    rendered += _rerender_video_faces(path, media_rows)
             else:
-                src = prev_icc
-            img = cv_io.imread(path)
-            if img is not None and img.size:
-                out = _avatar_to_output(img, file_path or "x.jpg", src)
-                if out is not img and cv_io.imwrite(path, out, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
-                    converted += 1
-        done.add(fid)
-        if i % 50 == 49:
+                dec = imaging.open_oriented(path)
+                w, h = dec.image.size
+                for fid, crop_path, bx, by, bw, bh, _, media_id in media_rows:
+                    if None in (bx, by, bw, bh):
+                        continue
+                    window = square_crop_window(w, h, (bx * w, by * h, (bx + bw) * w, (by + bh) * h), 0.50)
+                    if window is None:
+                        continue
+                    x, y, side = window
+                    crop = dec.image.crop((x, y, x + side, y + side)).convert("RGB")
+                    avatar = imaging.render_avatar(crop, AVATAR_PX, dec.icc)
+                    target = resolve_face_path(crop_path, FACE_CACHE_DIR) or os.path.join(
+                        FACE_CACHE_DIR, f"face_{media_id}_rec_{fid}.jpg")
+                    if imaging.write_jpeg(avatar, target):
+                        rendered += 1
+                        if target != crop_path:
+                            c = get_connection()
+                            try:
+                                c.execute("UPDATE face_instances SET face_crop_path = ? WHERE id = ?", (target, fid))
+                                c.execute("UPDATE people SET cover_face_path = ? WHERE key_face_id = ?", (target, fid))
+                                c.commit()
+                            finally:
+                                c.close()
+        except Exception as e:
+            print(f"[FaceCrops] {os.path.basename(path or '')}: {e}")
+        done.update(r[0] for r in media_rows)
+        if k % 10 == 9:
             save_state()
     save_state(final=True)
-    return converted
+    return rendered
+
+
+PURGE_MIN_REFS_PRESENT = 0.8     # aspoň tolik odkazovaných ořezů musí v té složce opravdu ležet
+
+
+def purge_orphan_face_files(min_age_s=86400):
+    """Smaže soubory ořezů, na které už neodkazuje žádný obličej ani obálka osoby (pozůstatky
+    opakovaných skenů). Jen face_*.jpg / temp_*.jpg starší než min_age_s.
+
+    POJISTKA: maže jen tehdy, když databáze a složka prokazatelně patří k sobě – DB má odkazy
+    a aspoň PURGE_MIN_REFS_PRESENT z nich v této složce existuje. Jiná / prázdná / dočasná DB
+    proti skutečné složce (testy, rozbitá migrace) = nic se nesmaže. Vrací počet smazaných."""
+    conn = get_connection()
+    try:
+        refs = {os.path.basename(str(p).replace("\\", "/")).lower()
+                for (p,) in conn.execute(
+                    "SELECT face_crop_path FROM face_instances WHERE face_crop_path IS NOT NULL "
+                    "UNION SELECT cover_face_path FROM people WHERE cover_face_path IS NOT NULL") if p}
+    finally:
+        conn.close()
+    try:
+        entries = list(os.scandir(FACE_CACHE_DIR))
+    except OSError:
+        return 0
+    names = {e.name.lower() for e in entries}
+    present = len(refs & names)
+    if not refs or present < PURGE_MIN_REFS_PRESENT * len(refs):
+        print(f"[FaceCrops] úklid ořezů přeskočen: DB a složka k sobě nepatří ({present}/{len(refs)})")
+        return 0
+    now = time.time()
+    removed = 0
+    for e in entries:
+        name = e.name.lower()
+        if not (name.endswith(".jpg") and (name.startswith("face_") or name.startswith("temp_"))):
+            continue
+        if name in refs:
+            continue
+        try:
+            if not e.is_file() or now - e.stat().st_mtime < min_age_s:
+                continue
+            os.remove(e.path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def restore_missing_video_face_crops(should_stop=None, min_similarity=0.55):
+    """Samoléčení: ořezy obličejů z VIDEÍ, jejichž soubor chybí, se vyříznou znovu. Snímek se
+    vytáhne ve stejných časech jako při skenování, detektor najde tváře a ta pravá se pozná
+    podle uloženého ArcFace embeddingu (+ překryv rámečku) – tedy přesně ta tvář z přesně
+    toho snímku, ne odhad. Uloží se na původní cestu. Vrací počet obnovených ořezů."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT f.id, f.face_crop_path, f.bbox_x, f.bbox_y, f.bbox_w, f.bbox_h, f.embedding,
+                   m.file_path, f.media_id
+            FROM face_instances f JOIN media_items m ON m.id = f.media_id
+            WHERE f.face_crop_path IS NOT NULL ORDER BY f.media_id
+        """).fetchall()
+    finally:
+        conn.close()
+    import json
+    marker = os.path.join(FACE_CACHE_DIR, "FACE_RESTORE")      # id, které se obnovit nepodařilo
+    try:
+        with open(marker, encoding="utf-8") as f:
+            failed = set(json.load(f).get("failed") or [])
+    except (OSError, ValueError):
+        failed = set()
+    by_media = {}
+    for row in rows:
+        if row[0] in failed:
+            continue                                     # nezkoušet při každém startu znovu
+        if os.path.splitext(row[7] or "")[1].lower() in VIDEO_EXTS and not resolve_face_path(row[1], FACE_CACHE_DIR):
+            by_media.setdefault(row[8], []).append(row)
+    if not by_media:
+        return 0
+    app = _get_app()
+    attempted = set()
+    restored = 0
+    for media_rows in by_media.values():
+        if should_stop and should_stop():
+            break
+        path = media_rows[0][7]
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            detections = []                                   # (frame, bbox px, normed emb, bbox norm)
+            for frame in _get_images_from_media(path):
+                fh, fw = frame.shape[:2]
+                for face in app.get(frame) or []:
+                    emb = getattr(face, "normed_embedding", None)
+                    if emb is None:
+                        continue
+                    x1, y1, x2, y2 = [float(v) for v in face.bbox]
+                    detections.append((frame, (max(0, int(x1)), max(0, int(y1)), min(fw, int(x2)), min(fh, int(y2))),
+                                       np.asarray(emb, dtype=np.float32),
+                                       (x1 / fw, y1 / fh, x2 / fw, y2 / fh)))
+            for fid, crop_path, bx, by, bw, bh, blob, _, media_id in media_rows:
+                attempted.add(fid)
+                if not blob:
+                    continue
+                ref = np.frombuffer(bytes(blob), dtype=np.float32)
+                ref = ref / (np.linalg.norm(ref) or 1.0)
+                best = None
+                for frame, bbox, emb, nb in detections:
+                    if emb.shape != ref.shape:
+                        continue
+                    sim = float(np.dot(ref, emb))
+                    if None not in (bx, by, bw, bh):
+                        ix = max(0.0, min(bx + bw, nb[2]) - max(bx, nb[0]))
+                        iy = max(0.0, min(by + bh, nb[3]) - max(by, nb[1]))
+                        inter = ix * iy
+                        union = bw * bh + (nb[2] - nb[0]) * (nb[3] - nb[1]) - inter
+                        sim += 0.1 * (inter / union if union > 0 else 0.0)
+                    if best is None or sim > best[0]:
+                        best = (sim, frame, bbox)
+                if best is None or best[0] < min_similarity:
+                    continue
+                avatar = _extract_apple_avatar_crop(best[1], best[2], AVATAR_PX, 0.50)
+                target = os.path.join(FACE_CACHE_DIR, os.path.basename(str(crop_path).replace("\\", "/")))
+                if avatar is not None and _write_avatar(target, avatar):
+                    attempted.discard(fid)
+                    restored += 1
+                    if os.path.normcase(target) != os.path.normcase(str(crop_path)):
+                        c = get_connection()
+                        try:
+                            c.execute("UPDATE face_instances SET face_crop_path = ? WHERE id = ?", (target, fid))
+                            c.execute("UPDATE people SET cover_face_path = ? WHERE key_face_id = ?", (target, fid))
+                            c.commit()
+                        finally:
+                            c.close()
+        except Exception as e:
+            print(f"[FaceCrops] obnova {os.path.basename(path)}: {e}")
+    if attempted:
+        try:
+            with open(marker, "w", encoding="utf-8") as f:
+                json.dump({"failed": sorted(failed | attempted)}, f)
+        except OSError:
+            pass
+    return restored
 
 
 def _is_stretched_window(img_w, img_h, bbox, pad_ratio=0.50, tolerance=0.03):
@@ -394,7 +609,7 @@ def _video_size(path):
         return None
 
 
-def _repair_video_faces(path, media_rows, target_size=256, pad_ratio=0.50):
+def _repair_video_faces(path, media_rows, target_size=AVATAR_PX, pad_ratio=0.50):
     """Protažené ořezy obličejů z videa: snímek, ze kterého ořez vznikl, se najde znovu (stejné
     časy jako při skenování, _get_images_from_media) porovnáním uloženého ořezu se starým
     algoritmem. Přeřízne se jen tam, kde uložený ořez opravdu odpovídá starému protaženému –
@@ -435,7 +650,7 @@ def _repair_video_faces(path, media_rows, target_size=256, pad_ratio=0.50):
                 best = (d_old, new)
         if best is None or best[0] > CROP_MATCH_TOL or new_diff <= best[0]:
             continue                                       # už správný / snímek nenalezen
-        if cv_io.imwrite(stored, best[1], [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+        if _write_avatar(stored, best[1]):
             repaired += 1
     return repaired
 
@@ -620,7 +835,7 @@ def _oriented_size(path):
     return w, h
 
 
-def repair_stretched_face_crops(should_stop=None, target_size=256, pad_ratio=0.50):
+def repair_stretched_face_crops(should_stop=None, target_size=AVATAR_PX, pad_ratio=0.50):
     """Jednorázově přeřízne deformované ořezy (CROP_VERSION < 2) z originálních fotek.
 
     Kontroluje jen hlavičky fotek; originál dekóduje jen tam, kde byl ořez opravdu
@@ -682,7 +897,7 @@ def repair_stretched_face_crops(should_stop=None, target_size=256, pad_ratio=0.5
             target = resolve_face_path(crop_path, FACE_CACHE_DIR) or os.path.join(
                 FACE_CACHE_DIR, f"face_{media_id}_rec_{fid}.jpg")
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            if cv_io.imwrite(target, _avatar_to_output(avatar, path), [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+            if _write_avatar(target, _avatar_to_output(avatar, path)):
                 repaired += 1
                 if target != crop_path:
                     conn = get_connection()
@@ -703,7 +918,7 @@ def repair_stretched_face_crops(should_stop=None, target_size=256, pad_ratio=0.5
     return repaired
 
 
-def reconstruct_face_crop(face_instance_id, target_size=256, pad_ratio=0.50):
+def reconstruct_face_crop(face_instance_id, target_size=AVATAR_PX, pad_ratio=0.50):
     """
     PATCH 2.1 – Lazy rekonstrukce ořezu obličeje z původní fotky.
 
@@ -778,7 +993,7 @@ def reconstruct_face_crop(face_instance_id, target_size=256, pad_ratio=0.50):
         crop_path = os.path.join(FACE_CACHE_DIR, crop_filename)
 
     os.makedirs(os.path.dirname(crop_path), exist_ok=True)
-    if not cv_io.imwrite(crop_path, _avatar_to_output(avatar, file_path), [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+    if not _write_avatar(crop_path, _avatar_to_output(avatar, file_path)):
         return None
 
     # Aktualizujeme cestu v DB (pokud se změnila nebo chyběla)
@@ -799,7 +1014,7 @@ def reconstruct_face_crop(face_instance_id, target_size=256, pad_ratio=0.50):
     return crop_path
 
 
-def reconstruct_best_crop_for_person(person_id, target_size=256, pad_ratio=0.50):
+def reconstruct_best_crop_for_person(person_id, target_size=AVATAR_PX, pad_ratio=0.50):
     """
     PATCH 2.1 – Najde nejkvalitnější obličej osoby a rekonstruuje jeho ořez.
 
@@ -890,14 +1105,13 @@ def detect_and_extract_faces(media_id, image_path, preloaded_image=None):
             quality_score = float(sharpness * det_score)
 
             # Uložíme estetický portrét s 50% paddingem (celá hlava a krk)
-            avatar_crop = _extract_apple_avatar_crop(img, (x1, y1, x2, y2), target_size=256, pad_ratio=0.50)
+            avatar_crop = _extract_apple_avatar_crop(img, (x1, y1, x2, y2), target_size=AVATAR_PX, pad_ratio=0.50)
             if avatar_crop is None:
                 avatar_crop = aligned_face
 
             crop_filename = f"face_{media_id}_{int(time.time())}_{np.random.randint(1000,9999)}.jpg"
             crop_path = os.path.join(FACE_CACHE_DIR, crop_filename)
-            if not cv_io.imwrite(crop_path, _avatar_to_output(avatar_crop, image_path),
-                                 [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+            if not _write_avatar(crop_path, _avatar_to_output(avatar_crop, image_path)):
                 # cv2.imwrite by tady selhal TIŠE (např. diakritika v cestě) a v DB by zůstala
                 # cesta k neexistujícímu souboru. Raději hlasitě selhat - fotka se zkusí příště.
                 _discard_crops(raw_detections)

@@ -7,9 +7,9 @@ API zůstává Qt: KButton je QPushButton, položky jsou zaškrtávací tlačít
 from i18n import tr
 import re
 
-from PyQt6.QtCore import QObject, QPointF, QRect, QRectF, QSize, Qt, pyqtSignal, QEvent
+from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, pyqtSignal, QEvent
 from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
-from PyQt6.QtWidgets import (QAbstractButton, QButtonGroup, QGraphicsOpacityEffect, QHBoxLayout, QLabel,
+from PyQt6.QtWidgets import (QAbstractButton, QButtonGroup, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLayout,
                              QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
 import icons
@@ -669,10 +669,37 @@ class ToggleSwitch(_Interactive, QAbstractButton):
         self._pos = motion.Tween(0.0, lambda v: self.update(), self)
         self.toggled.connect(lambda on: self._pos.to(1.0 if on else 0.0, "spring"))
         self._init_interaction()
+        self.info_dot = None
+
+    def set_info(self, text):
+        """(i) hned za textem vypínače (Founder audit: místo vysvětlujícího odstavce pod ním)."""
+        if self.info_dot is None:
+            self.info_dot = InfoDot(text, self)
+        else:
+            self.info_dot.set_info(text)
+        self._place_info()
+        return self.info_dot
+
+    def _text_room(self):
+        extra = (InfoDot.SIZE + 6) if self.info_dot is not None else 0
+        return max(0, int(self.track_rect().left() - 12 - extra))
+
+    def _place_info(self):
+        if self.info_dot is None:
+            return
+        fm = self.fontMetrics()
+        x = min(fm.horizontalAdvance(self.text()), self._text_room()) + 6
+        self.info_dot.move(int(x), int((self.height() - InfoDot.SIZE) / 2))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._place_info()
 
     def sizeHint(self):
         fm = self.fontMetrics()
         text_w = fm.horizontalAdvance(self.text()) + 16 if self.text() else 0
+        if self.info_dot is not None:
+            text_w += InfoDot.SIZE + 6
         return QSize(text_w + self.TRACK_W + 4, max(28, fm.height() + 8))
 
     def minimumSizeHint(self):
@@ -692,7 +719,7 @@ class ToggleSwitch(_Interactive, QAbstractButton):
         if self.text():
             p.setPen(_c(t, "text") if self.isEnabled() else _c(t, "text_tertiary"))
             p.setFont(self.font())
-            text_rect = QRectF(0, 0, tr.left() - 12, self.height())
+            text_rect = QRectF(0, 0, self._text_room(), self.height())
             text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight, int(text_rect.width()))
             p.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), text)
         pos = self._pos.value
@@ -1238,3 +1265,197 @@ class ActivityStatus(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(accent_2)
         p.drawEllipse(QPointF(hx, hy), 2.2, 2.2)
+
+
+# ── Founder audit: kolečko myši nesmí „ukrást“ posouvání stránky ─────────────────────────────────
+class _WheelGuard(QObject):
+    """Pole se seznamem / posuvník / číselník pod kurzorem při posouvání stránky nemění hodnotu:
+    dokud nemá fokus (klik / Tab), kolečko se předá rodiči – a po řetězci rodičů dojde do
+    QScrollArea, která stránku posune dál. Po kliknutí kolečko prvek normálně ovládá."""
+
+    EXPLICIT = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
+                Qt.FocusReason.BacktabFocusReason, Qt.FocusReason.ShortcutFocusReason)
+    KEEP = (Qt.FocusReason.ActiveWindowFocusReason, Qt.FocusReason.PopupFocusReason)
+
+    def eventFilter(self, obj, event):
+        et = event.type()
+        if et == QEvent.Type.MouseButtonPress:
+            obj.setProperty("_wheel_ok", True)        # klik = výslovný zájem (i když fokus už měl)
+            return False
+        if et == QEvent.Type.FocusIn:
+            # jen fokus, který uživatel dal výslovně (klik, Tab); fokus „od programu“ ne
+            if event.reason() in self.EXPLICIT:
+                obj.setProperty("_wheel_ok", True)
+            elif event.reason() not in self.KEEP:
+                obj.setProperty("_wheel_ok", False)
+            return False
+        if et == QEvent.Type.FocusOut and event.reason() not in self.KEEP:
+            obj.setProperty("_wheel_ok", False)
+            return False
+        if et == QEvent.Type.Wheel and isinstance(obj, QWidget)                 and not (obj.hasFocus() and obj.property("_wheel_ok")):
+            from PyQt6.QtGui import QWheelEvent
+            from PyQt6.QtWidgets import QAbstractScrollArea, QApplication
+            area = obj.parentWidget()
+            while area is not None and not isinstance(area, QAbstractScrollArea):
+                area = area.parentWidget()
+            if area is not None:
+                # Qt 6 nešíří nespontánní Wheel k rodičům -> předat přímo viewportu oblasti
+                vp = area.viewport()
+                pos = vp.mapFromGlobal(event.globalPosition())
+                fwd = QWheelEvent(pos, event.globalPosition(), event.pixelDelta(), event.angleDelta(),
+                                  event.buttons(), event.modifiers(), event.phase(), event.inverted())
+                QApplication.sendEvent(vp, fwd)
+            return True
+        return False
+
+
+_wheel_guard = None
+
+
+def guard_wheel(root):
+    """Nainstaluje _WheelGuard na všechny QComboBox / QAbstractSlider (kromě posuvníků oblastí) /
+    QAbstractSpinBox uvnitř root. Fokus jen klikem / Tabem (StrongFocus), ne kolečkem.
+    Vrací počet chráněných prvků."""
+    from PyQt6.QtWidgets import QAbstractSlider, QAbstractSpinBox, QComboBox, QScrollBar
+    global _wheel_guard
+    if _wheel_guard is None:
+        _wheel_guard = _WheelGuard()
+    n = 0
+    for w in root.findChildren(QWidget):
+        if isinstance(w, QScrollBar) or not isinstance(w, (QComboBox, QAbstractSlider, QAbstractSpinBox)):
+            continue
+        if w.property("_wheel_guarded"):
+            continue
+        w.setProperty("_wheel_guarded", True)
+        w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        w.installEventFilter(_wheel_guard)
+        n += 1
+    return n
+
+
+# ── Founder audit: (i) místo zdí vysvětlujícího textu ───────────────────────────────────────────
+def _tooltip_html(text):
+    import html
+    body = html.escape(str(text)).replace("\n", "<br>")
+    return f"<qt><div style='max-width:340px'>{body}</div></qt>"
+
+
+class InfoDot(_Interactive, QAbstractButton):
+    """Malé (i) vedle popisku: vysvětlení v bohaté bublině při najetí, kliknutí i z klávesnice
+    (Enter / mezerník). Text se dá změnit (set_info) – např. stav modelu, profil displeje."""
+    SIZE = 18
+
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self._init_interaction()
+        self.info = ""
+        self.set_info(text)
+        self.clicked.connect(self.show_info)
+
+    def set_info(self, text):
+        self.info = str(text or "")
+        self.setToolTip(_tooltip_html(self.info) if self.info else "")
+        self.setAccessibleName(tr("info-more"))
+        self.setAccessibleDescription(self.info)
+
+    def show_info(self):
+        from PyQt6.QtWidgets import QToolTip
+        if self.info:
+            QToolTip.showText(self.mapToGlobal(self.rect().bottomLeft()), self.toolTip(), self, QRect(), 12000)
+
+    def paintEvent(self, _):
+        t = palette_for(self)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        k = max(0.0, min(1.0, self._hover.value))
+        col = tokens.mix(_c(t, "text_tertiary"), _c(t, "accent"), k)
+        if k > 0:
+            soft = _c(t, "accent_soft")
+            soft.setAlphaF(soft.alphaF() * k)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(soft)
+            p.drawEllipse(QRectF(self.rect()))
+        icons.paint(p, "info", QRectF(self.rect()).adjusted(1, 1, -1, -1), col)
+        if self._kbd_focus:
+            _focus_ring(p, t, self.rect(), self.SIZE / 2)
+        p.end()
+
+
+def with_info(widget, text, parent=None):
+    """Widget (popisek / vypínač) + (i) hned za ním v jednom řádku. Vrací (kontejner, InfoDot)."""
+    box = QWidget(parent)
+    lay = QHBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(6)
+    lay.addWidget(widget, 1 if isinstance(widget, ToggleSwitch) else 0)
+    dot = InfoDot(text, box)
+    lay.addWidget(dot, 0, Qt.AlignmentFlag.AlignVCenter)
+    if not isinstance(widget, ToggleSwitch):
+        lay.addStretch(1)
+    return box, dot
+
+
+# ── zalamovací rozvržení (karty osob v mřížce, štítky osob v prohlížeči) ─────────────────────────
+class FlowLayout(QLayout):
+    """Řadí položky zleva doprava a zalamuje je podle dostupné šířky (responzivní mřížka)."""
+
+    def __init__(self, parent=None, spacing=8, v_spacing=None):
+        super().__init__(parent)
+        self._items = []
+        self._spacing = spacing
+        self._v_spacing = spacing if v_spacing is None else v_spacing
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, apply=True)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, apply):
+        m = self.contentsMargins()
+        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = area.x(), area.y(), 0
+        for item in self._items:
+            if item.isEmpty():          # skrytý widget (filtr vyhledávání)
+                continue
+            hint = item.sizeHint()
+            if line_h and x + hint.width() > area.right() + 1:
+                x = area.x()
+                y += line_h + self._v_spacing
+                line_h = 0
+            if apply:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._spacing
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + m.bottom()

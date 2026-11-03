@@ -41,6 +41,7 @@ cache-unexpected-path = Chemin de cache inattendu – suppression annulée.
 ## color_manage
 
 color-reason-default = par défaut
+color-reason-system = Windows (sRGB – comme Photos, le navigateur et les vidéos)
 color-reason-manual = défini manuellement
 color-reason-profile = profil attribué à l’écran dans Windows
 color-reason-wide-gamut = écran à large gamut sans gestion des couleurs
@@ -514,8 +515,8 @@ settings-cache-pending = {"  "}→  { $pending_cache_dir }  (après enregistreme
 settings-cache-usage = Vignettes (supprimables) : <b>{ $thumbs_mb } Mo</b><br>Aperçus 2048 px (supprimables) : <b>{ $previews_mb } Mo</b><br>Recadrages de visages (données permanentes, jamais supprimées) : <b>{ $faces_mb } Mo</b>
 settings-caches-hint = Les deux caches se reconstruisent d’eux-mêmes en arrière-plan. Les recadrages de visages, les personnes, la bibliothèque et vos photos ne sont pas touchés.
 settings-change-passcode = Modifier le code…
-settings-color-display = Adapter les couleurs des photos à l’écran
-settings-color-hint = Actuellement : { $name } – { $reason }. Désactivé = toujours sRGB (pour les écrans qui convertissent eux-mêmes les couleurs). Après un changement, les aperçus sont régénérés en arrière-plan.
+settings-color-display = Gamut large de la dalle (P3 exact)
+settings-color-hint = Actuellement : { $name } – { $reason }. Désactivé (recommandé) = couleurs selon Windows, exactement comme Photos, le navigateur et les vidéos. Activé = conversion vers le gamut natif de la dalle (EDID) : les teintes Display P3 au-delà du sRGB restent distinctes, mais tout paraît plus terne que dans le reste de Windows. Après un changement, les aperçus sont régénérés en arrière-plan.
 settings-default-sort = Tri par défaut
 settings-delete-previews = Supprimer les aperçus 2048 px
 settings-delete-thumbs = Supprimer les vignettes
@@ -610,6 +611,7 @@ splash-preparing = Préparation de votre bibliothèque…
 accent-custom = Couleur personnalisée…
 accent-custom-dialog = Couleur d’accentuation personnalisée
 accent-custom-tooltip = Couleur personnalisée { $custom_hex }
+accent-classic = Bleu classique
 
 ## ui_nav
 
@@ -728,6 +730,7 @@ person-unknown = Personne inconnue
 place-unknown = Lieu inconnu
 event-kicker-trip = Voyage
 event-city-area = { $city } et environs
+event-region-pair = { $a } et { $b }
 moments-no-date = Sans date
 events-journey-hint = J – lire le voyage sur la carte
 key-click = clic
@@ -964,6 +967,13 @@ map-nogl-body = Le globe est dessiné avec WebGL, qui n’est pas disponible ici
 map-journey = Voyage
 map-replay = Revoir
 map-done = Terminé
+map-whole-trip = Voyage entier
+map-day-n = Jour { $n }
+map-days-a11y = Jours du voyage
+map-next-day = Jour suivant
+map-next-day-tip = Jour suivant (Page suivante)
+map-day-one-place = un seul lieu, lu dans le voyage entier
+map-seek-a11y = Position dans le voyage
 map-controls-a11y = Lecture du voyage
 map-prev-stop = Étape précédente
 map-next-stop = Étape suivante
@@ -1031,3 +1041,15 @@ music-added = { $count ->
    *[other] { $count } morceaux ajoutés. Les parcours peuvent les utiliser.
 }
 music-add-failed = Impossible d’ajouter la musique
+info-more = Plus d’informations
+dup-mode-side = Côte à côte
+dup-mode-split = Curseur
+dup-side-left = Gauche
+dup-side-right = Droite
+dup-badge-recommended = Recommandée
+dup-badge-higher-res = Meilleure résolution
+dup-badge-same-res = Même résolution
+dup-badge-larger = Fichier plus lourd
+dup-megapixels = { $mp } Mpx
+dup-file-size = { $mb } Mo
+dup-mode-tooltip = Comparer côte à côte ou superposées avec un curseur (touche S)

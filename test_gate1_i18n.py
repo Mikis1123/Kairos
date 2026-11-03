@@ -18,6 +18,7 @@ NON_UI_MODULES = {
     "conftest.py", "benchmark_stress.py", "perf_profile.py",   # dev tools
     "search_lexicon.py",                                       # Czech/English search vocabulary
     "i18n.py",                                                 # the engine itself (native language names)
+    "regions.py",                                              # place gazetteer: names per language as data
 }
 CZECH = re.compile(r"[áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ„]")   # “ is also English
 DEV_CALLS = {"print", "debug", "info", "warning", "error", "exception", "log", "_log", "_dbg", "critical",
@@ -218,8 +219,12 @@ def test_placeables_match_english():
 def test_all_message_ids_used_in_code_exist():
     used = set()
     pat = re.compile(r"""\b(?:tr|N_|tr_lang\([^,]+,)\(\s*["']([a-z0-9][a-z0-9\-]*)["']""")
-    for f in ui_modules() + [os.path.join(HERE, "i18n.py")]:
-        used |= set(pat.findall(open(f, encoding="utf-8").read()))
+    # Indirect ids stored in tables and translated later (e.g. tokens.ACCENTS[k]["label"]) –
+    # 'accent-classic' slipped through the direct-call scan above.
+    label_pat = re.compile(r"""["'](?:label|label_key|title_key)["']\s*:\s*["']([a-z0-9]+-[a-z0-9\-]+)["']""")
+    for f in ui_modules() + [os.path.join(HERE, "i18n.py"), os.path.join(HERE, "tokens.py")]:
+        src = open(f, encoding="utf-8").read()
+        used |= set(pat.findall(src)) | set(label_pat.findall(src))
     missing = sorted(used - _ids("en"))
     assert not missing, missing
 

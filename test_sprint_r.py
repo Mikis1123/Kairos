@@ -311,7 +311,10 @@ class TestMapHolds(unittest.TestCase):
         self.html = open(os.path.join(ROOT, "map_vault.html"), encoding="utf-8").read()
 
     def test_moveend_releases_before_director_guard(self):
+        # moveend -> cameraRested() (an orbit session calls it once at its end, test_map_engine)
         i = self.html.index("map.on('moveend'")
+        self.assertIn("cameraRested()", self.html[i:i + 200])
+        i = self.html.index("function cameraRested()")
         block = self.html[i:i + 300]
         self.assertLess(block.index("setInteraction('map', false)"), block.index("if (director.directing) return"))
 

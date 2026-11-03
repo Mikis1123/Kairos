@@ -21,6 +21,8 @@ try:
     pillow_heif.register_heif_opener()
 except ImportError:
     pass
+import raw_decode  # noqa: E402  ProRAW / camera RAW through every Image.open (raw_decode.py)
+raw_decode.register()
 
 TEXT_MODEL_NAME = "sentence-transformers/clip-ViT-B-32-multilingual-v1"
 IMAGE_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"

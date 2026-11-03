@@ -41,6 +41,7 @@ cache-unexpected-path = 缓存路径异常，已取消删除。
 ## color_manage
 
 color-reason-default = 默认
+color-reason-system = Windows（sRGB – 与“照片”、浏览器和视频一致）
 color-reason-manual = 手动设置
 color-reason-profile = Windows 中分配给显示器的配置文件
 color-reason-wide-gamut = 未进行色彩管理的广色域显示器
@@ -514,8 +515,8 @@ settings-cache-pending = {"  "}→  { $pending_cache_dir }  （存储并重新�
 settings-cache-usage = 缩略图（可删除）：<b>{ $thumbs_mb } MB</b><br>2048 px 预览（可删除）：<b>{ $previews_mb } MB</b><br>面孔裁切（永久数据，不会删除）：<b>{ $faces_mb } MB</b>
 settings-caches-hint = 两种缓存都会在后台自动重建。面孔裁切、人物、图库和你的照片不受影响。
 settings-change-passcode = 更改密码…
-settings-color-display = 让照片色彩匹配显示器
-settings-color-hint = 当前：{ $name } – { $reason }。关闭 = 始终使用 sRGB（适用于自行转换色彩的显示器）。更改后，预览会在后台重新生成。
+settings-color-display = 面板广色域（精确 P3）
+settings-color-hint = 当前：{ $name } – { $reason }。关闭（推荐）= 色彩遵循 Windows，与“照片”、浏览器和视频完全一致。开启 = 按 EDID 转换到面板原生色域：超出 sRGB 的 Display P3 色彩保持可区分，但整体会比 Windows 其他部分更平淡。更改后，预览会在后台重新生成。
 settings-default-sort = 默认排序
 settings-delete-previews = 删除 2048 px 预览
 settings-delete-thumbs = 删除缩略图
@@ -610,6 +611,7 @@ splash-preparing = 正在准备你的图库…
 accent-custom = 自定颜色…
 accent-custom-dialog = 自定强调色
 accent-custom-tooltip = 自定颜色 { $custom_hex }
+accent-classic = 经典蓝
 
 ## ui_nav
 
@@ -689,6 +691,7 @@ person-unknown = 未知人物
 place-unknown = 未知地点
 event-kicker-trip = 旅行
 event-city-area = { $city }及周边
+event-region-pair = { $a }和{ $b }
 moments-no-date = 无日期
 events-journey-hint = J – 在地图上播放旅程
 key-click = 点按
@@ -871,6 +874,13 @@ map-nogl-body = 地球仪使用 WebGL 绘制，但此处不可用。你的照片
 map-journey = 旅程
 map-replay = 重新播放
 map-done = 完成
+map-whole-trip = 整个旅程
+map-day-n = 第 { $n } 天
+map-days-a11y = 旅程的每一天
+map-next-day = 下一天
+map-next-day-tip = 下一天 (Page Down)
+map-day-one-place = 只有一个地点，在整个旅程中播放
+map-seek-a11y = 旅程中的位置
 map-controls-a11y = 旅程播放
 map-prev-stop = 上一站
 map-next-stop = 下一站
@@ -917,3 +927,15 @@ music-add-pick = 选择音乐
 music-file-filter = 音频 (*.opus *.ogg *.webm *.mp3 *.m4a *.wav)
 music-added = 已添加 { $count } 首曲目，旅程现在可以使用。
 music-add-failed = 无法添加音乐
+info-more = 更多信息
+dup-mode-side = 并排
+dup-mode-split = 滑块
+dup-side-left = 左
+dup-side-right = 右
+dup-badge-recommended = 推荐
+dup-badge-higher-res = 分辨率更高
+dup-badge-same-res = 分辨率相同
+dup-badge-larger = 文件更大
+dup-megapixels = { $mp } MP
+dup-file-size = { $mb } MB
+dup-mode-tooltip = 并排比较或用滑块叠加比较（S 键）

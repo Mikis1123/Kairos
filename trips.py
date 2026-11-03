@@ -42,6 +42,8 @@ import math
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
+import regions
+
 # i18n-ok: stored data markers (localized at display time by i18n.event_title)
 STORED_TRIP = "Výlet"  # i18n-ok: stored data marker
 STORED_UNKNOWN_PLACE = "Neznámé místo"  # i18n-ok: stored data marker
@@ -59,7 +61,8 @@ HOME_MIN_SHARE = 0.25
 HOME_MIN_SPAN_DAYS = 10                 # home recurs over weeks; a lodging is one block of nights
 STAY_MIN_NIGHTS = 2                     # a basecamp anchors at least two nights...
 STAY_MAX_GAP_NIGHTS = 2                 # ...with at most this many unevidenced nights in a row
-ALGO_VERSION = 3                        # bump -> existing libraries re-cluster once (ensure_current)
+ALGO_VERSION = 4                        # bump -> existing libraries re-cluster once (ensure_current)
+                                        # 4 = natural-region trip names (regions.py)
 AWAY_KM_MIN, AWAY_KM_MAX = 20.0, 60.0   # adaptive away radius bounds
 DRIVE_KMH = 90.0                        # "could they have driven here since dawn?"
 DAWN_H = 6.0
@@ -406,7 +409,24 @@ def hub_city(items, hub):
     return Counter(near).most_common(1)[0][0] if near else None
 
 
-def title_for(items, hub=None):
+def region_name(items):
+    """A natural region's name for a trip that spans a landscape (regions.py): several towns, a
+    real spread, and most GPS photos inside one range. None -> name the trip after a town."""
+    pts = [(it["lat"], it["lon"]) for it in items if _has_gps(it)]
+    cities = {it["city"] for it in items if it.get("city") and it["city"] != STORED_UNKNOWN_PLACE}
+    if len(pts) < 3 or len(cities) < regions.REGION_MIN_CITIES:
+        return None
+    clat = sum(p[0] for p in pts) / len(pts)
+    clon = sum(p[1] for p in pts) / len(pts)
+    if max(haversine_km(clat, clon, a, b) for a, b in pts) < regions.REGION_MIN_SPREAD_KM:
+        return None
+    hit = regions.classify(pts)
+    return hit[0] if hit else None
+
+
+def title_for(items, hub=None, regional=False):
+    """(stored title, location). regional=True (top-level trips, not day chapters): a trip across
+    a landscape is named after its natural region ("Šumava"), not its lodging village."""
     start, end = items[0]["dt"], items[-1]["dt"]
     if start.date() == end.date():
         label = start.strftime("%d. %m. %Y")
@@ -415,6 +435,9 @@ def title_for(items, hub=None):
     cities = [it["city"] for it in items if it.get("city") and it["city"] != STORED_UNKNOWN_PLACE]
     if not cities:
         return f"{STORED_TRIP} ({label})", STORED_UNKNOWN_PLACE
+    region = region_name(items) if regional else None
+    if region:
+        return f"{STORED_TRIP}: {region} ({label})", region
     dominant = hub_city(items, hub) or Counter(cities).most_common(1)[0][0]
     if len(set(cities)) > 1:
         return f"{STORED_TRIP}: {dominant} a okolí ({label})", dominant  # i18n-ok: stored title
@@ -496,7 +519,7 @@ def apply(conn, clusters):
     keep = set()
 
     def write(c, eid, parent_id):
-        title, location = title_for(c.items, c.hub)
+        title, location = title_for(c.items, c.hub, regional=parent_id is None)
         start, end = c.items[0]["dt"].strftime("%Y-%m-%d %H:%M"), c.items[-1]["dt"].strftime("%Y-%m-%d %H:%M")
         if eid is not None:
             cover = existing[eid][1]

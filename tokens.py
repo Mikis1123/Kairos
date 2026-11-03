@@ -653,6 +653,9 @@ QFrame#sheetCard {{
 }}
 QLabel#sheetTitle {{ {qss_font('headline')} color: {t['text']}; }}
 QLabel#sheetBody {{ color: {t['text_secondary']}; font-size: 13px; }}
+QFrame#panelCard {{
+    background-color: {t['bg_sunken']}; border: 1px solid {t['hairline_strong']}; border-radius: {RADIUS['lg']}px;
+}}
 """
 
 
@@ -662,6 +665,8 @@ QDialog {{ background-color: {t['bg_sunken']}; color: {t['text']}; font-family: 
 QWidget {{ font-family: "{ui_family()}"; }}
 QLabel {{ color: {t['text']}; font-size: 13px; background: transparent; }}
 QLabel#hint {{ color: {t['text_secondary']}; font-size: 12px; }}
+QDialog#settingsSheet {{ background: transparent; }}
+QLabel#sheetHeader {{ {qss_font('headline')} color: {t['text']}; padding-bottom: 2px; }}
 QLabel#impact {{ color: {t['warning_text']}; font-size: 12px; }}
 QLabel#groupTitle {{ color: {t['text_tertiary']}; font-size: 11px; font-weight: 600; padding: 12px 4px 2px 4px; }}
 QFrame#group {{ background-color: {t['surface']}; border: 1px solid {t['hairline']}; border-radius: {RADIUS['md']}px; }}

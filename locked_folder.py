@@ -413,6 +413,7 @@ class Vault:
 
     def seal_thumbnail(self, media_id, data):
         """Zašifruje JPEG miniatury. Zamčeno: klíč tiše z DPAPI (skrytí nic neodhaluje)."""
+        self._ensure_thumb_render_version()          # staré pečeti pryč dřív, než přibude nová
         with self._lock:
             aead = self._aead
         if aead is None:
@@ -422,11 +423,42 @@ class Vault:
                 key[i] = 0
         return self._seal_with(aead, media_id, data)
 
+    def _ensure_thumb_render_version(self):
+        """Zapečetěné miniatury jiné verze pipeline / jiného kontraktu barev (scanner.
+        thumb_version_tag) se smažou – vytvoří se znovu z originálu při dalším zobrazení.
+        Značka RENDER obsahuje jen číslo verze a otisk profilu displeje (nic soukromého)."""
+        try:
+            import scanner
+            tag = scanner.thumb_version_tag()          # levné; mění se i po změně v Předvolbách
+            if getattr(self, "_thumb_render_tag", None) == tag:
+                return
+            marker = os.path.join(self.thumb_dir, "RENDER")
+            try:
+                with open(marker, encoding="utf-8") as f:
+                    current = f.read().strip()
+            except OSError:
+                current = None
+            if current != tag and os.path.isdir(self.thumb_dir):
+                for e in os.scandir(self.thumb_dir):
+                    if e.name.endswith(".kvt"):
+                        try:
+                            os.remove(e.path)
+                        except OSError:
+                            pass
+            if current != tag:
+                os.makedirs(self.thumb_dir, exist_ok=True)
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write(tag)
+            self._thumb_render_tag = tag
+        except Exception:
+            pass
+
     def open_thumbnail(self, media_id):
         """Dešifrovaný JPEG, nebo None (chybí / poškozený). Zamčeno: VaultLocked."""
         aead = self._aead
         if aead is None:
             raise VaultLocked(tr("locked-error-locked"))
+        self._ensure_thumb_render_version()
         try:
             with open(self.thumb_path(media_id), "rb") as f:
                 blob = f.read()

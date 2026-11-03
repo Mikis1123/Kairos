@@ -22,6 +22,7 @@ import threading
 import time
 
 import paths
+import video_clap
 
 PROXY_EDGE = 1920
 PROXY_FPS = 30
@@ -129,7 +130,8 @@ def ffmpeg_cmd(source, target, info, threads=2, ffmpeg_path=None):
         vf.append(sdr_filter(info))
     vf.append("format=yuv420p")
     return [ffmpeg_path or paths.FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-threads", str(threads), "-hwaccel", "d3d11va", "-i", source,
+            "-threads", str(threads), "-hwaccel", "d3d11va",
+            *video_clap.ffmpeg_full_frame_args(ffmpeg_path or paths.FFMPEG_PATH), "-i", source,
             "-map", "0:v:0", "-map", "0:a:0?", "-vf", ",".join(vf),
             "-c:v", "libx264", "-preset", "veryfast", "-crf", str(PROXY_CRF),
             "-maxrate", PROXY_MAXRATE, "-bufsize", "12M", "-threads", str(threads),
@@ -195,8 +197,8 @@ def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=
             print(f"[Proxy] {os.path.basename(source)}: ffmpeg {proc.returncode} {' '.join(err)}")
             _touch(_marker_path(source))      # nepřevoditelné: nezkoušet při každém startu
         return False if cancelled else None
-    os.replace(tmp, target)
-    return target
+    import fs_atomic
+    return target if fs_atomic.replace(tmp, target) else None
 
 
 def _read_progress(stream, done_us):

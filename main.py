@@ -43,16 +43,17 @@ from PyQt6.QtWidgets import (
     QProgressBar, QStackedWidget, QComboBox, QButtonGroup, QLineEdit,
     QAbstractItemView, QInputDialog, QListView, QStyledItemDelegate,
     QStyleOptionViewItem, QStyle, QSlider, QFrame, QDialog, QScrollArea,
-    QMenu, QMessageBox, QSizePolicy, QLayout,
+    QMenu, QMessageBox, QSizePolicy, QLayout, QGraphicsDropShadowEffect,
 )
 from PyQt6.QtCore import (
     Qt, QSize, QObject, pyqtSlot, QTimer, QThread, pyqtSignal,
     QUrl, QRect, QRectF, QCoreApplication, QAbstractListModel,
-    QModelIndex, QThreadPool, QRunnable, QPoint, QPointF, QEvent,
+    QModelIndex, QThreadPool, QRunnable, QPoint, QPointF, QEvent, QSizeF,
 )
 from PyQt6.QtGui import (
     QIcon, QPixmap, QImage, QFont, QPainter, QColor, QKeyEvent,
-    QPainterPath, QLinearGradient, QPen, QKeySequence, QShortcut, QCursor, QImageReader,
+    QPainterPath, QLinearGradient, QRadialGradient, QPen, QKeySequence, QShortcut, QCursor, QImageReader,
+    QImageIOHandler, QPolygonF,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
@@ -95,6 +96,7 @@ import preview_cache
 import theme
 import tokens
 import motion
+import ui_controls
 import kinetic_scroll
 from ui_controls import (ActivityStatus, EmptyState, HintPill, KButton, MenuSelect, NavItem, NavSection,
                          SegmentedControl, SidebarNav, pin_overlay,
@@ -144,6 +146,8 @@ try:
     pillow_heif.register_heif_opener()
 except ImportError:
     pass
+import raw_decode  # noqa: E402  ProRAW / camera RAW through every Image.open (raw_decode.py)
+raw_decode.register()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -239,6 +243,7 @@ def create_media_viewer(records, index=0, parent=None):
     (NavigationController) a „‹ Zpět“ / Esc vrací do mřížky na stejné místo."""
     viewer = MediaViewerWidget(parent)
     viewer.web_profile_factory = map_web_profile   # minimapa sdílí diskovou cache dlaždic s mapou
+    viewer.page_setup = attach_tile_store          # Founder audit: minimapa přes stejné úložiště dlaždic
     records = list(records)
     viewer.set_media_data(records, index)
     return viewer
@@ -442,6 +447,19 @@ def install_tile_store(page, budget_mb=tile_store.DEFAULT_BUDGET_MB):
     srv = tile_store.start(budget_mb)
     if srv is None:
         return None
+    return _inject_tile_store(page, srv)
+
+
+def attach_tile_store(page):
+    """Minimapa prohlížeče: připojí se k už běžícímu úložišti (nemění jeho rozpočet);
+    když neběží (mapa se v této relaci neotevřela), spustí ho s rozpočtem z Předvoleb."""
+    srv = tile_store.service()
+    if srv is None:
+        srv = tile_store.start(int(load_config().get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
+    return _inject_tile_store(page, srv) if srv is not None else None
+
+
+def _inject_tile_store(page, srv):
     script = QWebEngineScript()
     script.setName("kairos-tile-store")
     script.setSourceCode(f"window.TILE_STORE_CONFIG = {json.dumps(srv.config())};")
@@ -526,6 +544,8 @@ THUMB_UNAVAILABLE = "unavailable"     # soubor je, ale náhled se nepodařilo na
 # berou jen v rozlišení, které dlaždice potřebuje (kratší strana ve fyzických px) – hustá
 # mřížka (14 sloupců) tak nedrží 4 MB na dlaždici, velké dlaždice (3 sloupce) nejsou rozmazané.
 THUMB_TIERS = (256, 512, 840)
+DECODE_THREADS_REST = 4               # thumbnail decoders while the grid rests
+DECODE_THREADS_FLING = 2              # ...and while it glides (the GUI thread keeps its frame budget)
 
 
 def thumb_tier(cell_px_physical):
@@ -535,13 +555,9 @@ def thumb_tier(cell_px_physical):
 
 
 def _shrink_short_edge(img, short):
-    """QImage zmenšený tak, aby kratší strana byla `short` (menší se nezvětšuje)."""
-    w, h = img.width(), img.height()
-    if min(w, h) <= short:
-        return img
-    k = short / float(min(w, h))
-    return img.scaled(max(1, round(w * k)), max(1, round(h * k)), Qt.AspectRatioMode.IgnoreAspectRatio,
-                      Qt.TransformationMode.SmoothTransformation)
+    """QImage zmenšený (Lanczos3, imaging) tak, aby kratší strana byla `short` (menší se nezvětšuje)."""
+    import imaging
+    return imaging.shrink_qimage_short_edge(img, short)
 
 
 class ThumbnailWorkerSignals(QObject):
@@ -554,13 +570,15 @@ class ThumbnailWorker(QRunnable):
     """Načte náhled mimo GUI vlákno. Pracuje jen s QImage (QPixmap mimo GUI vlákno
     není bezpečný); na QPixmap ho převede až model v hlavním vlákně."""
 
-    def __init__(self, item_id: int, thumb_path: str, fallback_path: str = None, tier: int = 512):
+    def __init__(self, item_id: int, thumb_path: str, fallback_path: str = None, tier: int = 512, signals=None):
         super().__init__()
         self.item_id = item_id
         self.thumb_path = thumb_path
         self.fallback_path = fallback_path
         self.tier = int(tier)
-        self.signals = ThumbnailWorkerSignals()
+        # the model hands every worker ONE shared signals object (connected once): a QObject plus
+        # three connects per tile cost ~0.3 ms of GUI time per request during a fling
+        self.signals = signals if signals is not None else ThumbnailWorkerSignals()
         self.started_ids = None     # Gate 2 A: model's set of dequeued ids (stale-queue cancel)
         self._source_short = None   # true short edge of the decoded source (before scaled decode)
         self.setAutoDelete(True)
@@ -585,21 +603,29 @@ class ThumbnailWorker(QRunnable):
         self.signals.loaded.emit(self.item_id, _shrink_short_edge(img, self.tier))
 
     def _load(self, path):
-        ext = os.path.splitext(path)[1].lower()
-        if ext in {".heic", ".dng"}:
+        import color_manage
+        import imaging
+        if not color_manage.is_cache_file(path):
+            # záložně originál (miniatura chybí): stejná pipeline jako miniatury (imaging),
+            # dekódovaná rovnou v DCT na ≥ 2× dlaždici
             try:
-                import color_manage
-                from PIL import Image, ImageOps
-                with Image.open(path) as img:
-                    icc = color_manage.source_profile(img)
-                    img = ImageOps.exif_transpose(img)
-                    img.thumbnail((self.tier * 2, self.tier * 2))
-                    img = color_manage.pil_to_output(img.convert("RGB"), icc)
-                    w, h = img.size
-                    return QImage(img.tobytes("raw", "RGB"), w, h, w * 3,
-                                  QImage.Format.Format_RGB888).copy()
+                dec = imaging.open_oriented(path, need_long=self.tier * 3)
+                self._source_short = min(dec.full_size)
+                img = dec.image
+                target = imaging.fit_short_edge(*img.size, self.tier)
+                if target != img.size:
+                    img = imaging.sharpen_luma(imaging.resample(img, target), *imaging.SHARPEN_THUMB)
+                return imaging.pil_to_qimage(imaging.to_display(img, dec.icc))
             except Exception:
                 pass
+        else:
+            # miniatura z cache: celé dekódování (840 px, ~3 ms) a zmenšení Lanczos v tomto
+            # vlákně – škálované čtení QImageReaderu by zmenšovalo hrubším filtrem Qt
+            reader = QImageReader(path)
+            img = reader.read()
+            if not img.isNull():
+                self._source_short = min(img.width(), img.height())
+                return img
         reader = QImageReader(path)
         reader.setAutoTransform(True)
         # Gate 2 A: decode straight at the tier (JPEG scales in the DCT - far cheaper than a
@@ -612,10 +638,8 @@ class ThumbnailWorker(QRunnable):
                 k = self.tier / short
                 reader.setScaledSize(QSize(max(1, round(src.width() * k)), max(1, round(src.height() * k))))
         img = reader.read()
-        if not img.isNull():
-            import color_manage
-            if not color_manage.is_cache_file(path):     # záložně originál: do profilu displeje
-                img = color_manage.qimage_to_output(img)
+        if not img.isNull() and not color_manage.is_cache_file(path):
+            img = color_manage.qimage_to_output(img)     # záložně originál: kontrakt displeje
         return img
 
 
@@ -623,8 +647,8 @@ class VaultThumbnailWorker(ThumbnailWorker):
     """Miniatura položky ze složky Skryté: dešifruje se z trezoru (locked_folder) jen do RAM;
     chybí-li, vytvoří se v paměti z originálu a rovnou zašifruje. Zamčeno = žádný obraz."""
 
-    def __init__(self, item_id, rec, tier, vault):
-        super().__init__(item_id, None, rec[2], tier)
+    def __init__(self, item_id, rec, tier, vault, signals=None):
+        super().__init__(item_id, None, rec[2], tier, signals)
         self.media_type, self.paired = rec[3], rec[4]
         self.vault = vault
 
@@ -662,7 +686,11 @@ class ApplePhotoModel(QAbstractListModel):
         self.id_to_row = {}
         self.ram_cache = LRUCache(lru_capacity, max_bytes=THUMB_RAM_BUDGET_MB * 1024 * 1024, sizer=pixmap_bytes)
         self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(4)
+        self.thread_pool.setMaxThreadCount(DECODE_THREADS_REST)
+        self._signals = ThumbnailWorkerSignals(self)     # shared by every worker (one set of connects)
+        self._signals.source_short.connect(self._on_source_short)
+        self._signals.loaded.connect(self._on_thumb_loaded)
+        self._signals.failed.connect(self._on_thumb_failed)
         self.loading_ids = set()
         self.failed = {}          # item_id -> THUMB_MISSING_FILE | THUMB_UNAVAILABLE
         self._meta = {}           # řádek -> slovník MetaRole (delegát ho čte při každém snímku)
@@ -682,6 +710,10 @@ class ApplePhotoModel(QAbstractListModel):
         if fast == self.fast:
             return False
         self.fast = fast
+        # measured (eval/bench_massive_scale.py, 2 000 items, fling): with 4 decode threads the GUI
+        # thread's paint took 6.4 ms (CPU + GIL contention), with 2 threads 4.3 ms. Glide with 2,
+        # settle with 4.
+        self.thread_pool.setMaxThreadCount(DECODE_THREADS_FLING if fast else DECODE_THREADS_REST)
         if not fast:
             self.cancel_stale()
         return True
@@ -710,14 +742,11 @@ class ApplePhotoModel(QAbstractListModel):
         tier = min(self.tier, THUMB_TIERS[0]) if self.fast else self.tier
         if self.vault is not None:
             self._vault_ids.add(item_id)
-            w = VaultThumbnailWorker(item_id, rec, tier, self.vault)
+            w = VaultThumbnailWorker(item_id, rec, tier, self.vault, self._signals)
         else:
-            w = ThumbnailWorker(item_id, rec[5], rec[2], tier)
+            w = ThumbnailWorker(item_id, rec[5], rec[2], tier, self._signals)
         w.started_ids = self._started
         self._queued.add(item_id)
-        w.signals.source_short.connect(self._on_source_short)
-        w.signals.loaded.connect(self._on_thumb_loaded)
-        w.signals.failed.connect(self._on_thumb_failed)
         self.thread_pool.start(w)
 
     def _on_source_short(self, item_id: int, short: int):
@@ -875,6 +904,9 @@ def paint_media_glyph(p, rect, is_video=False, crossed=False):
     p.restore()
 
 
+BADGE_D = 20.0                            # průměr skleněného kroužku ikony Live / video
+BADGE_INSET = 6.0
+BADGE_GLASS_ALPHA = 92
 TILE_CACHE_BYTES = 64 * 1024 * 1024       # hotové dlaždice mřížky (~500 dlaždic 180 px)
 
 
@@ -926,36 +958,45 @@ class ApplePhotoDelegate(QStyledItemDelegate):
 
     @staticmethod
     def _paint_badge_shade(painter, frame, meta):
-        if meta.get("type") in ("live_photo", "video") or meta.get("is_fav"):
-            grad = QLinearGradient(0, frame.top(), 0, frame.top() + 40)
-            grad.setColorAt(0.0, QColor(0, 0, 0, 90))
+        """Jen jemné ztmavení tam, kde leží ikona (roh vpravo nahoře / srdce vlevo dole) – žádný
+        pruh přes celou šířku dlaždice."""
+        if meta.get("type") in ("live_photo", "video") and frame.width() >= 64:
+            c = QPointF(frame.right() - BADGE_INSET - BADGE_D / 2, frame.top() + BADGE_INSET + BADGE_D / 2)
+            grad = QRadialGradient(c, BADGE_D * 1.6)
+            grad.setColorAt(0.0, QColor(0, 0, 0, 46))
             grad.setColorAt(1.0, QColor(0, 0, 0, 0))
-            painter.fillRect(QRectF(frame.left(), frame.top(), frame.width(), 40), grad)
+            painter.fillRect(QRectF(c.x() - BADGE_D * 1.6, frame.top(), BADGE_D * 3.2, BADGE_D * 3.2) & frame, grad)
+        if meta.get("is_fav"):
             grad = QLinearGradient(0, frame.bottom() - 36, 0, frame.bottom())
             grad.setColorAt(0.0, QColor(0, 0, 0, 0))
-            grad.setColorAt(1.0, QColor(0, 0, 0, 70 if meta.get("is_fav") else 0))
+            grad.setColorAt(1.0, QColor(0, 0, 0, 70))
             painter.fillRect(QRectF(frame.left(), frame.bottom() - 36, frame.width(), 36), grad)
 
     @staticmethod
+    def badge_rect(frame):
+        """Skleněný kroužek ikony Live / video v pravém horním rohu dlaždice (logické px)."""
+        return QRectF(frame.right() - BADGE_INSET - BADGE_D, frame.top() + BADGE_INSET, BADGE_D, BADGE_D)
+
+    @staticmethod
     def _paint_badges(painter, frame, meta):
-        """Odznak LIVE / VIDEO vlevo nahoře a srdce oblíbené vlevo dole."""
+        """Founder audit: místo textových štítků LIVE / VIDEO tichá skleněná mikro-ikona v rohu
+        (soustředné kruhy = Live Photo, trojúhelník = video) a srdce oblíbené vlevo dole."""
         white = QColor("#FFFFFF")
         m_type = meta.get("type")
         if m_type in ("live_photo", "video") and frame.width() >= 64:
-            label, icon = ("LIVE", "live") if m_type == "live_photo" else ("VIDEO", "play_fill")
-            f = QFont(tokens.ui_family())
-            f.setPixelSize(10)
-            f.setWeight(QFont.Weight.DemiBold)
-            f.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 106)
-            painter.setFont(f)
-            tw = painter.fontMetrics().horizontalAdvance(label)
-            badge = QRectF(frame.left() + 7, frame.top() + 7, tw + 26, 19)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(12, 12, 14, 130))
-            painter.drawRoundedRect(badge, 6, 6)
-            icons.paint(painter, icon, QRectF(badge.left() + 5, badge.top() + 3.5, 12, 12), white)
-            painter.setPen(white)
-            painter.drawText(badge.adjusted(20, 0, 0, 0), Qt.AlignmentFlag.AlignVCenter, label)
+            disc = ApplePhotoDelegate.badge_rect(frame)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setBrush(QColor(20, 20, 24, BADGE_GLASS_ALPHA))      # „sklo“ nad fotkou
+            painter.setPen(QPen(QColor(255, 255, 255, 64), 0.8))            # vlasová hrana
+            painter.drawEllipse(disc)
+            inner = disc.adjusted(4.5, 4.5, -4.5, -4.5)
+            if m_type == "video":
+                play = disc.adjusted(3.5, 3.5, -3.5, -3.5).translated(0.7, 0)    # opticky na střed
+                icons.paint(painter, "play_fill", play, QColor(255, 255, 255, 240))
+            else:
+                icons.paint(painter, "live", inner, QColor(255, 255, 255, 240))
+            painter.restore()
         if meta.get("is_fav") and frame.width() >= 48:
             icons.paint(painter, "heart_fill", QRectF(frame.left() + 7, frame.bottom() - 23, 16, 16), white)
 
@@ -1224,10 +1265,14 @@ _SCROLL_SWALLOWED_EVENTS = (QEvent.Type.HoverMove, QEvent.Type.HoverEnter, QEven
 class AppleGridView(QListView):
     item_activated = pyqtSignal(int)
     zoom_changed = pyqtSignal(int)          # nová velikost dlaždice (px) po Ctrl + kolečku / gestu
+    # Founder audit: první „hotový“ snímek – všechny viditelné dlaždice mají náhled (nebo trvale
+    # selhaly), případně je knihovna prázdná. Splash do té doby drží obraz a pak se prolne.
+    firstFrameRendered = pyqtSignal()
 
     def __init__(self, main_window, parent=None):
         super().__init__(parent)
         self.main_window = main_window
+        self._first_frame_pending = True
         self.setViewMode(QListView.ViewMode.IconMode)
         self.setResizeMode(QListView.ResizeMode.Adjust)
         self.setMovement(QListView.Movement.Static)
@@ -1464,6 +1509,29 @@ class AppleGridView(QListView):
         else:
             super().paintEvent(event)
         frame_meter.tick("grid")            # Fáze 0: doba snímku mřížky (Ctrl+Shift+F)
+        if self._first_frame_pending and self.visible_tiles_ready():
+            self._first_frame_pending = False
+            QTimer.singleShot(0, self.firstFrameRendered.emit)     # až po dokončení tohoto snímku
+
+    def visible_tiles_ready(self, cap=240):
+        """True, když žádná viditelná dlaždice už nečeká na náhled (prázdná mřížka = hotovo)."""
+        model = self.model()
+        if model is None or model.rowCount() == 0:
+            return True
+        vp = self.viewport().rect()
+        first = self.indexAt(QPoint(vp.left() + 6, vp.top() + 6))
+        row = first.row() if first.isValid() else 0
+        for _ in range(cap):
+            if row >= model.rowCount():
+                break
+            idx = model.index(row, 0)
+            r = self.visualRect(idx)
+            if r.top() > vp.bottom():
+                break
+            if r.intersects(vp) and model.data(idx, ApplePhotoModel.StateRole) == THUMB_LOADING:
+                return False
+            row += 1
+        return True
 
     def _paint_frozen(self):
         """Klidové dlaždice (z cache delegáta) škálované do mezilehlých obdélníků: žádné
@@ -1740,8 +1808,8 @@ def _load_avatar_image(path, px):
         return QImage()
     side = min(src.width(), src.height())
     src = src.copy((src.width() - side) // 2, (src.height() - side) // 2, side, side)
-    src = src.scaled(px, px, Qt.AspectRatioMode.IgnoreAspectRatio,
-                     Qt.TransformationMode.SmoothTransformation)
+    import imaging
+    src = imaging.scale_qimage(src, px, px)              # Lanczos3, ne bilineární Qt
     out = QImage(px, px, QImage.Format.Format_ARGB32_Premultiplied)
     out.fill(Qt.GlobalColor.transparent)
     p = QPainter(out)
@@ -2078,66 +2146,11 @@ class MergeSuggestionBar(QFrame):
         self._show_current()
 
 
-class FlowLayout(QLayout):
-    """Řadí položky zleva doprava a zalamuje je podle dostupné šířky (responzivní mřížka)."""
+class FlowLayout(ui_controls.FlowLayout):
+    """Responzivní mřížka karet osob (ui_controls.FlowLayout s rozestupem mřížky osob)."""
 
     def __init__(self, parent=None, spacing=PERSON_GRID_SPACING):
-        super().__init__(parent)
-        self._items = []
-        self._spacing = spacing
-
-    def addItem(self, item):
-        self._items.append(item)
-
-    def count(self):
-        return len(self._items)
-
-    def itemAt(self, index):
-        return self._items[index] if 0 <= index < len(self._items) else None
-
-    def takeAt(self, index):
-        return self._items.pop(index) if 0 <= index < len(self._items) else None
-
-    def expandingDirections(self):
-        return Qt.Orientation(0)
-
-    def hasHeightForWidth(self):
-        return True
-
-    def heightForWidth(self, width):
-        return self._do_layout(QRect(0, 0, width, 0), apply=False)
-
-    def setGeometry(self, rect):
-        super().setGeometry(rect)
-        self._do_layout(rect, apply=True)
-
-    def sizeHint(self):
-        return self.minimumSize()
-
-    def minimumSize(self):
-        size = QSize()
-        for item in self._items:
-            size = size.expandedTo(item.minimumSize())
-        m = self.contentsMargins()
-        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
-
-    def _do_layout(self, rect, apply):
-        m = self.contentsMargins()
-        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
-        x, y, line_h = area.x(), area.y(), 0
-        for item in self._items:
-            if item.isEmpty():          # skrytý widget (filtr vyhledávání)
-                continue
-            hint = item.sizeHint()
-            if line_h and x + hint.width() > area.right() + 1:
-                x = area.x()
-                y += line_h + self._spacing
-                line_h = 0
-            if apply:
-                item.setGeometry(QRect(QPoint(x, y), hint))
-            x += hint.width() + self._spacing
-            line_h = max(line_h, hint.height())
-        return y + line_h - rect.y() + m.bottom()
+        super().__init__(parent, spacing)
 
 
 def create_event_card(cover_thumb_path, title, date_str, item_count, target_w=290, target_h=215):
@@ -2392,6 +2405,13 @@ class MapBridge(QObject):
         """Gate 2 C: the Journey started -> route its legs along real roads in the background."""
         if hasattr(self.main_window, "route_journey"):
             QTimer.singleShot(0, lambda: self.main_window.route_journey(int(journey_id), str(tile_template or "")))
+
+    @pyqtSlot(int, int, str)
+    def routeJourneyDay(self, journey_id, day, tile_template):
+        """A single day of a multi-day Journey started: route that day's legs (day -1 = whole)."""
+        if hasattr(self.main_window, "route_journey"):
+            QTimer.singleShot(0, lambda: self.main_window.route_journey(
+                int(journey_id), str(tile_template or ""), day=int(day)))
 
     @pyqtSlot()
     def journeyClosed(self):
@@ -2669,6 +2689,8 @@ class BackgroundAIDaemon(QThread):
         """Náhledy v rozlišení displeje a plakáty videí na pozadí, v pořadí podle užitku: kandidáti duplicit,
         obálky událostí, pak celá knihovna od nejnovějších. Nakonec LRU úklid na rozpočet."""
         try:
+            import imaging
+            imaging.purge_retired_caches()                  # tónové křivky Live, značky přebarvení
             removed = preview_cache.sweep_legacy()          # Stage 2: náhledy staré verze / profilu
             if removed:
                 print(f"[Previews] smazáno {removed} náhledů staré verze")
@@ -2707,8 +2729,12 @@ class BackgroundAIDaemon(QThread):
         try:
             self._status(tr("status-checking-face-crops"), force=True)
             fixed = face_engine.repair_stretched_face_crops(should_stop=self._yield)
-            if self._running:
-                fixed += face_engine.recolor_face_crops(should_stop=self._yield)   # Stage 2: barvy
+            if self._running:                      # pipeline ořezů / kontrakt barev se změnil
+                fixed += face_engine.rerender_face_crops(should_stop=self._yield)
+            if self._running:                      # samoléčení: chybějící ořezy z videí
+                fixed += face_engine.restore_missing_video_face_crops(should_stop=self._yield)
+            if self._running:                      # jen když DB a složka k sobě patří (pojistka)
+                face_engine.purge_orphan_face_files()
             if fixed and self._running:
                 self.face_crops_repaired.emit(fixed)
         except Exception as e:
@@ -2877,10 +2903,13 @@ class BackgroundAIDaemon(QThread):
 # ── Kontroly (duplicity, hraniční obličeje) jako stránky v okně ───────────────
 
 class ScaledImageLabel(QLabel):
-    """Obrázek přizpůsobený velikosti štítku (celoplošné stránky místo pevných 280 px)."""
+    """Obrázek přizpůsobený velikosti štítku (celoplošné stránky místo pevných 280 px).
+    radius > 0 = obraz se kreslí se zaoblenými rohy (karty duplicit)."""
+    source_changed = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, radius=0):
         super().__init__(parent)
+        self.radius = radius
         self._source = QPixmap()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(200, 200)
@@ -2891,10 +2920,31 @@ class ScaledImageLabel(QLabel):
         if self._source.isNull():
             self.setPixmap(QPixmap())
         self._rescale()
+        self.source_changed.emit()
+
+    def source(self):
+        return self._source
 
     def setText(self, text):
         self._source = QPixmap()
         super().setText(text)
+        self.source_changed.emit()
+
+    def paintEvent(self, event):
+        pix = self.pixmap()
+        if self.radius <= 0 or pix is None or pix.isNull():
+            return super().paintEvent(event)
+        size = pix.deviceIndependentSize()
+        r = QRectF((self.width() - size.width()) / 2, (self.height() - size.height()) / 2,
+                   size.width(), size.height())
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        clip = QPainterPath()
+        clip.addRoundedRect(r, self.radius, self.radius)
+        p.setClipPath(clip)
+        p.drawPixmap(r, pix, QRectF(pix.rect()))
+        p.end()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2909,6 +2959,236 @@ class ScaledImageLabel(QLabel):
                                      Qt.TransformationMode.SmoothTransformation)
         scaled.setDevicePixelRatio(dpr)
         super().setPixmap(scaled)
+
+
+class SplitCompare(QWidget):
+    """Founder audit: porovnání duplicit posuvníkem – obě fotky přes sebe ve stejném výřezu,
+    vlevo od dělítka levá, vpravo pravá. Tažení / klik posune dělítko (i za letu ostré –
+    škálované snímky se drží v mezipaměti podle velikosti)."""
+    HANDLE = 30
+
+    def __init__(self, label_a, label_b, parent=None):
+        super().__init__(parent)
+        self.a, self.b = label_a, label_b
+        self.split = 0.5
+        self._scaled = {}
+        self.setMinimumSize(200, 200)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.SplitHCursor)
+        for lbl in (label_a, label_b):
+            lbl.source_changed.connect(self._invalidate)
+        self.tag_a = tr("dup-side-left")
+        self.tag_b = tr("dup-side-right")
+
+    def _invalidate(self):
+        self._scaled.clear()
+        self.update()
+
+    def image_rect(self):
+        """Společný výřez: poměr stran levé fotky (duplicity mají stejný záběr)."""
+        src = self.a.source() if not self.a.source().isNull() else self.b.source()
+        if src.isNull():
+            return QRectF(self.rect())
+        size = QSizeF(src.size()).scaled(QSizeF(self.size()), Qt.AspectRatioMode.KeepAspectRatio)
+        return QRectF((self.width() - size.width()) / 2, (self.height() - size.height()) / 2,
+                      size.width(), size.height())
+
+    def _fitted(self, key, src, rect):
+        if src.isNull():
+            return None
+        dpr = self.devicePixelRatioF()
+        k = (key, src.cacheKey(), round(rect.width()), round(rect.height()), dpr)
+        pm = self._scaled.get(k)
+        if pm is None:
+            pm = src.scaled(QSize(round(rect.width() * dpr), round(rect.height() * dpr)),
+                            Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            pm.setDevicePixelRatio(dpr)
+            self._scaled = {kk: v for kk, v in self._scaled.items() if kk[0] != key}
+            self._scaled[k] = pm
+        return pm
+
+    def set_split(self, v):
+        self.split = max(0.0, min(1.0, float(v)))
+        self.update()
+
+    def _from_pos(self, x):
+        r = self.image_rect()
+        if r.width() > 0:
+            self.set_split((x - r.left()) / r.width())
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._from_pos(e.position().x())
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.MouseButton.LeftButton:
+            self._from_pos(e.position().x())
+        e.accept()
+
+    def paintEvent(self, _):
+        t = tokens.palette()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = self.image_rect()
+        clip = QPainterPath()
+        clip.addRoundedRect(r, 12, 12)
+        p.setClipPath(clip)
+        p.fillRect(r, tokens.qcolor(t["surface_2"]))
+        x = r.left() + r.width() * self.split
+        pa = self._fitted("a", self.a.source(), r)
+        pb = self._fitted("b", self.b.source(), r)
+        if pa is not None:
+            p.save()
+            p.setClipRect(QRectF(r.left(), r.top(), x - r.left(), r.height()), Qt.ClipOperation.IntersectClip)
+            p.drawPixmap(r.topLeft(), pa)
+            p.restore()
+        if pb is not None:
+            p.save()
+            p.setClipRect(QRectF(x, r.top(), r.right() - x, r.height()), Qt.ClipOperation.IntersectClip)
+            p.drawPixmap(r.topLeft(), pb)
+            p.restore()
+        # štítky stran
+        f = QFont(tokens.ui_family())
+        f.setPixelSize(11)
+        f.setWeight(QFont.Weight.DemiBold)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        for text, left in ((self.tag_a, True), (self.tag_b, False)):
+            w = fm.horizontalAdvance(text) + 16
+            pill = QRectF(r.left() + 10 if left else r.right() - 10 - w, r.top() + 10, w, 20)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(12, 12, 14, 150))
+            p.drawRoundedRect(pill, 10, 10)
+            p.setPen(QColor("#FFFFFF"))
+            p.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
+        p.setClipping(False)
+        # dělítko s úchytem
+        p.setPen(QPen(QColor(255, 255, 255, 235), 2))
+        p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+        h = QRectF(x - self.HANDLE / 2, r.center().y() - self.HANDLE / 2, self.HANDLE, self.HANDLE)
+        p.setPen(QPen(QColor(0, 0, 0, 40), 1))
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawEllipse(h)
+        p.setPen(QPen(QColor("#1C1C1E"), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                      Qt.PenJoinStyle.RoundJoin))
+        c = h.center()
+        for d in (-1, 1):
+            p.drawPolyline(QPolygonF([QPointF(c.x() + d * 3, c.y() - 4.5), QPointF(c.x() + d * 7.5, c.y()),
+                                      QPointF(c.x() + d * 3, c.y() + 4.5)]))
+        p.end()
+
+
+def _badge(text, kind="neutral"):
+    """Štítek srovnání kvality (accent = lepší hodnota / doporučeno, neutral = údaj)."""
+    t = tokens.palette()
+    lbl = QLabel(text)
+    lbl.setObjectName("dupBadge")
+    lbl.setProperty("kind", kind)
+    if kind == "accent":
+        fg, bg, border = t["accent"], t["accent_soft"], "transparent"
+    elif kind == "good":
+        fg, bg, border = t["text"], t["surface_2"], t["hairline_strong"]
+    else:
+        fg, bg, border = t["text_secondary"], "transparent", t["hairline_strong"]
+    lbl.setStyleSheet(f"QLabel#dupBadge {{ color:{fg}; background:{bg}; border:1px solid {border}; "
+                      f"border-radius:9px; padding:1px 8px; font-size:11px; font-weight:600; }}")
+    return lbl
+
+
+def media_facts(path, file_size=None):
+    """(šířka, výška, bajty, PŘÍPONA) z hlavičky souboru – bez dekódování obrazu. Chybějící = None."""
+    w = h = None
+    if path and os.path.exists(path):
+        try:
+            reader = QImageReader(path)
+            size = reader.size()
+            if size.isValid():
+                w, h = size.width(), size.height()
+                if reader.transformation() & QImageIOHandler.Transformation.TransformationRotate90:
+                    w, h = h, w
+        except Exception:
+            pass
+        if w is None:
+            try:
+                from PIL import Image as _PIL
+                with _PIL.open(path) as im:
+                    w, h = im.size
+            except Exception:
+                pass
+        if file_size is None:
+            try:
+                file_size = os.path.getsize(path)
+            except OSError:
+                file_size = None
+    ext = os.path.splitext(path or "")[1].lstrip(".").upper() or None
+    return w, h, file_size, ext
+
+
+def compare_facts(fa, fb):
+    """Které straně patří štítky „vyšší rozlišení“ / „větší soubor“: {'a': [...], 'b': [...]}."""
+    out = {"a": [], "b": []}
+    pa = (fa[0] or 0) * (fa[1] or 0)
+    pb = (fb[0] or 0) * (fb[1] or 0)
+    if pa and pb:
+        if pa > pb * 1.01:
+            out["a"].append("res")
+        elif pb > pa * 1.01:
+            out["b"].append("res")
+        else:
+            out["a"].append("same_res")
+            out["b"].append("same_res")
+    sa, sb = fa[2] or 0, fb[2] or 0
+    if sa and sb and abs(sa - sb) > 0.03 * max(sa, sb):
+        out["a" if sa > sb else "b"].append("size")
+    return out
+
+
+class CandidateCard(QFrame):
+    """Vyvýšená zaoblená karta kandidáta: štítky nahoře, fotka, pod ní název a údaje."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("dupCard")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        t = tokens.palette()
+        self.setStyleSheet(f"QFrame#dupCard {{ background:{t['surface']}; border:1px solid {t['hairline']}; "
+                           f"border-radius:{tokens.RADIUS['lg']}px; }}")
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 70 if theme.current() == "dark" else 38))
+        self.setGraphicsEffect(shadow)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+        badge_row = QWidget()
+        badge_row.setFixedHeight(22)              # i bez štítků stejná výška -> fotky obou karet zarovnané
+        badge_row.setStyleSheet("background:transparent; border:none;")
+        self.badges = QHBoxLayout(badge_row)
+        self.badges.setSpacing(6)
+        self.badges.setContentsMargins(2, 0, 2, 0)
+        lay.addWidget(badge_row)
+        self.image = ScaledImageLabel(radius=10)
+        self.image.setStyleSheet("background:transparent; border:none;")
+        lay.addWidget(self.image, 1)
+        self.name = QLabel()
+        self.name.setFont(tokens.font("headline"))
+        self.name.setStyleSheet(f"color:{t['text']}; background:transparent; border:none;")
+        self.facts = QLabel()
+        self.facts.setFont(tokens.font("callout"))
+        self.facts.setStyleSheet(f"color:{t['text_secondary']}; background:transparent; border:none;")
+        lay.addWidget(self.name)
+        lay.addWidget(self.facts)
+
+    def set_badges(self, badges):
+        while self.badges.count():
+            item = self.badges.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for text, kind in badges:
+            self.badges.addWidget(_badge(text, kind))
+        self.badges.addStretch(1)
 
 
 REVIEW_IMAGE_MIN_EDGE = 1600     # porovnání duplicit: ostrý obraz i na velkém / HiDPI displeji
@@ -2995,27 +3275,31 @@ class DuplicateReviewView(ReviewView):
         root = QVBoxLayout(self)
         root.setContentsMargins(*self.MARGINS)
         root.setSpacing(16)
-        self.lbl_title = self._review_label("headline", "text")
-        root.addWidget(self.lbl_title)
-        img_row = QHBoxLayout()
-        img_row.setSpacing(20)
-        self.lbl_a = ScaledImageLabel()
-        self.lbl_a.setStyleSheet(self._media_well_style())
-        self.lbl_b = ScaledImageLabel()
-        self.lbl_b.setStyleSheet(self._media_well_style())
-        left_col = QVBoxLayout()
-        left_col.setSpacing(8)
-        self.lbl_info_a = self._review_label("callout", "text_secondary")
-        left_col.addWidget(self.lbl_a, 1)
-        left_col.addWidget(self.lbl_info_a)
-        right_col = QVBoxLayout()
-        right_col.setSpacing(8)
-        self.lbl_info_b = self._review_label("callout", "text_secondary")
-        right_col.addWidget(self.lbl_b, 1)
-        right_col.addWidget(self.lbl_info_b)
-        img_row.addLayout(left_col)
-        img_row.addLayout(right_col)
-        root.addLayout(img_row, 1)
+        head = QHBoxLayout()
+        self.lbl_title = self._review_label("headline", "text", Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        head.addWidget(self.lbl_title, 1)
+        # Founder audit: vedle sebe (karty) / posuvník (obě fotky přes sebe)
+        self.mode_switch = SegmentedControl([(tr("dup-mode-side"), "side"), (tr("dup-mode-split"), "split")],
+                                            current="side")
+        self.mode_switch.changed.connect(self.set_mode)
+        self.mode_switch.setToolTip(tr("dup-mode-tooltip"))
+        head.addWidget(self.mode_switch, 0, Qt.AlignmentFlag.AlignRight)
+        root.addLayout(head)
+        self.card_a = CandidateCard()
+        self.card_b = CandidateCard()
+        self.lbl_a, self.lbl_b = self.card_a.image, self.card_b.image
+        self.lbl_info_a, self.lbl_info_b = self.card_a.name, self.card_b.name
+        side = QWidget()
+        img_row = QHBoxLayout(side)
+        img_row.setContentsMargins(6, 4, 6, 10)        # místo pro stín karet
+        img_row.setSpacing(24)
+        img_row.addWidget(self.card_a, 1)
+        img_row.addWidget(self.card_b, 1)
+        self.split_view = SplitCompare(self.lbl_a, self.lbl_b)
+        self.compare_stack = QStackedWidget()
+        self.compare_stack.addWidget(side)
+        self.compare_stack.addWidget(self.split_view)
+        root.addWidget(self.compare_stack, 1)
         # Doporučené ponechání (A = nejostřejší) je jediná plná akce; ostatní tlumené sklo
         self.btn_keep_a = self._review_button(tr("duplicates-keep-left"), "primary", tr("duplicates-keep-left-tooltip"))
         self.btn_keep_b = self._review_button(tr("duplicates-keep-right"), "secondary", tr("duplicates-keep-right-tooltip"))
@@ -3072,8 +3356,50 @@ class DuplicateReviewView(ReviewView):
         self._set_thumb(self.lbl_a, id_a, path_a)
         self._set_thumb(self.lbl_b, id_b, path_b)
         # A je z get_duplicate_pairs nejostřejší (pak největší) položka skupiny
-        self.lbl_info_a.setText((os.path.basename(path_a) if path_a else "?") + tr("duplicates-recommended"))
+        self.lbl_info_a.setText(os.path.basename(path_a) if path_a else "?")
         self.lbl_info_b.setText(os.path.basename(path_b) if path_b else "?")
+        self._show_facts(id_a, path_a, id_b, path_b)
+
+    def set_mode(self, mode):
+        """'side' = dvě karty vedle sebe, 'split' = posuvné porovnání přes sebe."""
+        self.compare_stack.setCurrentIndex(1 if mode == "split" else 0)
+        if self.mode_switch.current_key() != mode:
+            self.mode_switch.set_current(mode)
+
+    def _show_facts(self, id_a, path_a, id_b, path_b):
+        """Rozlišení, velikost a formát pod kartami + štítky toho, co je lepší."""
+        sizes = {}
+        try:
+            conn = get_connection()
+            try:
+                for mid, size in conn.execute("SELECT id, file_size FROM media_items WHERE id IN (?, ?)",
+                                              (id_a, id_b)).fetchall():
+                    sizes[int(mid)] = size
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        fa = media_facts(path_a, sizes.get(int(id_a)))
+        fb = media_facts(path_b, sizes.get(int(id_b)))
+        self.facts = (fa, fb)
+        better = compare_facts(fa, fb)
+        for card, facts, side in ((self.card_a, fa, "a"), (self.card_b, fb, "b")):
+            w, h, size, ext = facts
+            bits = []
+            if w and h:
+                bits.append(f"{w} × {h}")
+                bits.append(tr("dup-megapixels", mp=fmt_number(w * h / 1e6, 1)))
+            if size:
+                bits.append(tr("dup-file-size", mb=fmt_number(size / (1024 * 1024), 1)))
+            if ext:
+                bits.append(ext)
+            card.facts.setText("  ·  ".join(bits))
+            badges = [(tr("dup-badge-recommended"), "accent")] if side == "a" else []
+            for key in better[side]:
+                badges.append({"res": (tr("dup-badge-higher-res"), "good"),
+                               "same_res": (tr("dup-badge-same-res"), "neutral"),
+                               "size": (tr("dup-badge-larger"), "good")}[key])
+            card.set_badges(badges)
 
     def _set_thumb(self, label, media_id, path):
         """Okamžitě miniatura z DB (náhled), pak na pozadí plné rozlišení originálu.
@@ -3198,6 +3524,8 @@ class DuplicateReviewView(ReviewView):
                 self._next()
         elif key == Qt.Key.Key_Z and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self._undo()
+        elif key == Qt.Key.Key_S and not event.modifiers():
+            self.set_mode("side" if self.compare_stack.currentIndex() == 1 else "split")
         else:
             super().keyPressEvent(event)     # Esc propadne do DetailPage = zpět
             return
@@ -3320,9 +3648,13 @@ class BorderlineReviewView(ReviewView):
             self.img_profile.setText("?")
 
     def _set_round_thumb(self, label, path):
-        img = _load_avatar_image(path, 200) if path and os.path.exists(path) else QImage()
+        dpr = max(1.0, label.devicePixelRatioF())
+        px = round(200 * dpr)                      # HiDPI: avatar ve fyzických px, ne zvětšený 2×
+        img = _load_avatar_image(path, px) if path and os.path.exists(path) else QImage()
         if not img.isNull():                       # stejný středový čtvercový ořez jako karty Osob
-            label.setPixmap(QPixmap.fromImage(img))
+            pix = QPixmap.fromImage(img)
+            pix.setDevicePixelRatio(px / 200.0)
+            label.setPixmap(pix)
         else:
             label.setText("?")
 
@@ -5008,6 +5340,8 @@ class MainWindow(QMainWindow):
         self._sync_accent()
         self._sync_map_active()
         self._refresh_map()
+        if self._map_warm_allowed():         # the library's photo places, z10-15, in the background
+            page.runJavaScript("window.warmPhotoHotspots && window.warmPhotoHotspots();")
         data, self._pending_journey = self._pending_journey, None
         if data is not None:                # Cesta vyžádaná z Událostí dřív, než se mapa načetla
             page.runJavaScript(f"window.playJourney && window.playJourney({json.dumps(data)});")
@@ -5051,6 +5385,45 @@ class MainWindow(QMainWindow):
             return 60 if power.get().state().on_battery else 0
         except Exception:
             return 0
+
+    def _map_warm_allowed(self):
+        """Background tile warm-up (fidelity pass): on unless config "map_prefetch" is off;
+        on battery only with the "full" battery policy (it is network and disk work)."""
+        if not self.config.get("map_prefetch", True):
+            return False
+        if self.config.get("battery_policy", power.DEFAULT_POLICY) == "full":
+            return True
+        try:
+            return not power.get().state().on_battery
+        except Exception:
+            return True
+
+    def _warm_event_region(self, event_id: int):
+        """An event was opened: its places (bounding box z10-13, around the photos z14-16) go
+        into the tile store in the background, so a later zoom into them is never blank."""
+        if getattr(self, "map_view", None) is None or not self._map_loaded or not self._map_warm_allowed():
+            return
+        try:
+            conn = get_connection()
+            try:
+                rows = conn.execute(f"""
+                    SELECT DISTINCT ROUND(m.longitude, 3), ROUND(m.latitude, 3) FROM media_items m
+                    WHERE m.event_id = ? AND m.latitude IS NOT NULL AND m.longitude IS NOT NULL
+                      AND {visible_media_sql('m')}
+                    LIMIT 400""", (int(event_id),)).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[Map] warm-up: {e}")
+            return
+        pts = [[float(lon), float(lat)] for lon, lat in rows
+               if lon is not None and lat is not None and abs(lat) <= 85 and abs(lon) <= 180
+               and (lat, lon) != (0.0, 0.0)]
+        if not pts:
+            return
+        lons, lats = [p[0] for p in pts], [p[1] for p in pts]
+        spec = {"bbox": [min(lons), min(lats), max(lons), max(lats)], "points": pts[:160], "zmin": 10, "zmax": 16}
+        self.map_view.page().runJavaScript(f"window.warmRegion && window.warmRegion({json.dumps(spec)});")
 
     def play_journey(self, event_id: int, return_here: bool = False):
         """Cesta: zastávky události -> kinematické přehrávání na mapě (journey.py).
@@ -5097,8 +5470,9 @@ class MainWindow(QMainWindow):
         self.map_view.page().runJavaScript(f"window.playJourney && window.playJourney({json.dumps(data)});")
         return True
 
-    def route_journey(self, journey_id: int, tile_template: str):
-        """Starts CorridorRouter for the playing Journey (legs with a GPX line are skipped)."""
+    def route_journey(self, journey_id: int, tile_template: str, day: int = -1):
+        """Starts CorridorRouter for the playing Journey (legs with a GPX line are skipped).
+        day >= 0: one day of a multi-day Journey is playing; its own stops are routed."""
         old = getattr(self, "_corridor_router", None)
         if old is not None:
             old.stop()
@@ -5111,12 +5485,18 @@ class MainWindow(QMainWindow):
         srv = tile_store.service()
         if not data or int(data.get("id", -1)) != int(journey_id) or not tile_template or srv is None:
             return False
-        skip = {int(k) for k in (data.get("tracks") or {})}
-        reqs = [r for r in route_corridor.leg_requests(data["stops"]) if r[0] not in skip]
+        film = data
+        if day >= 0:
+            days = data.get("days") or []
+            if day >= len(days) or len(days[day].get("stops") or []) < 2:
+                return False
+            film = days[day]
+        skip = {int(k) for k in (film.get("tracks") or {})}
+        reqs = [r for r in route_corridor.leg_requests(film["stops"]) if r[0] not in skip]
         if not reqs:
             return False
         worker = CorridorRouter(journey_id, reqs, route_corridor.store_fetcher(tile_template, srv.resolve), self)
-        worker.leg_ready.connect(self._on_corridor_leg)
+        worker.leg_ready.connect(lambda jid, leg, path, d=int(day): self._on_corridor_leg(jid, leg, path, d))
         worker.finished.connect(lambda w=worker: self._forget_router(w))
         worker.finished.connect(worker.deleteLater)
         self._corridor_router = worker
@@ -5159,11 +5539,11 @@ class MainWindow(QMainWindow):
         if getattr(self, "_corridor_router", None) is worker:
             self._corridor_router = None
 
-    def _on_corridor_leg(self, journey_id, leg, path_json):
+    def _on_corridor_leg(self, journey_id, leg, path_json, day=-1):
         if getattr(self, "map_view", None) is None or not self._map_loaded:
             return
         self.map_view.page().runJavaScript(
-            f"window.corridorRoute && window.corridorRoute({int(journey_id)}, {int(leg)}, {path_json});")
+            f"window.corridorRoute && window.corridorRoute({int(journey_id)}, {int(leg)}, {path_json}, {int(day)});")
 
     def _journey_music(self, conn, data):
         """Gate 2 D: the track whose energy fits the trip's mood (mood.py) -> data["music"]."""
@@ -6415,6 +6795,7 @@ class MainWindow(QMainWindow):
         self._add_slideshow_action(page, grid)
         page.set_content(grid)
         self.nav.push(page)
+        self._warm_event_region(event_id)          # dlaždice oblasti události dopředu (tile store)
 
     # ── Ozvěny (tehdy a teď) ──────────────────────────────────────────────────
 
@@ -6612,9 +6993,9 @@ class MainWindow(QMainWindow):
         old_accent = (self.config.get("accent"), self.config.get("accent_custom"))
         old_memories = self.config.get("show_memories", True)
         old_precise = self._precise_wanted()
-        old_color = self.config.get("color_output", "auto")
+        old_color = self.config.get("color_output", "system")
         old_language = self.config.get("language", i18n.SYSTEM)
-        dlg = SettingsDialog(self)
+        dlg = SettingsDialog(self, as_sheet=True)     # Founder audit: list v okně, ne okno Win32
         accepted = dlg.exec()
         if dlg.trash_emptied:                  # proběhlo i při Zrušit – knihovna musí sedět s DB
             self._on_library_changed()
@@ -6634,7 +7015,7 @@ class MainWindow(QMainWindow):
             for card in getattr(self, "event_cards", []):
                 card.update()
             self.memory_card.update()
-        if self.config.get("color_output", "auto") != old_color:
+        if self.config.get("color_output", "system") != old_color:
             configure_display_pipeline(QApplication.instance(), self.config)   # démon přegeneruje cache
         # P3.9 resize LRU cache
         cap = int(self.config.get("thumbnail_lru_capacity", 1200))
@@ -6800,7 +7181,7 @@ def configure_display_pipeline(app, cfg):
     Volat z GUI vlákna před prvním náhledem / démonem."""
     import color_manage
     try:
-        tgt = color_manage.configure(cfg.get("color_output", color_manage.MODE_AUTO))
+        tgt = color_manage.configure(cfg.get("color_output", color_manage.MODE_SYSTEM))
         print(f"[Barvy] výstup: {tgt['name']} ({tgt['reason']})")
     except Exception as e:
         print(f"[Barvy] {e}")
@@ -6834,9 +7215,18 @@ def main(app=None, splash=None):
 
     window = MainWindow()
     window_effects.style_for_theme(window)    # titulkový pruh v barvě aplikace (Windows 11)
+    reveal = splash is not None and not motion.reduced()
+    if reveal:
+        # Founder audit: okno se ukáže neviditelné (žádné šedé probliknutí prázdné mřížky),
+        # splash drží obraz do prvního hotového snímku mřížky a pak se oba prolnou (250 ms).
+        window.setWindowOpacity(0.0)
     window.show()
     if splash is not None:
-        splash.finish(window)
+        grid = getattr(window, "grid_view", None)
+        if reveal and grid is not None and grid.isVisible():
+            splash.hand_off(window, grid.firstFrameRendered)
+        else:
+            splash.finish(window)              # úvod jinde než v mřížce / omezený pohyb
     ret = app.exec()
     shutdown_app(app, window)                # pevné pořadí úklidu (pád v sip při ukončení)
     del window

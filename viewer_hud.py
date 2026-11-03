@@ -908,58 +908,50 @@ def _read_preview(path, max_size):
     p = get_preview(path)
     if not p:
         return QImage()
-    reader = QImageReader(p)
-    img = reader.read()
-    if not img.isNull() and max_size is not None and (img.width() > max_size.width() or img.height() > max_size.height()):
-        img = img.scaled(max_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    img = QImageReader(p).read()
+    if not img.isNull() and max_size is not None:
+        import imaging
+        img = imaging.fit_qimage(img, max_size.width(), max_size.height())
     return img
 
 
 def load_image_file(path, max_size=None, use_preview=True):
-    """Fotka jako QImage se správnou orientací z EXIFu (bezpečné mimo GUI vlákno).
+    """Fotka jako QImage – přes nativní pipeline (imaging): bezpečné mimo GUI vlákno.
 
-    use_preview: pokud cílová velikost nepřesahuje náhled (2048 px) a platný náhled existuje,
-    načte se ten (~25 ms místo ~300 ms u HEIC). HEIC/HEIF/DNG přes Pillow (+ pillow_heif),
-    ostatní přes QImageReader s autoTransform (QPixmap(path) orientaci z EXIFu ignoruje).
-    max_size = zmenšení s vyhlazením, menší snímky se nezvětšují. Prázdný QImage při chybě."""
+    use_preview: pokud cílová velikost nepřesahuje náhled a platný náhled existuje, načte se ten
+    (~25 ms místo ~300 ms u HEIC; náhled je už v kontraktu displeje). Jinak originál: Pillow
+    (+ pillow_heif) s vloženým ICC a orientací z EXIFu, Lanczos3 do max_size (menší se
+    nezvětšuje), JEDEN převod barev do kontraktu displeje. Bez ostření – prohlížeč je věrné okno.
+    Formáty, které Pillow neotevře, čte QImageReader (+ qimage_to_output). Prázdný QImage při chybě."""
     if not path or not os.path.exists(path):
         return QImage()
     if use_preview and _fits_preview(max_size):
         img = _read_preview(path, max_size)
         if not img.isNull():
             return img
-    img = QImage()
-    if os.path.splitext(path)[1].lower() in PIL_ONLY_FORMATS:
-        try:
-            from PIL import Image, ImageOps
-            try:
-                import pillow_heif
-                pillow_heif.register_heif_opener()
-            except ImportError:
-                pass
-            import color_manage
-            with Image.open(path) as pil:
-                icc = color_manage.source_profile(pil)        # Display P3 z iPhonu -> profil displeje
-                pil = ImageOps.exif_transpose(pil).convert("RGB")
-                if max_size is not None:
-                    pil.thumbnail((max_size.width(), max_size.height()), Image.Resampling.LANCZOS)
-                pil = color_manage.pil_to_output(pil, icc)     # až po zmenšení: méně pixelů
-                w, h = pil.size
-                img = QImage(pil.tobytes("raw", "RGB"), w, h, w * 3, QImage.Format.Format_RGB888).copy()
-        except Exception:
-            img = QImage()
-    if img.isNull():
-        reader = QImageReader(path)
-        reader.setAutoTransform(True)          # orientace z EXIFu
-        img = reader.read()
+    import color_manage
+    import imaging
+    if color_manage.is_cache_file(path):           # soubor z cache je už v kontraktu displeje
+        img = QImageReader(path).read()
+        return imaging.fit_qimage(img, max_size.width(), max_size.height())             if max_size is not None and not img.isNull() else img
+    try:
+        size_fn = None
+        need = None
+        if max_size is not None:
+            bw, bh = max_size.width(), max_size.height()
+            size_fn = lambda w, h: imaging.fit_box(w, h, bw, bh)
+            need = max(bw, bh)
+        return imaging.pil_to_qimage(imaging.render_still(path, size_fn, need_long=need))
+    except Exception:
+        pass
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)          # orientace z EXIFu
+    img = reader.read()
     if img.isNull():
         return img
-    import color_manage
-    if not color_manage.is_cache_file(path):         # cache už je v profilu displeje
-        img = color_manage.qimage_to_output(img)
-    if max_size is not None and (img.width() > max_size.width() or img.height() > max_size.height()):
-        img = img.scaled(max_size, Qt.AspectRatioMode.KeepAspectRatio,
-                         Qt.TransformationMode.SmoothTransformation)
+    img = color_manage.qimage_to_output(img)
+    if max_size is not None:
+        img = imaging.fit_qimage(img, max_size.width(), max_size.height())
     return img
 
 

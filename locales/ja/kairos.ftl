@@ -41,6 +41,7 @@ cache-unexpected-path = 予期しないキャッシュパスのため、削除�
 ## color_manage
 
 color-reason-default = デフォルト
+color-reason-system = Windows（sRGB – フォト、ブラウザー、動画と同じ）
 color-reason-manual = 手動で設定
 color-reason-profile = Windowsでディスプレイに割り当てられたプロファイル
 color-reason-wide-gamut = カラーマネジメントのない広色域ディスプレイ
@@ -514,8 +515,8 @@ settings-cache-pending = {"  "}→  { $pending_cache_dir }  （保存して再�
 settings-cache-usage = サムネール（削除可）: <b>{ $thumbs_mb } MB</b><br>2048 pxプレビュー（削除可）: <b>{ $previews_mb } MB</b><br>顔の切り抜き（永続データ、削除されません）: <b>{ $faces_mb } MB</b>
 settings-caches-hint = どちらのキャッシュもバックグラウンドで自動的に再作成されます。顔の切り抜き、人物、ライブラリ、写真には影響しません。
 settings-change-passcode = パスコードを変更…
-settings-color-display = 写真の色をディスプレイに合わせる
-settings-color-hint = 現在: { $name } – { $reason }。オフ = 常にsRGB（色を自ら変換するディスプレイ向け）。変更後、プレビューはバックグラウンドで再生成されます。
+settings-color-display = パネルの広色域（正確なP3）
+settings-color-hint = 現在: { $name } – { $reason }。オフ（推奨）= Windowsに従った色。フォト、ブラウザー、動画と同じです。オン = EDIDに基づきパネル本来の色域へ変換：sRGBを超えるDisplay P3の色が区別されますが、Windowsの他の部分より落ち着いた色に見えます。変更後、プレビューはバックグラウンドで再生成されます。
 settings-default-sort = デフォルトの並べ替え
 settings-delete-previews = 2048 pxプレビューを削除
 settings-delete-thumbs = サムネールを削除
@@ -610,6 +611,7 @@ splash-preparing = ライブラリを準備しています…
 accent-custom = カスタムカラー…
 accent-custom-dialog = カスタムアクセントカラー
 accent-custom-tooltip = カスタムカラー { $custom_hex }
+accent-classic = クラシックブルー
 
 ## ui_nav
 
@@ -689,6 +691,7 @@ person-unknown = 不明な人物
 place-unknown = 不明な場所
 event-kicker-trip = 旅行
 event-city-area = { $city }とその周辺
+event-region-pair = { $a }と{ $b }
 moments-no-date = 日付なし
 events-journey-hint = J – マップで旅を再生
 key-click = クリック
@@ -871,6 +874,13 @@ map-nogl-body = 地球儀はWebGLで描画されますが、この環境では�
 map-journey = 旅
 map-replay = もう一度再生
 map-done = 完了
+map-whole-trip = 旅の全体
+map-day-n = { $n }日目
+map-days-a11y = 旅の日ごと
+map-next-day = 次の日
+map-next-day-tip = 次の日 (Page Down)
+map-day-one-place = 1か所のみ、旅の全体の中で再生
+map-seek-a11y = 旅の再生位置
 map-controls-a11y = 旅の再生
 map-prev-stop = 前の立ち寄り先
 map-next-stop = 次の立ち寄り先
@@ -917,3 +927,15 @@ music-add-pick = 音楽を選択
 music-file-filter = オーディオ (*.opus *.ogg *.webm *.mp3 *.m4a *.wav)
 music-added = { $count } 曲を追加しました。旅で使えるようになりました。
 music-add-failed = 音楽を追加できませんでした
+info-more = 詳細情報
+dup-mode-side = 並べて表示
+dup-mode-split = スライダー
+dup-side-left = 左
+dup-side-right = 右
+dup-badge-recommended = おすすめ
+dup-badge-higher-res = 高解像度
+dup-badge-same-res = 同じ解像度
+dup-badge-larger = 大きいファイル
+dup-megapixels = { $mp } MP
+dup-file-size = { $mb } MB
+dup-mode-tooltip = 並べて、またはスライダーで重ねて比較（S キー）

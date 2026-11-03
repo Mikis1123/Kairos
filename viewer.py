@@ -5,10 +5,10 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSlider, QFrame,
-    QInputDialog, QLineEdit, QStyle
+    QInputDialog, QLineEdit, QStyle, QAbstractButton
 )
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QSize, QTimer, QEvent, QPoint, QRect, QRectF, QThreadPool
-from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QPainter, QColor, QPainterPath, QIcon
+from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QPainter, QColor, QPainterPath, QIcon, QFont, QPen
 from PyQt6.QtMultimedia import QMediaPlayer
 import media_engine
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -123,6 +123,8 @@ try:
     pillow_heif.register_heif_opener()
 except ImportError:
     pass
+import raw_decode  # noqa: E402  ProRAW / camera RAW through every Image.open (raw_decode.py)
+raw_decode.register()
 
 
 def load_hi_res_pixmap(file_path):
@@ -152,8 +154,122 @@ class ClickableSlider(QSlider):
             self.mouse_released.emit(self.value())
 
 
+class FaceChip(QAbstractButton):
+    """Founder audit: osoba v panelu Info jako moderní štítek – avatar 28 px v kroužku, jméno
+    vedle (13 px, oříznuté), zaoblené pozadí, při najetí jemné zvýraznění a prstenec zvýraznění.
+    Neznámá osoba: čárkovaný obrys a „+“, ať je jasné, že se dá pojmenovat."""
+    H = 34
+    AV = 26
+    MAX_W = 196
+
+    def __init__(self, crop_path=None, name=None, parent=None):
+        super().__init__(parent)
+        self.person_name = name or ""
+        self.known = bool(name)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setToolTip(name if name else tr("viewer-unknown-person-tooltip"))
+        self.setAccessibleName(name if name else tr("viewer-unknown-person-tooltip"))
+        self._hover = 0.0
+        self._kbd_focus = False
+        self._avatar = self._make_avatar(crop_path)
+        self._label = name or tr("viewer-unknown")
+        f = self.font()
+        f.setPixelSize(13)
+        f.setWeight(QFont.Weight.DemiBold if self.known else QFont.Weight.Normal)
+        self.setFont(f)
+        fm = self.fontMetrics()
+        room = self.MAX_W - (4 + self.AV + 8 + 12)
+        self._text = fm.elidedText(self._label, Qt.TextElideMode.ElideRight, room)
+        self.setFixedSize(4 + self.AV + 8 + fm.horizontalAdvance(self._text) + 12, self.H)
+
+    def _make_avatar(self, crop_path):
+        d = self.AV * 2                               # HiDPI: dvojnásobné rozlišení
+        if not crop_path:
+            return None
+        src = QImage(crop_path)
+        if src.isNull():
+            return None
+        import imaging                                # Lanczos3: ostrý čip i ze 384 px ořezu
+        side = min(src.width(), src.height())
+        src = src.copy((src.width() - side) // 2, (src.height() - side) // 2, side, side)
+        pix = QPixmap.fromImage(imaging.scale_qimage(src, d, d))
+        out = QPixmap(d, d)
+        out.fill(Qt.GlobalColor.transparent)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        clip = QPainterPath()
+        clip.addEllipse(0, 0, d, d)
+        p.setClipPath(clip)
+        p.drawPixmap((d - pix.width()) // 2, (d - pix.height()) // 2, pix)
+        p.end()
+        out.setDevicePixelRatio(2.0)
+        return out
+
+    def enterEvent(self, e):
+        self._hover = 1.0
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = 0.0
+        self.update()
+        super().leaveEvent(e)
+
+    def focusInEvent(self, e):
+        self._kbd_focus = e.reason() in (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason)
+        self.update()
+        super().focusInEvent(e)
+
+    def focusOutEvent(self, e):
+        self._kbd_focus = False
+        self.update()
+        super().focusOutEvent(e)
+
+    def sizeHint(self):
+        return self.size()
+
+    def paintEvent(self, _):
+        t = tokens.palette("dark")
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = r.height() / 2
+        bg = tokens.qcolor(t["surface_2"] if self._hover else t["surface"])
+        p.setBrush(bg)
+        pen = QPen(tokens.qcolor(t["hairline_strong"]), 1)
+        if not self.known:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.drawRoundedRect(r, radius, radius)
+        av = QRectF(4, (self.H - self.AV) / 2, self.AV, self.AV)
+        if self._avatar is not None:
+            p.drawPixmap(av, self._avatar, QRectF(self._avatar.rect()))
+        else:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(tokens.qcolor(t["surface_2"]))
+            p.drawEllipse(av)
+            p.setPen(tokens.qcolor(t["text_secondary"]))
+            f = QFont(self.font())
+            f.setPixelSize(12)
+            f.setWeight(QFont.Weight.DemiBold)
+            p.setFont(f)
+            glyph = "".join(w[0] for w in self.person_name.split()[:2]).upper() if self.known else "+"
+            p.drawText(av, Qt.AlignmentFlag.AlignCenter, glyph)
+        if self._hover or self._kbd_focus:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(tokens.qcolor(t["accent"]), 1.6))
+            p.drawEllipse(av.adjusted(-1.2, -1.2, 1.2, 1.2))
+        p.setFont(self.font())
+        p.setPen(tokens.qcolor(t["text"] if self.known else t["text_secondary"]))
+        text_r = QRectF(av.right() + 8, 0, self.width() - av.right() - 8 - 10, self.H)
+        p.drawText(text_r, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), self._text)
+        p.end()
+
+
 class MediaViewerWidget(QWidget):
     web_profile_factory = None                     # instance: () -> trvalý profil mapy (main.create_media_viewer)
+    page_setup = None                              # (QWebEnginePage) -> None: úložiště dlaždic (main.attach_tile_store)
     close_requested = pyqtSignal()
     favorite_changed_signal = pyqtSignal(int, int)
     fullscreen_toggled = pyqtSignal(bool)          # hlavní okno přepne celou obrazovku
@@ -264,10 +380,10 @@ class MediaViewerWidget(QWidget):
 
         self.faces_container = QWidget()
         self.faces_container.setStyleSheet("background: transparent;")
-        self.faces_layout = QHBoxLayout(self.faces_container)
-        self.faces_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.faces_layout.setContentsMargins(0, 2, 0, 4)
-        self.faces_layout.setSpacing(12)
+        # Founder audit: štítky osob (avatar + jméno) se zalamují – žádná přeplněná řada kroužků
+        from ui_controls import FlowLayout
+        self.faces_layout = FlowLayout(self.faces_container, spacing=6, v_spacing=6)
+        self.faces_layout.setContentsMargins(0, 4, 0, 4)
         self.info_layout.addWidget(self.faces_container)
 
         self.lbl_map_hdr = _caption(tr("viewer-place-taken"))
@@ -890,48 +1006,11 @@ class MediaViewerWidget(QWidget):
             self.btn_gmap.setVisible(False)
 
     def _face_chip(self, face_id, crop_path, person_id, person_name, item_id):
-        """Kruhová tvář a jméno pod ní; klik = přiřadit / přejmenovat osobu."""
-        t = tokens.palette("dark")
-        box = QWidget()
-        box.setStyleSheet("background: transparent;")
-        lay = QVBoxLayout(box)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
-        btn = QPushButton()
-        btn.setFixedSize(48, 48)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setToolTip(person_name if person_name else tr("viewer-unknown-person-tooltip"))
-        btn.setStyleSheet(f"QPushButton {{ border: none; border-radius: 24px; background: {t['surface_2']}; "
-                          f"color: {t['text_secondary']}; font-weight: 600; }}"
-                          f"QPushButton:hover {{ border: 2px solid {t['accent']}; }}")
-        crop_path = resolve_face_path(crop_path)
-        if crop_path:
-            pix = QPixmap(crop_path).scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                                            Qt.TransformationMode.SmoothTransformation)
-            out = QPixmap(48, 48)
-            out.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(out)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            clip = QPainterPath()
-            clip.addEllipse(0, 0, 48, 48)
-            painter.setClipPath(clip)
-            painter.drawPixmap((48 - pix.width()) // 2, (48 - pix.height()) // 2, pix)   # střed, 1:1
-            painter.end()
-            btn.setIcon(QIcon(out))
-            btn.setIconSize(QSize(48, 48))
-        else:
-            btn.setText("".join(w[0] for w in (person_name or "?").split()[:2]).upper() if person_name else "?")
-        btn.clicked.connect(lambda checked=False, f_id=face_id, p_id=person_id, p_name=person_name:
-                            self.on_face_badge_clicked(f_id, p_id, p_name, item_id))
-        lay.addWidget(btn, 0, Qt.AlignmentFlag.AlignHCenter)
-        name = QLabel(person_name or tr("viewer-unknown"))
-        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        name.setFixedWidth(64)
-        name.setStyleSheet(f"font-size: 11px; color: {t['text_secondary'] if not person_name else t['text']}; "
-                           f"background: transparent;")
-        name.setText(name.fontMetrics().elidedText(name.text(), Qt.TextElideMode.ElideRight, 62))
-        lay.addWidget(name, 0, Qt.AlignmentFlag.AlignHCenter)
-        return box
+        """Štítek osoby: kulatý avatar + jméno v zaobleném „chipu“; klik = přiřadit / přejmenovat."""
+        chip = FaceChip(resolve_face_path(crop_path), person_name)
+        chip.clicked.connect(lambda checked=False, f_id=face_id, p_id=person_id, p_name=person_name:
+                             self.on_face_badge_clicked(f_id, p_id, p_name, item_id))
+        return chip
 
     def _ensure_mini_map(self):
         """Minimapa = mini_map.html (přibalený MapLibre GL, jako hlavní mapa). Načte se jednou;
@@ -945,10 +1024,15 @@ class MediaViewerWidget(QWidget):
                       else QuietWebPage(m, tag="Minimapa"))
             m.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
             m.setFixedHeight(180)
-            m.page().setBackgroundColor(QColor("#141416"))
             # Stránka z file:// (přibalený MapLibre) smí načíst styl a dlaždice povolených serverů
             m.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-            m.setStyleSheet("border-radius: 8px; border: 1px solid #2C2C2E; background-color: #141416;")
+            m.setStyleSheet("border-radius: 10px; border: 1px solid #2C2C2E; background-color: #E4E8EC;")
+            m.page().setBackgroundColor(QColor("#E4E8EC"))      # pozadí Základní – žádný černý záblesk
+            if self.page_setup is not None:
+                try:
+                    self.page_setup(m.page())       # dlaždice přes místní úložiště (jako hlavní mapa)
+                except Exception as e:
+                    print(f"[Minimapa] úložiště dlaždic: {e}")
             m.loadFinished.connect(self._on_mini_map_loaded)
             m.load(QUrl.fromLocalFile(os.path.join(RESOURCE_DIR, MINI_MAP_PAGE)))
             self.info_layout.insertWidget(self._mini_map_index, m)
@@ -968,6 +1052,12 @@ class MediaViewerWidget(QWidget):
             self.mini_map.page().runJavaScript(
                 f"window.setStrings && window.setStrings({json.dumps(i18n.page_strings('minimap-'), ensure_ascii=False)},"
                 f" {json.dumps(i18n.current())});")
+            import motion
+            import tokens
+            accent = tokens.accent("dark")["accent"]
+            self.mini_map.page().runJavaScript(
+                f"window.setAccent && window.setAccent({json.dumps(accent)});"
+                f" window.setStill && window.setStill({json.dumps(motion.reduced())});")
         if ok and self._mini_place is not None:
             self._show_mini_place(*self._mini_place)
 

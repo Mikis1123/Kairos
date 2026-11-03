@@ -7,6 +7,7 @@ takže se soubor tiše nevytvoří. Řešení: soubor načíst/zapsat přes Pyth
 """
 import os
 import cv2
+import fs_atomic
 import numpy as np
 
 
@@ -25,15 +26,14 @@ def imwrite(path, img, params=None):
     """Náhrada cv2.imwrite. Vrací True/False; zápis je atomický (tmp + replace)."""
     path = str(path)
     ext = os.path.splitext(path)[1] or ".jpg"
-    tmp = path + ".part"
+    tmp = fs_atomic.unique_tmp(path)
     try:
         ok, buf = cv2.imencode(ext, img, params or [])
         if not ok:
             return False
         with open(tmp, "wb") as f:
             f.write(buf.tobytes())
-        os.replace(tmp, path)
-        return True
+        return fs_atomic.replace(tmp, path)
     except Exception:
         try:
             if os.path.exists(tmp):

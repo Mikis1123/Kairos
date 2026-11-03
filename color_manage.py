@@ -1,23 +1,27 @@
-"""Správa barev (Stage 2): fotky z iPhonu jsou v Display P3 a kreslit se mají v barvách displeje.
+"""Display colour contract – the single colour conversion of the image pipeline (imaging.py).
 
-Dřív aplikace žádný profil neuplatnila – P3 hodnoty šly na displej tak, jak byly. Teď každý
-obraz, který aplikace zobrazí nebo uloží do cache (miniatura, náhled, prohlížeč, ořez tváře),
-projde převodem z vloženého profilu do VÝSTUPNÍHO profilu:
+Every still is converted exactly once, from its embedded ICC profile (none = sRGB) to what the
+Windows compositor actually expects from an 8-bit Qt surface:
 
-* Windows barvy spravuje sám (Advanced Color: automatická správa barev / HDR) -> sRGB,
-  o zbytek se postará systém.
-* Displej má přiřazený vlastní profil ICC (kalibrace) -> ten.
-* Jinak displej se širokým gamutem (OLED, EDID primárky výrazně za sRGB) -> profil sestavený
-  z EDID (jako macOS). Systém sRGB obsah na takovém panelu NEpřevádí, takže převod do sRGB
-  by fotky přesytil.
-* Jinak sRGB.
+* MODE_SYSTEM (default) – the Windows contract, the same one Photos, Edge, Chrome and every
+  video player follow:
+    - Windows manages colour itself (Auto Color Management / HDR) -> sRGB; DWM maps it to
+      the panel.
+    - A profile is assigned to the display in Windows (calibration) -> that profile.
+    - Otherwise sRGB. Untagged / sRGB images pass through bit-for-bit (no transform at all).
+  On a wide-gamut panel without ACM the compositor shows sRGB at the panel's native primaries;
+  photos, the rest of the desktop and Live Photo videos therefore match each other exactly.
+* MODE_PANEL (opt-in) – colorimetric mapping to the panel's own primaries from EDID (macOS
+  style). Keeps Display P3 distinctions beyond sRGB, but on an unmanaged Windows desktop
+  everything then looks calmer than every other app – measured −21 % saturation on the
+  library vs. MODE_SYSTEM – which is why it is not the default.
 
-Cache (miniatury, náhledy) se renderují do výstupního profilu jednou; jeho otisk
-(`target_fingerprint`) je součástí verze cache – jiný displej / nastavení = přegenerování.
-Videa (a obrázky z nich: plakáty, pás časové osy) se NEpřevádějí – přehrávač Qt profil
-neuplatňuje a plakát musí barevně navazovat na první snímek videa.
+Never: heuristic gamut compression, tone curves, saturation changes, second conversions.
+Cache versions include `target_fingerprint()`: a different display contract = regenerated.
+Video (and frames from it: posters, timeline strips) is never converted – Qt plays it
+unmanaged, which under MODE_SYSTEM is exactly the contract above.
 
-Bezpečné mimo GUI vlákno (po `configure()` z GUI vlákna při startu).
+Safe off the GUI thread (after `configure()` from the GUI thread at start-up).
 """
 from i18n import N_, tr
 import hashlib
@@ -28,13 +32,16 @@ import threading
 
 from PIL import Image, ImageCms
 
-MODE_AUTO = "auto"
-MODE_SRGB = "srgb"
+MODE_SYSTEM = "system"
+MODE_PANEL = "panel"
+MODE_AUTO = MODE_SYSTEM          # legacy name
+MODE_SRGB = "srgb"               # legacy value: the system contract covers it
 
 _SRGB = ImageCms.createProfile("sRGB")
 _transforms = {}
 _lock = threading.Lock()
-_target = {"icc": None, "name": "sRGB", "reason": N_("color-reason-default"), "fp": "srgb"}   # icc None = sRGB
+_target = {"icc": None, "name": "sRGB", "reason": N_("color-reason-default"), "fp": "srgb",
+           "mode": MODE_SYSTEM}   # icc None = sRGB
 
 # ── ICC profil z primárek (EDID) ──────────────────────────────────────────────
 
@@ -249,33 +256,38 @@ def _assigned_icc():
         return None
 
 
-def detect_output(mode=MODE_AUTO):
-    """(icc_bytes | None = sRGB, popis, důvod) pro výstup na hlavní displej."""
-    if mode == MODE_SRGB:
-        return None, "sRGB", tr("color-reason-manual")
-    acm = _advanced_color_active()
-    if acm:
+def normalize_mode(mode):
+    """Config value -> MODE_SYSTEM / MODE_PANEL (legacy "auto" / "srgb" = system)."""
+    return MODE_PANEL if str(mode or "").strip().lower() == MODE_PANEL else MODE_SYSTEM
+
+
+def detect_output(mode=MODE_SYSTEM):
+    """(icc_bytes | None = sRGB, description, reason) for output to the main display."""
+    mode = normalize_mode(mode)
+    if _advanced_color_active():
         return None, "sRGB", tr("color-reason-windows")
     icc = _assigned_icc()
     if icc:
         return icc, _describe(icc), tr("color-reason-profile")
-    edid = _internal_display_edid()
-    if edid:
-        prim = _edid_primaries(edid)
-        ratio = gamut_area_ratio(prim)
-        if ratio > 1.15:
-            name = f"Displej (EDID, {ratio * 100:.0f} % sRGB)"
-            return build_matrix_profile(prim, name), name, tr("color-reason-wide-gamut")
-    return None, "sRGB", "displej v rozsahu sRGB"
+    if mode == MODE_PANEL:
+        edid = _internal_display_edid()
+        if edid:
+            prim = _edid_primaries(edid)
+            ratio = gamut_area_ratio(prim)
+            if ratio > 1.15:
+                name = f"Displej (EDID, {ratio * 100:.0f} % sRGB)"
+                return build_matrix_profile(prim, name), name, tr("color-reason-wide-gamut")
+    return None, "sRGB", tr("color-reason-system")
 
 
-def configure(mode=MODE_AUTO):
-    """Zvolí výstupní profil (volat z GUI vlákna při startu a po změně nastavení).
-    Vrací slovník s popisem cíle."""
+def configure(mode=MODE_SYSTEM):
+    """Pick the output profile (call from the GUI thread at start-up and after a settings
+    change). Returns a description of the target."""
+    mode = normalize_mode(mode)
     icc, name, reason = detect_output(mode)
     fp = "srgb" if icc is None else hashlib.sha1(icc).hexdigest()[:8]
     with _lock:
-        _target.update(icc=icc, name=name, reason=reason, fp=fp)
+        _target.update(icc=icc, name=name, reason=reason, fp=fp, mode=mode)
         _transforms.clear()
     return dict(_target)
 
@@ -352,47 +364,46 @@ def pil_to_output(img, icc=None):
     return out
 
 
+def convert_to_srgb(img, icc, mode):
+    """Non-RGB source (CMYK) with its own profile -> sRGB RGB image, or None."""
+    try:
+        src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+        tr = ImageCms.buildTransform(src, _SRGB, mode, "RGB",
+                                     renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC)
+        return ImageCms.applyTransform(img, tr)
+    except Exception:
+        return None
+
+
 def qimage_to_output(img):
-    """QImage (profil z JPEG/PNG přes QImageReader, bez profilu = sRGB) do výstupního profilu."""
+    """QImage (colour space from QImageReader; none = sRGB) -> display contract. Alpha kept."""
     try:
         if img.isNull():
             return img
+        from PyQt6.QtGui import QColorSpace
         cs = img.colorSpace()
         icc = bytes(cs.iccProfile()) if cs.isValid() else b""
-        if not icc and cs.isValid():
-            from PyQt6.QtGui import QColorSpace
-            if cs != QColorSpace(QColorSpace.NamedColorSpace.SRgb):
-                return img.convertedToColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb)) \
-                    if _target["icc"] is None else img
-        tr = _transform_for(icc or None, "RGB")
+        if not icc and cs.isValid() and cs != QColorSpace(QColorSpace.NamedColorSpace.SRgb):
+            # named / parametric space without ICC bytes (PNG cHRM+gAMA): Qt converts to sRGB,
+            # the sRGB -> target step below then applies
+            img = img.convertedToColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb))
+            icc = b""
+        mode = "RGBA" if img.hasAlphaChannel() else "RGB"
+        tr = _transform_for(icc or None, mode)
         if tr is None:
             return img
-        from PyQt6.QtGui import QImage
-        rgb = img.convertToFormat(QImage.Format.Format_RGB888)
-        w, h = rgb.width(), rgb.height()
-        ptr = rgb.constBits()
-        ptr.setsize(rgb.sizeInBytes())
-        pil = Image.frombuffer("RGB", (w, h), bytes(ptr), "raw", "RGB", rgb.bytesPerLine(), 1)
-        out = ImageCms.applyTransform(pil, tr)
-        res = QImage(out.tobytes("raw", "RGB"), w, h, w * 3, QImage.Format.Format_RGB888).copy()
-        return res
+        import imaging
+        out = ImageCms.applyTransform(imaging.qimage_to_pil(img), tr)
+        return imaging.pil_to_qimage(out)
     except Exception:
         return img
 
 
 def open_rgb_output(path, draft=None):
-    """Otevře soubor Pillowem, otočí podle EXIF a vrátí RGB ve výstupním profilu."""
-    from PIL import ImageOps
-    with Image.open(path) as img:
-        icc = source_profile(img)
-        if draft:
-            try:
-                img.draft("RGB", draft)
-            except Exception:
-                pass
-        oriented = ImageOps.exif_transpose(img)
-        return pil_to_output(oriented.convert("RGB"), icc)
-
+    """File -> oriented RGB in the display contract (through the imaging pipeline)."""
+    import imaging
+    need = max(draft) if draft else None
+    return imaging.flatten(imaging.render_still(path, need_long=need))
 
 
 def is_cache_file(path):

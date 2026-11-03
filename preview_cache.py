@@ -20,14 +20,17 @@ import time
 from PyQt6.QtCore import QSize
 from PyQt6.QtGui import QImage
 
+import fs_atomic
 import paths
 
 # Stage 2: náhled = delší strana displeje ve fyzických px (configure_for_display), takže je to
 # rovnou výsledný obraz prohlížeče – žádné zvětšené 2048 px a „doostření“ o půl sekundy později.
 PREVIEW_EDGE = 2880
 PREVIEW_MIN_EDGE, PREVIEW_MAX_EDGE = 2048, 3840
-PREVIEW_QUALITY = 90
-PREVIEW_VERSION = 2              # 2 = rozměr displeje + profil displeje (color_manage)
+PREVIEW_QUALITY = 90             # 4:4:4 (imaging.encode_jpeg)
+PREVIEW_VERSION = 4              # 2 = rozměr displeje + profil displeje (color_manage)
+                                 # 3 = HEIC bez dvojího převodu + tón Live Photo (live_tone)
+                                 # 4 = imaging pipeline: Lanczos3, 4:4:4, kontrakt Windows, bez tónu
 DEFAULT_BUDGET_MB = 2048
 TOUCH_INTERVAL_S = 3600          # mtime posouvat nejvýš jednou za hodinu (méně zápisů na disk)
 VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".avi", ".mkv"}
@@ -116,28 +119,18 @@ def save_preview(source, image):
         return None
     if _is_hidden(source):                   # Skryté: na disk nikdy nešifrovaně
         return None
-    if image.width() > PREVIEW_EDGE or image.height() > PREVIEW_EDGE:
-        from PyQt6.QtCore import Qt
-        image = image.scaled(QSize(PREVIEW_EDGE, PREVIEW_EDGE), Qt.AspectRatioMode.KeepAspectRatio,
-                             Qt.TransformationMode.SmoothTransformation)
+    import imaging
+    image = imaging.fit_qimage(image, PREVIEW_EDGE, PREVIEW_EDGE)
     os.makedirs(preview_dir(), exist_ok=True)
     target = preview_path(source)
-    tmp = f"{target}.{threading.get_ident()}.tmp"
-    if not image.save(tmp, "JPG", PREVIEW_QUALITY):
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        return None
-    os.replace(tmp, target)
-    return target
+    return target if imaging.write_jpeg(imaging.qimage_to_pil(image), target, PREVIEW_QUALITY) else None
 
 
 def _video_poster(source, target, ffmpeg_path=None):
     ffmpeg_path = ffmpeg_path or paths.FFMPEG_PATH
     if not os.path.exists(ffmpeg_path):
         return False
-    tmp = f"{target}.{threading.get_ident()}.tmp.jpg"
+    tmp = fs_atomic.unique_tmp(target)
     edge = PREVIEW_EDGE
     # HDR (HLG / Dolby Vision z iPhonu) -> SDR jako proxy; bez toho vybledlý plakát. Profil
     # displeje se na plakát NEuplatní: musí barevně navazovat na (nespravované) video.
@@ -146,12 +139,12 @@ def _video_poster(source, target, ffmpeg_path=None):
         sdr = video_proxy.sdr_filter(video_proxy.probe(source, ffmpeg_path))
     except Exception:
         sdr = ""
-    vf = f"scale='if(gt(iw,ih),min({edge},iw),-2)':'if(gt(iw,ih),-2,min({edge},ih))'" + (
-        "," + sdr if sdr else "") + ",format=yuvj420p"
+    vf = f"scale='if(gt(iw,ih),min({edge},iw),-2)':'if(gt(iw,ih),-2,min({edge},ih))':flags=lanczos+accurate_rnd" + (
+        "," + sdr if sdr else "") + ",format=yuvj444p"
     cmd = [ffmpeg_path, "-loglevel", "quiet", "-y", "-ss", "00:00:00.200", "-i", source,
            "-map", "0:v:0", "-frames:v", "1",
            "-vf", vf,
-           "-q:v", "3", tmp]
+           "-q:v", "2", tmp]
     startupinfo = None
     if os.name == "nt":
         startupinfo = subprocess.STARTUPINFO()
@@ -159,8 +152,7 @@ def _video_poster(source, target, ffmpeg_path=None):
     try:
         subprocess.run(cmd, capture_output=True, startupinfo=startupinfo, timeout=60)
         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-            os.replace(tmp, target)
-            return True
+            return fs_atomic.replace(tmp, target)
     except Exception:
         pass
     try:
@@ -183,7 +175,15 @@ def build_preview(source, media_type=None):
         os.makedirs(preview_dir(), exist_ok=True)
         target = preview_path(source)
         return target if _video_poster(source, target) else None
-    from viewer_hud import load_image_file          # sdílený dekodér (HEIC, EXIF orientace)
+    import imaging                                  # nativní pipeline: přímo PIL -> JPEG
+    try:
+        edge = PREVIEW_EDGE
+        img = imaging.render_still(source, lambda w, h: imaging.fit_box(w, h, edge, edge), need_long=edge)
+        target = preview_path(source)
+        return target if imaging.write_jpeg(img, target, PREVIEW_QUALITY) else None
+    except Exception:
+        pass
+    from viewer_hud import load_image_file          # formáty mimo Pillow (QImageReader)
     img = load_image_file(source, QSize(PREVIEW_EDGE, PREVIEW_EDGE), use_preview=False)
     return save_preview(source, img)
 

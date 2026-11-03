@@ -33,7 +33,7 @@ if os.path.exists('exiftool.exe') and os.path.isdir('exiftool_files'):
 
 # Mapa a minimapa prohlížeče: stránky + lokálně přibalený MapLibre (main.py / viewer.py je
 # hledají v paths.RESOURCE_DIR = sys._MEIPASS, stránky odkazují relativně na vendor/maplibre)
-for page in ('map_vault.html', 'mini_map.html', 'director.js', 'reel_player.html'):
+for page in ('map_vault.html', 'mini_map.html', 'map_style.js', 'director.js', 'reel_player.html'):
     if os.path.exists(page):
         datas.append((page, '.'))
 # Vrstva videa prohlížeče (QML VideoOutput, viewer_hud.py)
@@ -88,6 +88,7 @@ hidden_imports = [
     'PyQt6.QtQml',
     'reverse_geocoder',
     'pillow_heif',
+    'rawpy',                 # ProRAW / camera RAW (raw_decode.py); its LibRaw DLL ships in the wheel
     # Gate 0: obsahový otisk médií (media_identity) – C rozšíření, ať ho analýza nepřehlédne
     'xxhash',
     'data_migration',

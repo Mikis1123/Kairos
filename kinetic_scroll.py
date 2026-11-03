@@ -24,7 +24,7 @@ defer full-quality thumbnail decodes during fast flings.
 import math
 
 try:
-    from PyQt6.QtCore import QAbstractAnimation, QElapsedTimer, QObject, Qt, pyqtSignal
+    from PyQt6.QtCore import QElapsedTimer, QObject, Qt, QTimer, pyqtSignal
     HAS_QT = True
 except ImportError:          # pragma: no cover - the physics core works without Qt
     HAS_QT = False
@@ -194,18 +194,40 @@ def classify_wheel(angle_dy, pixel_dy):
 
 
 if HAS_QT:
-    class _Ticker(QAbstractAnimation):
-        """Per-frame callback from Qt's unified animation timer (vsync-paced where available)."""
+    class _FrameTicker(QObject):
+        """Per-frame callback at the panel's refresh rate.
 
-        def __init__(self, cb, parent=None):
+        Qt's unified animation timer (QAbstractAnimation) ticks every 16 ms on Windows. Measured
+        (eval/bench_massive_scale.py): the grid glide ran at 59-62 ticks/s on a 120 Hz panel,
+        so it was capped at 60 fps whatever the paint cost. This one is a precise timer at the
+        refresh interval of the window's screen, read at each start (battery: 60 Hz). The physics
+        integrates real elapsed time, so timer jitter changes the sampling, never the motion."""
+
+        def __init__(self, cb, area, parent=None):
             super().__init__(parent)
             self._cb = cb
+            self._area = area
+            self._timer = QTimer(self)
+            self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+            self._timer.timeout.connect(self._cb)
 
-        def duration(self):
-            return -1
+        def interval_ms(self):
+            hz = 60.0
+            try:
+                scr = self._area.screen() if hasattr(self._area, "screen") else None
+                hz = float(scr.refreshRate()) if scr is not None else 60.0
+            except Exception:
+                pass
+            return max(4, int(1000.0 / max(30.0, min(hz, 240.0))))
 
-        def updateCurrentTime(self, _ms):
-            self._cb()
+        def start(self):
+            self._timer.start(self.interval_ms())
+
+        def stop(self):
+            self._timer.stop()
+
+        def running(self):
+            return self._timer.isActive()
 
     class KineticScroller(QObject):
         """Drives a QAbstractScrollArea's vertical scrollbar with KineticPhysics."""
@@ -224,7 +246,7 @@ if HAS_QT:
             self._clock.start()
             self._last_t = None
             self._writing = False
-            self._ticker = _Ticker(self._tick, self)
+            self._ticker = _FrameTicker(self._tick, area, self)
             self.bar.valueChanged.connect(self._on_value)
             self.bar.rangeChanged.connect(self._on_range)
             self._on_range(self.bar.minimum(), self.bar.maximum())
@@ -285,7 +307,7 @@ if HAS_QT:
             return True
 
         def _ensure_running(self):
-            if self.phys.active() and self._ticker.state() != QAbstractAnimation.State.Running:
+            if self.phys.active() and not self._ticker.running():
                 self._last_t = self.now()
                 self._ticker.start()
 

@@ -41,6 +41,7 @@ cache-unexpected-path = Neočekávaná cesta k mezipaměti, mazání zrušeno.
 ## color_manage
 
 color-reason-default = výchozí
+color-reason-system = Windows (sRGB – jako Fotky, prohlížeč a videa)
 color-reason-manual = nastaveno ručně
 color-reason-profile = profil přiřazený displeji ve Windows
 color-reason-wide-gamut = displej se širokým gamutem bez správy barev
@@ -514,8 +515,8 @@ settings-cache-pending = {"  "}→  { $pending_cache_dir }  (po uložení a rest
 settings-cache-usage = Miniatury (lze smazat): <b>{ $thumbs_mb } MB</b><br>Náhledy 2048 px (lze smazat): <b>{ $previews_mb } MB</b><br>Ořezy tváří (trvalá data, nemažou se): <b>{ $faces_mb } MB</b>
 settings-caches-hint = Obě mezipaměti se na pozadí samy vytvoří znovu. Ořezy tváří, osoby, databáze a vaše fotografie se tím nemění.
 settings-change-passcode = Změnit heslo…
-settings-color-display = Barvy fotek podle displeje
-settings-color-hint = Teď: { $name } – { $reason }. Vypnuto = vždy sRGB (pro displeje, které barvy převádějí samy). Po změně se náhledy na pozadí přegenerují.
+settings-color-display = Široký gamut panelu (přesné P3)
+settings-color-hint = Teď: { $name } – { $reason }. Vypnuto (doporučeno) = barvy podle Windows, stejně jako aplikace Fotky, prohlížeč a videa. Zapnuto = převod do nativního gamutu panelu z EDID: odstíny Display P3 za hranicí sRGB zůstanou odlišené, ale vše bude klidnější než ve zbytku Windows. Po změně se náhledy na pozadí přegenerují.
 settings-default-sort = Výchozí řazení
 settings-delete-previews = Smazat náhledy 2048 px
 settings-delete-thumbs = Smazat miniatury
@@ -610,6 +611,7 @@ splash-preparing = Připravuji knihovnu…
 accent-custom = Vlastní barva…
 accent-custom-dialog = Vlastní barva zvýraznění
 accent-custom-tooltip = Vlastní barva { $custom_hex }
+accent-classic = Klasická modrá
 
 ## ui_nav
 
@@ -756,6 +758,7 @@ person-unknown = Neznámá osoba
 place-unknown = Neznámé místo
 event-kicker-trip = Výlet
 event-city-area = { $city } a okolí
+event-region-pair = { $a } a { $b }
 moments-no-date = Bez data
 events-journey-hint = J – přehrát Cestu na mapě
 key-click = klik
@@ -1005,6 +1008,13 @@ map-nogl-body = Zeměkouli kreslí WebGL, které tu není k dispozici. Fotky ani
 map-journey = Cesta
 map-replay = Přehrát znovu
 map-done = Hotovo
+map-whole-trip = Celá cesta
+map-day-n = Den { $n }
+map-days-a11y = Dny cesty
+map-next-day = Další den
+map-next-day-tip = Další den (Page Down)
+map-day-one-place = jedno místo, přehraje se v celé cestě
+map-seek-a11y = Pozice v cestě
 map-controls-a11y = Přehrávání cesty
 map-prev-stop = Předchozí zastávka
 map-next-stop = Další zastávka
@@ -1084,3 +1094,15 @@ music-added = { $count ->
    *[other] Přidáno { $count } skladeb. Cesta je teď může použít.
 }
 music-add-failed = Hudbu se nepodařilo přidat
+info-more = Další informace
+dup-mode-side = Vedle sebe
+dup-mode-split = Posuvník
+dup-side-left = Levá
+dup-side-right = Pravá
+dup-badge-recommended = Doporučeno
+dup-badge-higher-res = Vyšší rozlišení
+dup-badge-same-res = Stejné rozlišení
+dup-badge-larger = Větší soubor
+dup-megapixels = { $mp } MP
+dup-file-size = { $mb } MB
+dup-mode-tooltip = Porovnání vedle sebe nebo posuvníkem přes sebe (klávesa S)

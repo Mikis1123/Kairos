@@ -19,12 +19,16 @@ import trips
 import reverse_geocoder as rg
 from PIL import Image, ImageOps
 import color_manage
+import fs_atomic
+import imaging
 
 try:
     import pillow_heif
     pillow_heif.register_heif_opener()
 except ImportError:
     pass
+import raw_decode  # noqa: E402  ProRAW / camera RAW through every Image.open (raw_decode.py)
+raw_decode.register()
 
 try:
     from mutagen.mp4 import MP4
@@ -45,8 +49,9 @@ SUPPORTED_EXTS = {'.heic', '.jpg', '.jpeg', '.png', '.mov', '.mp4', '.dng'}
 # tolik pixelů, kolik dlaždice potřebuje (main.thumb_tier).
 THUMB_SHORT_EDGE = 840
 THUMB_LONG_MAX = 1680
-THUMB_QUALITY = 88
-THUMB_VERSION = 2               # 2 = kratší strana 840 px + převod do profilu displeje (color_manage)
+THUMB_QUALITY = 88               # 4:4:4 (imaging.encode_jpeg) – čisté sytě barevné hrany i na velké dlaždici
+THUMB_VERSION = 3               # 2 = kratší strana 840 px + převod do profilu displeje (color_manage)
+                                # 3 = imaging pipeline: Lanczos3, ostření jasu, 4:4:4, kontrakt Windows
 THUMB_VERSION_FILE = "THUMB_VERSION"
 MTIME_TOLERANCE_SEC = 2.0   # FAT/exFAT ukládá mtime s přesností 2 s
 
@@ -112,19 +117,27 @@ def _video_thumb_filter(file_path, ffmpeg_path):
     """Zmenšení snímku videa na kratší stranu miniatury + HDR -> SDR (HLG / Dolby Vision z iPhonu
     by jinak vypadaly vybledle)."""
     s = THUMB_SHORT_EDGE
-    vf = f"scale='if(gt(iw,ih),-2,min({s},iw))':'if(gt(iw,ih),min({s},ih),-2)'"
+    vf = f"scale='if(gt(iw,ih),-2,min({s},iw))':'if(gt(iw,ih),min({s},ih),-2)':flags=lanczos+accurate_rnd"
     try:
         import video_proxy
         sdr = video_proxy.sdr_filter(video_proxy.probe(file_path, ffmpeg_path))
     except Exception:
         sdr = ""
-    return vf + ("," + sdr if sdr else "") + ",format=yuvj420p"
+    return vf + ("," + sdr if sdr else "") + ",format=yuvj444p"
+
+
+def _render_still_thumb(file_path):
+    """Miniatura fotky přes imaging: dekódování (JPEG v DCT na ≥ 2×), Lanczos3 na kratší stranu
+    THUMB_SHORT_EDGE, ostření jasu pro obrazovku, jediný převod do kontraktu displeje."""
+    return imaging.render_still(
+        file_path, lambda w, h: imaging.fit_short_edge(w, h, THUMB_SHORT_EDGE, THUMB_LONG_MAX),
+        sharpen=imaging.SHARPEN_THUMB, need_long=THUMB_LONG_MAX)
 
 
 def make_thumbnail(file_path, thumb_path, m_type, paired_video, ffmpeg_path=DEFAULT_FFMPEG):
     """Vytvoří miniaturu (kratší strana THUMB_SHORT_EDGE, sRGB). Zápis je atomický. Vrací True při úspěchu."""
     startupinfo = _hidden_startupinfo()
-    tmp_path = os.path.splitext(thumb_path)[0] + ".tmp.jpg"
+    tmp_path = fs_atomic.unique_tmp(thumb_path)
     is_video_only = (m_type == 'video' and not paired_video)
 
     def _ffmpeg(extra_before_input):
@@ -133,7 +146,7 @@ def make_thumbnail(file_path, thumb_path, m_type, paired_video, ffmpeg_path=DEFA
         cmd = [ffmpeg_path, "-loglevel", "quiet", "-y"] + extra_before_input + [
             "-i", file_path, "-map", "0:v:0", "-frames:v", "1",
             "-vf", _video_thumb_filter(file_path, ffmpeg_path),
-            "-q:v", "3", tmp_path,
+            "-q:v", "2", tmp_path,
         ]
         subprocess.run(cmd, capture_output=True, startupinfo=startupinfo)
 
@@ -142,29 +155,17 @@ def make_thumbnail(file_path, thumb_path, m_type, paired_video, ffmpeg_path=DEFA
             os.remove(tmp_path)
         if not is_video_only:
             try:
-                with Image.open(file_path) as img:
-                    icc = color_manage.source_profile(img)
-                    box = _thumb_box(*img.size)
-                    # JPEG: dekodér umí rovnou zmenšit (DCT scaling), ušetří paměť i čas.
-                    try:
-                        img.draft("RGB", (box[0] * 2, box[1] * 2))
-                    except Exception:
-                        pass
-                    # Nejdřív zmenšit, teprve potom otáčet / konvertovat (žádné kopie v plné velikosti).
-                    img.thumbnail((box[0] * 2, box[1] * 2))
-                    oriented = ImageOps.exif_transpose(img)
-                    rgb = oriented.convert("RGB")
-                    rgb.thumbnail(_thumb_box(*rgb.size), Image.Resampling.LANCZOS)
-                    rgb = color_manage.pil_to_output(rgb, icc)     # Display P3 -> profil displeje
-                    rgb.save(tmp_path, "JPEG", quality=THUMB_QUALITY)
+                rgb = _render_still_thumb(file_path)
+                with open(tmp_path, "wb") as f:
+                    f.write(imaging.encode_jpeg(rgb, THUMB_QUALITY))
             except Exception:
                 _ffmpeg([])
         else:
             _ffmpeg(["-ss", "00:00:00.200"])
 
         if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-            os.replace(tmp_path, thumb_path)
-            return True
+            # cíl může krátce držet čtečka mřížky / antivir (WinError 5) -> retry s backoffem
+            return fs_atomic.replace(tmp_path, thumb_path)
     except Exception as e:
         print(f"Chyba miniatury {file_path}: {e}")
     try:
@@ -182,20 +183,7 @@ def render_thumbnail_bytes(file_path, m_type, paired_video, ffmpeg_path=DEFAULT_
         return None
     if not (m_type == 'video' and not paired_video):
         try:
-            with Image.open(file_path) as img:
-                icc = color_manage.source_profile(img)
-                box = _thumb_box(*img.size)
-                try:
-                    img.draft("RGB", (box[0] * 2, box[1] * 2))
-                except Exception:
-                    pass
-                img.thumbnail((box[0] * 2, box[1] * 2))
-                rgb = ImageOps.exif_transpose(img).convert("RGB")
-                rgb.thumbnail(_thumb_box(*rgb.size), Image.Resampling.LANCZOS)
-                rgb = color_manage.pil_to_output(rgb, icc)
-                buf = io.BytesIO()
-                rgb.save(buf, "JPEG", quality=THUMB_QUALITY)
-                return buf.getvalue()
+            return imaging.encode_jpeg(_render_still_thumb(file_path), THUMB_QUALITY)
         except Exception:
             pass
     if not os.path.exists(ffmpeg_path):
@@ -204,7 +192,7 @@ def render_thumbnail_bytes(file_path, m_type, paired_video, ffmpeg_path=DEFAULT_
     cmd = [ffmpeg_path, "-loglevel", "quiet"] + seek + [
         "-i", file_path, "-map", "0:v:0", "-frames:v", "1",
         "-vf", _video_thumb_filter(file_path, ffmpeg_path),
-        "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+        "-q:v", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
     try:
         out = subprocess.run(cmd, capture_output=True, startupinfo=_hidden_startupinfo(), timeout=60).stdout
     except Exception:

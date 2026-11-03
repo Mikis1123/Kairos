@@ -25,3 +25,5 @@ winrt-Windows.Security.Credentials.UI
 xxhash>=3.4
 # Gate 1: lokalizace – katalogy Project Fluent (locales/*/kairos.ftl), parser bez Babel
 fluent.syntax>=0.19
+# ProRAW / camera RAW: LibRaw (raw_decode.py) – vložený náhled, jinak demosaic
+rawpy>=0.28

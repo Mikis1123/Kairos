@@ -41,6 +41,7 @@ cache-unexpected-path = Unerwarteter Cache-Pfad – Löschen abgebrochen.
 ## color_manage
 
 color-reason-default = Standard
+color-reason-system = Windows (sRGB – wie Fotos, Browser und Videos)
 color-reason-manual = manuell festgelegt
 color-reason-profile = dem Bildschirm in Windows zugewiesenes Profil
 color-reason-wide-gamut = Bildschirm mit großem Farbraum ohne Farbmanagement
@@ -514,8 +515,8 @@ settings-cache-pending = {"  "}→  { $pending_cache_dir }  (nach Sichern und Ne
 settings-cache-usage = Miniaturen (löschbar): <b>{ $thumbs_mb } MB</b><br>Vorschauen 2048 px (löschbar): <b>{ $previews_mb } MB</b><br>Gesichtsausschnitte (dauerhafte Daten, werden nie gelöscht): <b>{ $faces_mb } MB</b>
 settings-caches-hint = Beide Caches bauen sich im Hintergrund selbst neu auf. Gesichtsausschnitte, Personen, die Mediathek und Ihre Fotos bleiben unberührt.
 settings-change-passcode = Code ändern …
-settings-color-display = Fotofarben an den Bildschirm anpassen
-settings-color-hint = Jetzt: { $name } – { $reason }. Aus = immer sRGB (für Bildschirme, die Farben selbst umrechnen). Nach einer Änderung werden die Vorschauen im Hintergrund neu erzeugt.
+settings-color-display = Breiter Farbraum des Panels (exaktes P3)
+settings-color-hint = Jetzt: { $name } – { $reason }. Aus (empfohlen) = Farben wie in Windows, genau wie Fotos, Browser und Videos. Ein = Umrechnung in den nativen Farbraum des Panels (EDID): Display-P3-Töne jenseits von sRGB bleiben unterscheidbar, aber alles wirkt ruhiger als im Rest von Windows. Nach einer Änderung werden die Vorschauen im Hintergrund neu erzeugt.
 settings-default-sort = Standardsortierung
 settings-delete-previews = 2048-px-Vorschauen löschen
 settings-delete-thumbs = Miniaturen löschen
@@ -610,6 +611,7 @@ splash-preparing = Ihre Mediathek wird vorbereitet …
 accent-custom = Eigene Farbe …
 accent-custom-dialog = Eigene Akzentfarbe
 accent-custom-tooltip = Eigene Farbe { $custom_hex }
+accent-classic = Klassisches Blau
 
 ## ui_nav
 
@@ -728,6 +730,7 @@ person-unknown = Unbekannte Person
 place-unknown = Unbekannter Ort
 event-kicker-trip = Reise
 event-city-area = { $city } und Umgebung
+event-region-pair = { $a } und { $b }
 moments-no-date = Ohne Datum
 events-journey-hint = J – Reise auf der Karte abspielen
 key-click = Klick
@@ -964,6 +967,13 @@ map-nogl-body = Der Globus wird mit WebGL gezeichnet, das hier nicht verfügbar 
 map-journey = Reise
 map-replay = Erneut abspielen
 map-done = Fertig
+map-whole-trip = Ganze Reise
+map-day-n = Tag { $n }
+map-days-a11y = Tage der Reise
+map-next-day = Nächster Tag
+map-next-day-tip = Nächster Tag (Bild ab)
+map-day-one-place = ein Ort, wird in der ganzen Reise gezeigt
+map-seek-a11y = Position in der Reise
 map-controls-a11y = Reisewiedergabe
 map-prev-stop = Vorherige Station
 map-next-stop = Nächste Station
@@ -1031,3 +1041,15 @@ music-added = { $count ->
    *[other] { $count } Titel hinzugefügt. Reisen können sie jetzt nutzen.
 }
 music-add-failed = Musik konnte nicht hinzugefügt werden
+info-more = Weitere Informationen
+dup-mode-side = Nebeneinander
+dup-mode-split = Schieberegler
+dup-side-left = Links
+dup-side-right = Rechts
+dup-badge-recommended = Empfohlen
+dup-badge-higher-res = Höhere Auflösung
+dup-badge-same-res = Gleiche Auflösung
+dup-badge-larger = Größere Datei
+dup-megapixels = { $mp } MP
+dup-file-size = { $mb } MB
+dup-mode-tooltip = Nebeneinander oder überlagert mit Schieberegler vergleichen (Taste S)

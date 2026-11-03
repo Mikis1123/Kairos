@@ -145,7 +145,7 @@ class TestLazyReconstruction(TempEnv):
         self.assertTrue(os.path.exists(result), "soubor orezku musi existovat na disku")
         img = cv_io.imread(result)
         self.assertIsNotNone(img)
-        self.assertEqual(img.shape[:2], (256, 256), "orez musi mit cilovou velikost 256x256")
+        self.assertEqual(img.shape[:2], (face_engine.AVATAR_PX, face_engine.AVATAR_PX), "orez musi mit cilovou velikost AVATAR_PX")
 
     def test_reconstruct_returns_existing_without_rewrite(self):
         """Pokud orez existuje, reconstruct_face_crop() ho vrati bez prepisu."""

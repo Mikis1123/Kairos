@@ -42,6 +42,7 @@ cache-unexpected-path = Unexpected cache path – deletion cancelled.
 ## color_manage
 
 color-reason-default = default
+color-reason-system = Windows (sRGB – like Photos, the browser and videos)
 color-reason-manual = set manually
 color-reason-profile = profile assigned to the display in Windows
 color-reason-wide-gamut = wide-gamut display without color management
@@ -515,8 +516,8 @@ settings-cache-pending = {"  "}→  { $pending_cache_dir }  (after saving and re
 settings-cache-usage = Thumbnails (can be deleted): <b>{ $thumbs_mb } MB</b><br>2048 px previews (can be deleted): <b>{ $previews_mb } MB</b><br>Face crops (permanent data, never deleted): <b>{ $faces_mb } MB</b>
 settings-caches-hint = Both caches rebuild themselves in the background. Face crops, people, the library, and your photos are unaffected.
 settings-change-passcode = Change Passcode…
-settings-color-display = Match photo colors to the display
-settings-color-hint = Now: { $name } – { $reason }. Off = always sRGB (for displays that convert colors themselves). After a change, previews are regenerated in the background.
+settings-color-display = Panel wide gamut (exact P3)
+settings-color-hint = Now: { $name } – { $reason }. Off (recommended) = colors follow Windows, exactly like Photos, the browser and videos. On = mapped to the panel's native gamut from its EDID: Display P3 shades beyond sRGB stay distinct, but everything looks calmer than the rest of Windows. After a change, previews are regenerated in the background.
 settings-default-sort = Default sort
 settings-delete-previews = Delete 2048 px Previews
 settings-delete-thumbs = Delete Thumbnails
@@ -611,6 +612,7 @@ splash-preparing = Preparing your library…
 accent-custom = Custom Color…
 accent-custom-dialog = Custom Accent Color
 accent-custom-tooltip = Custom color { $custom_hex }
+accent-classic = Classic Blue
 
 ## ui_nav
 
@@ -729,6 +731,7 @@ person-unknown = Unknown Person
 place-unknown = Unknown Place
 event-kicker-trip = Trip
 event-city-area = { $city } and surroundings
+event-region-pair = { $a } and { $b }
 moments-no-date = No Date
 events-journey-hint = J – play the Journey on the map
 key-click = click
@@ -965,6 +968,13 @@ map-nogl-body = The globe is drawn with WebGL, which isn’t available here. You
 map-journey = Journey
 map-replay = Play Again
 map-done = Done
+map-whole-trip = Whole trip
+map-day-n = Day { $n }
+map-days-a11y = Days of the trip
+map-next-day = Next day
+map-next-day-tip = Next day (Page Down)
+map-day-one-place = one place, plays within the whole trip
+map-seek-a11y = Position in the Journey
 map-controls-a11y = Journey playback
 map-prev-stop = Previous stop
 map-next-stop = Next stop
@@ -1032,3 +1042,15 @@ music-added = { $count ->
    *[other] { $count } tracks added. Journeys can use them now.
 }
 music-add-failed = Couldn’t add the music
+info-more = More information
+dup-mode-side = Side by Side
+dup-mode-split = Slider
+dup-side-left = Left
+dup-side-right = Right
+dup-badge-recommended = Recommended
+dup-badge-higher-res = Higher resolution
+dup-badge-same-res = Same resolution
+dup-badge-larger = Larger file
+dup-megapixels = { $mp } MP
+dup-file-size = { $mb } MB
+dup-mode-tooltip = Compare side by side or overlaid with a slider (S key)

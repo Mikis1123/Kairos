@@ -53,7 +53,7 @@ DEFAULT_CONFIG = {
     # Sprint 3 – text na fotkách (OCR Windows, offline) pro hledání slovem
     "ocr_text": True,
     # Stage 2 – barvy fotek: "auto" = do profilu displeje (color_manage), "srgb" = vždy sRGB
-    "color_output": "auto",
+    "color_output": "system",
     # Stage 3 – složka Skryté v postranním panelu (vypnuto = jen z Předvoleb)
     "show_hidden_folder": True,
     # Gate 0 – AI na pozadí na baterii: "throttle" | "pause" | "full" (power.py)

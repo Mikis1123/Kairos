@@ -8,10 +8,19 @@ nekonečné. Data jdou do window.playJourney() v map_vault.html.
 Túra (fotky po stovkách metrů) dostane zastávku skoro u každé vyhlídky (nejmenší poloměr
 0,4 km) – kamera pak jede po skutečné stezce mezi nimi (map_vault.html trailLeg). Na každé
 zastávce se ukáže jediný nejlepší snímek (best_shot: oblíbená > série > ostrost).
+
+Day chapters (2026-11-03): a multi-day Journey also carries "days", one per day of the trip.
+Days come from the trip's chapter events (trips.py), or from calendar days with a 04:00 cut-off
+when the event has no chapters. Each day has its own stops, built from that day's photos alone,
+so a single day plays as a focused flyover with full detail. Each day also has "first", the
+whole-trip stop where that day begins, so the page can either play one day or jump to it
+inside the whole film. A day with fewer than two places is listed but can't be played on its
+own ("stops": []).
 """
 from i18n import event_title, tr
 import math
 from collections import Counter
+from datetime import datetime, timedelta
 
 import gpx_tracks
 from database import visible_media_sql
@@ -21,6 +30,8 @@ MAX_STOPS = 24
 MIN_STOPS = 2                 # jedna zastávka není cesta – kamera by neměla kam letět
 POLAROIDS_PER_STOP = 4        # fotky zastávky v datech (pás / náhledy); ukazuje se best
 MAX_JOURNEY_ROWS = 5000
+DAY_CUTOFF_H = 4              # photos before 04:00 belong to the previous day (calendar fallback)
+MAX_DAYS = 31
 BURST_HAMMING = 10            # pHash do této vzdálenosti = stejný záběr (série / duplikát)
 BURST_BONUS = 0.6             # váha velikosti série (log2) proti ostrosti (log)
 FAVORITE_BONUS = 3.0
@@ -188,10 +199,18 @@ def iso_minute(value):
     return s.replace(":", "-", 2) if s[4:5] == ":" else s
 
 
+def _has_chapters(conn):
+    try:
+        return any(r[1] == "chapter_id" for r in conn.execute("PRAGMA table_info(media_items)"))
+    except Exception:
+        return False
+
+
 def _geo_photos(conn, event_id, thumb_url, image_url=None):
+    chapter = "m.chapter_id" if _has_chapters(conn) else "NULL"
     rows = conn.execute(f"""
         SELECT m.id, m.latitude, m.longitude, m.place_city, m.date_taken, m.thumbnail_path,
-               m.phash, m.sharpness_score, m.is_favorite, m.media_type, m.file_path
+               m.phash, m.sharpness_score, m.is_favorite, m.media_type, m.file_path, {chapter}
         FROM media_items m
         WHERE m.event_id = ? AND m.latitude IS NOT NULL AND m.date_taken IS NOT NULL
           AND {visible_media_sql('m')}
@@ -199,7 +218,7 @@ def _geo_photos(conn, event_id, thumb_url, image_url=None):
     """, (event_id,)).fetchall()
     focus = _event_focus(conn, event_id)
     photos = []
-    for mid, lat, lon, city, date, thumb, phash, sharp, fav, mtype, path in rows:
+    for mid, lat, lon, city, date, thumb, phash, sharp, fav, mtype, path, chap in rows:
         ll = _valid(lat, lon)
         if ll is None:
             continue
@@ -207,7 +226,7 @@ def _geo_photos(conn, event_id, thumb_url, image_url=None):
                        "date": iso_minute(date), "thumb": thumb_url(thumb),
                        "image": image_url(path) if image_url else "",
                        "phash": phash, "sharpness": sharp or 0.0, "fav": bool(fav), "type": mtype,
-                       "focus": focus.get(int(mid))})
+                       "focus": focus.get(int(mid)), "chapter": int(chap) if chap is not None else None})
     # řadit až po převodu: EXIF „2023:07:06“ by v SQL skončilo za ISO „2023-07-06“
     photos.sort(key=lambda p: (p["date"], p["id"]))
     return photos
@@ -235,6 +254,63 @@ def list_journeys(conn):
     return out
 
 
+def day_of(date):
+    """'2026-07-07 01:30' -> '2026-07-06' (before DAY_CUTOFF_H it is still the previous day)."""
+    try:
+        dt = datetime.strptime(str(date)[:16], "%Y-%m-%d %H:%M")
+    except ValueError:
+        return str(date)[:10]
+    return (dt - timedelta(hours=DAY_CUTOFF_H)).strftime("%Y-%m-%d")
+
+
+def split_days(photos):
+    """Photos (time order) -> [[photos of day 1], [day 2], ...]. Chapters (trips.py) win,
+    because the trip clustering already decided where each day ends (night anchors). Without
+    chapters it falls back to calendar days with the 04:00 cut-off."""
+    if photos and all(p.get("chapter") is not None for p in photos):
+        key = lambda p: p["chapter"]
+    else:
+        key = lambda p: day_of(p["date"])
+    days, last = [], object()
+    for p in photos:
+        k = key(p)
+        if not days or k != last:
+            days.append([])
+            last = k
+        days[-1].append(p)
+    return days
+
+
+def first_stop_at(stops, start):
+    """Index of the whole-trip stop that is current at time `start` (where the day begins)."""
+    for i, s in enumerate(stops):
+        if s["end"] >= start:
+            return i
+    return len(stops) - 1
+
+
+def build_days(conn, photos, stops):
+    """Day chapters of a multi-day Journey (see the module doc). [] for a single day."""
+    groups = split_days(photos)
+    if len(groups) < 2 or len(groups) > MAX_DAYS:
+        return []
+    days = []
+    for n, g in enumerate(groups, 1):
+        day_stops = build_stops(g)
+        playable = len(day_stops) >= MIN_STOPS
+        cities = Counter(p["city"] for p in g if p.get("city"))
+        day = {"n": n, "date": day_of(g[0]["date"]), "start": g[0]["date"], "end": g[-1]["date"],
+               "count": len(g), "city": cities.most_common(1)[0][0] if cities else "",
+               "thumb": best_shot(g)["thumb"], "first": first_stop_at(stops, g[0]["date"]),
+               "stops": day_stops if playable else []}
+        if playable:
+            tracks = gpx_tracks.leg_tracks(conn, day_stops)
+            if tracks:
+                day["tracks"] = {str(i): line for i, line in tracks.items()}
+        days.append(day)
+    return days
+
+
 def build_journey(conn, event_id, thumb_url=lambda p: "", image_url=None):
     """Data pro window.playJourney(), nebo None, když událost nemá aspoň dvě místa.
     image_url(cesta originálu) -> URL ostrého náhledu pro nejlepší snímek zastávky ('' = není)."""
@@ -242,7 +318,8 @@ def build_journey(conn, event_id, thumb_url=lambda p: "", image_url=None):
                       (int(event_id),)).fetchone()
     if ev is None:
         return None
-    stops = build_stops(_geo_photos(conn, ev[0], thumb_url, image_url))
+    photos = _geo_photos(conn, ev[0], thumb_url, image_url)
+    stops = build_stops(photos)
     if len(stops) < MIN_STOPS:
         return None
     location = ev[2] or next((s["city"] for s in stops if s["city"]), "")
@@ -253,4 +330,7 @@ def build_journey(conn, event_id, thumb_url=lambda p: "", image_url=None):
     tracks = gpx_tracks.leg_tracks(conn, stops)
     if tracks:
         data["tracks"] = {str(i): line for i, line in tracks.items()}
+    days = build_days(conn, photos, stops)
+    if days:
+        data["days"] = days
     return data

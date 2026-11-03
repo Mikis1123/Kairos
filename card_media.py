@@ -17,6 +17,7 @@ import subprocess
 import threading
 
 import paths
+import video_clap
 import video_proxy
 
 HIGHLIGHT_S = 3.0
@@ -31,8 +32,11 @@ def highlight_dir():
     return paths.HIGHLIGHT_DIR                  # čteno za běhu (testy ho přesměrují)
 
 
+CLIP_FRAMING = "|full-frame"     # klíč souboru: klipy z dřívějška byly oříznuté na clap (video_clap)
+
+
 def highlight_path(source):
-    key = os.path.normcase(os.path.abspath(source))
+    key = os.path.normcase(os.path.abspath(source)) + CLIP_FRAMING
     return os.path.join(highlight_dir(), hashlib.sha1(key.encode("utf-8")).hexdigest()[:20] + ".webm")
 
 
@@ -111,7 +115,9 @@ def ffmpeg_cmd(source, target, start_ms, info, threads=2, ffmpeg_path=None):
                   "zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
     vf.append("format=yuv420p")
     return [ffmpeg_path or paths.FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-            "-ss", f"{start_ms / 1000:.3f}", "-i", source, "-t", f"{HIGHLIGHT_S:.2f}",
+            "-ss", f"{start_ms / 1000:.3f}",
+            *video_clap.ffmpeg_full_frame_args(ffmpeg_path or paths.FFMPEG_PATH),
+            "-i", source, "-t", f"{HIGHLIGHT_S:.2f}",
             "-map", "0:v:0", "-an", "-vf", ",".join(vf),
             "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1",
             "-crf", str(HIGHLIGHT_CRF), "-b:v", "0", "-threads", str(threads), "-f", "webm", target]
@@ -162,12 +168,8 @@ def build(item, should_stop=None, threads=2, ffmpeg_path=None):
     if proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
         _remove(tmp)
         return None
-    try:
-        os.replace(tmp, target)
-    except OSError:
-        _remove(tmp)
-        return None
-    return target
+    import fs_atomic
+    return target if fs_atomic.replace(tmp, target) else None
 
 
 class ClipWorker(threading.Thread):

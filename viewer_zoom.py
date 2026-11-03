@@ -30,6 +30,12 @@ NOTCH_FACTOR = 1.25             # jeden zub kolečka myši
 INERTIA_TAU_S = 0.325
 INERTIA_MIN_SPEED = 25.0        # logické px/s – pod tím setrvačnost končí
 FIT_EPS = 1e-3
+MIN_W = 1e-6                    # pod tím je šířka „neplatná“ (0.0 = vešlé je sentinel, ne rozměr)
+MIN_FACTOR, MAX_FACTOR = 0.05, 50.0   # jeden krok zoom_by – rychlé/zběsilé vstupy nesmí přeskočit do ≤ 0 / ∞
+
+
+def _finite_pos(x):
+    return isinstance(x, (int, float)) and math.isfinite(x) and x > MIN_W
 
 
 # ── geometrie (čistá) ─────────────────────────────────────────────────────────
@@ -43,6 +49,8 @@ def fit_width(aspect, vw, vh):
 
 def clamp_center(u, v, w, aspect, vw, vh):
     """Střed tak, aby obraz větší než plocha nenechal okraj; menší rozměr se centruje."""
+    if not (_finite_pos(w) and _finite_pos(aspect)) or vw <= 0 or vh <= 0:
+        return 0.5, 0.5
     h = w * aspect
     if w <= vw:
         u = 0.5
@@ -58,7 +66,12 @@ def clamp_center(u, v, w, aspect, vw, vh):
 
 
 def zoom_about(u, v, w, new_w, ax, ay, vw, vh, aspect):
-    """Nový střed tak, aby bod obrazu pod (ax, ay) zůstal pod kurzorem."""
+    """Nový střed tak, aby bod obrazu pod (ax, ay) zůstal pod kurzorem.
+    Neplatné rozměry (w / new_w / aspect ≤ 0, prázdná plocha) -> beze změny, žádné dělení."""
+    if vw <= 0 or vh <= 0:
+        return u, v
+    if not (_finite_pos(w) and _finite_pos(new_w) and _finite_pos(aspect)):
+        return u, v
     h, new_h = w * aspect, new_w * aspect
     pu = u + (ax - vw / 2.0) / w
     pv = v + (ay - vh / 2.0) / h
@@ -282,17 +295,22 @@ class ZoomController(QObject):
 
     # ── akce ──
     def zoom_to(self, new_w, anchor=None, animate=True):
-        if not self.enabled or self.aspect <= 0:
+        if not self.enabled or not _finite_pos(self.aspect):
             return
         vp = self.canvas.viewport()
         vw, vh = vp.width(), vp.height()
         fit = self.fit_w()
+        if vw <= 0 or vh <= 0 or not _finite_pos(fit):
+            return                                          # ještě bez rozvržení (plocha 0×0)
+        if not isinstance(new_w, (int, float)) or math.isnan(new_w):
+            return
         cur_w = self.w or fit
         new_w = min(max(new_w, fit), self.max_w())
         ax, ay = (anchor.x(), anchor.y()) if anchor is not None else (vw / 2.0, vh / 2.0)
         # z cíle běžící animace (rychlé zuby kolečka se sčítají), jinak z aktuálního stavu
         base = self._anim_to if self._anim_to is not None else (cur_w, self.u, self.v)
         bw, bu, bv = base
+        bw = bw or fit                                      # 0.0 = cíl „vešlé“ (zoom ven během animace)
         nu, nv = zoom_about(bu, bv, bw, new_w, ax, ay, vw, vh, self.aspect)
         target = (0.0 if abs(new_w - fit) <= fit * FIT_EPS else new_w, nu, nv)
         if new_w > fit * (1 + FIT_EPS) and not self._wanted:
@@ -312,6 +330,15 @@ class ZoomController(QObject):
     def zoom_by(self, factor, anchor=None, animate=True):
         cur = self._anim_to[0] if self._anim_to is not None else self.w
         cur = cur or self.fit_w()
+        if not _finite_pos(cur):
+            return
+        try:
+            factor = float(factor)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(factor) or factor <= 0:
+            return
+        factor = min(max(factor, MIN_FACTOR), MAX_FACTOR)
         self.zoom_to(cur * factor, anchor, animate)
 
     def reset(self, animate=True):
@@ -325,7 +352,7 @@ class ZoomController(QObject):
             self.zoom_to(max(self.one_to_one_w(), self.fit_w() * 1.6), anchor)
 
     def pan_by(self, dx, dy, apply=True):
-        if not self.is_zoomed():
+        if not self.is_zoomed() or not _finite_pos(self.aspect):
             return
         vp = self.canvas.viewport()
         self.u, self.v = clamp_center(self.u - dx / self.w, self.v - dy / (self.w * self.aspect),
@@ -402,6 +429,8 @@ class ZoomController(QObject):
     def resized(self):
         if self.is_zoomed():
             vp = self.canvas.viewport()
+            if vp.width() <= 0 or vp.height() <= 0:
+                return                                      # minimalizace: stav nechat, srovná další resize
             self.w = max(self.w, self.fit_w())
             self.u, self.v = clamp_center(self.u, self.v, self.w, self.aspect, vp.width(), vp.height())
             self._apply()
@@ -416,12 +445,15 @@ class ZoomController(QObject):
         now = time.perf_counter()
         busy = False
         if self._anim_to is not None:
-            t = min(1.0, (now - self._anim_t0) * 1000.0 / self._anim_ms)
+            t = min(1.0, (now - self._anim_t0) * 1000.0 / max(1, self._anim_ms))
             e = 1.0 - (1.0 - t) ** 3                       # ease-out cubic
             (w0, u0, v0), (w1, u1, v1) = self._anim_from, self._anim_to
             fit = self.fit_w()
             a, b = (w0 or fit), (w1 or fit)
-            w = math.exp(math.log(a) + (math.log(b) - math.log(a)) * e)   # zoom v log měřítku
+            if _finite_pos(a) and _finite_pos(b):
+                w = math.exp(math.log(a) + (math.log(b) - math.log(a)) * e)   # zoom v log měřítku
+            else:                                          # plocha zmizela uprostřed animace
+                w, t = (b if _finite_pos(b) else 0.0), 1.0
             self.w = 0.0 if (t >= 1.0 and w1 == 0.0) else w
             self.u, self.v = u0 + (u1 - u0) * e, v0 + (v1 - v0) * e
             if self.w:
@@ -462,7 +494,7 @@ class ZoomController(QObject):
             if src is None or (self._base is not None and src.width() < self._base.width()
                                and src.width() < need):
                 src = self._base or src
-            if src is None:
+            if src is None or src.width() <= 0:
                 zoomed = False
             else:
                 if self.item.source() is not src:
