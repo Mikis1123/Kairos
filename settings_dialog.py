@@ -31,6 +31,7 @@ import preview_cache
 import theme
 import video_proxy
 import tokens
+import ambient_music
 import brand
 import i18n
 
@@ -334,6 +335,26 @@ class SettingsDialog(QDialog):
         self.chk_memories.setChecked(bool(self.config.get("show_memories", True)))
         self._row(g, stacked=self.chk_memories)
         layout.addWidget(_hint(tr("settings-appearance-hint")))
+
+        # Gate 2 D: hudba pro Cestu - vlastní skladby v %APPDATA%/Kairos/music
+        g = self._group(layout, tr("settings-music"))
+        self.list_music = QListWidget()
+        self.list_music.setObjectName("list_music")
+        self.list_music.setMinimumHeight(72)
+        self._reload_music()
+        music_box = QHBoxLayout()
+        self.btn_add_music = KButton(tr("music-add"), compact=True)
+        self.btn_add_music.clicked.connect(lambda _checked=False: self.add_music())
+        btn_remove_music = KButton(tr("settings-remove-selected"), compact=True)
+        btn_remove_music.clicked.connect(self.remove_music)
+        btn_open_music = KButton(tr("music-open-folder"), compact=True)
+        btn_open_music.clicked.connect(self.open_music_folder)
+        for b in (self.btn_add_music, btn_remove_music, btn_open_music):
+            music_box.addWidget(b)
+        music_box.addStretch()
+        self._row(g, tr("settings-music-own"), stacked=self.list_music)
+        self._row(g, stacked=music_box)
+        layout.addWidget(_hint(tr("settings-music-hint")))
 
         # Řazení
         g = self._group(layout, tr("settings-photo-library"))
@@ -732,6 +753,39 @@ class SettingsDialog(QDialog):
         self.cache_cleaned = self.cache_cleaned or values.get("clear_thumbnails", False)
         self.previews_cleared = self.previews_cleared or values.get("clear_previews", False)
         self.accept()
+
+    def _reload_music(self):
+        self.list_music.clear()
+        for t in ambient_music.user_tracks():
+            item = QListWidgetItem(t["title"])
+            item.setData(Qt.ItemDataRole.UserRole, t["file"])
+            self.list_music.addItem(item)
+
+    def add_music(self, files=None):
+        """Add Music… (the main window also shows a toast and refreshes the Journey player)."""
+        owner = self.parent()
+        if files is None or isinstance(files, bool):  # clicked(bool) must never pose as a file list
+            files, _ = QFileDialog.getOpenFileNames(self, tr("music-add-pick"), "", tr("music-file-filter"))
+        if not files:
+            return []
+        if owner is not None and hasattr(owner, "add_music"):
+            added = owner.add_music(files, parent=self)
+        else:
+            added = ambient_music.add_user_tracks(files)
+        self._reload_music()
+        return added
+
+    def remove_music(self):
+        for item in self.list_music.selectedItems():
+            try:
+                ambient_music.remove_user_track(item.data(Qt.ItemDataRole.UserRole))
+            except OSError as e:
+                print(f"[Music] {e}")
+        self._reload_music()
+
+    def open_music_folder(self):
+        os.makedirs(ambient_music.USER_MUSIC_DIR, exist_ok=True)
+        os.startfile(ambient_music.USER_MUSIC_DIR)       # i18n-ok: Windows shell call, no text
 
     def add_library_folder(self):
         folder = QFileDialog.getExistingDirectory(self, tr("settings-pick-folder"))

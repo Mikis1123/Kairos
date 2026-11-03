@@ -45,6 +45,15 @@ if os.path.exists('video_output.qml'):
 # Batch 6: MapLibre GL JS 5 (zeměkoule, terén, Cesta, minimapa), vč. licence – jediný mapový stack
 if os.path.isdir(os.path.join('vendor', 'maplibre')):
     datas.append((os.path.join('vendor', 'maplibre'), os.path.join('vendor', 'maplibre')))
+# Gate 2: mapa ve WebView2 (map_host.py) – SDK z NuGet Microsoft.Web.WebView2: spravované
+# Microsoft.Web.WebView2.Core.dll a nativní WebView2Loader.dll (x64) MUSÍ ležet vedle sebe
+# (Core.dll si loader hledá ve své složce). Jako data, ne binárky: analýza závislostí by
+# loader přesunula do kořene _internal. Runtime WebView2 (Evergreen) je součástí Windows 11;
+# bez něj map_host.available() = False a mapa zůstane v QtWebEngine.
+WEBVIEW2_SDK = os.path.join('vendor', 'webview2')
+for f in ('Microsoft.Web.WebView2.Core.dll', 'WebView2Loader.dll', 'LICENSE.txt'):
+    if os.path.exists(os.path.join(WEBVIEW2_SDK, f)):
+        datas.append((os.path.join(WEBVIEW2_SDK, f), WEBVIEW2_SDK))
 # Cesta 3.0 (C6): hudební podkres – vlastní skladby z `python ambient_music.py` (ambient_music.tracks
 # je hledá v RESOURCE_DIR/assets/music)
 if os.path.isdir(os.path.join('assets', 'music')):
@@ -82,6 +91,12 @@ hidden_imports = [
     # Gate 0: obsahový otisk médií (media_identity) – C rozšíření, ať ho analýza nepřehlédne
     'xxhash',
     'data_migration',
+    # Gate 2: WebView2 přes pythonnet (.NET Framework 4.x je ve Windows); hooky contrib přibalí
+    # Python.Runtime.dll (clr) a ffi knihovny clr_loader
+    'map_host',
+    'clr',
+    'clr_loader',
+    'pythonnet',
 ]
 hidden_imports += collect_submodules('pillow_heif')
 # Sprint 3: OCR Windows (ocr_engine) – projekce winrt se načítají dynamicky

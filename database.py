@@ -301,6 +301,15 @@ def init_db():
             ("tint", "TEXT"),
             ("tint_source", "TEXT"),
         ])
+        # Gate 2 B: trip hierarchy (trips.py) - kind = moment | day_trip | journey | chapter,
+        # chapters point to their journey; media_items.chapter_id = the day inside a journey
+        _ensure_columns(cursor, "events", [
+            ("kind", "TEXT"),
+            ("parent_id", "INTEGER"),
+        ])
+        _ensure_columns(cursor, "media_items", [
+            ("chapter_id", "INTEGER"),
+        ])
 
         # Původ embeddingu (EMBEDDING_SIG_SQL položky, ze které vznikl). NULL nebo jiný podpis =
         # embedding nepatří k aktuálnímu souboru -> přepočítá ho démon (refresh_embeddings).
@@ -309,6 +318,15 @@ def init_db():
         _ensure_columns(cursor, "image_embeddings", [
             ("source_sig", "TEXT"),
         ])
+
+        # Trips v3: app_meta holds the trip-algorithm version the events were clustered with.
+        # A brand-new (empty) library starts current; an existing one without a stamp is
+        # re-clustered once at startup (trips.ensure_current via MainWindow._migrate_trips).
+        cursor.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
+        if cursor.execute("SELECT 1 FROM app_meta WHERE key = 'trips_algo'").fetchone() is None \
+                and cursor.execute("SELECT 1 FROM media_items LIMIT 1").fetchone() is None:
+            import trips
+            cursor.execute("INSERT INTO app_meta (key, value) VALUES ('trips_algo', ?)", (str(trips.ALGO_VERSION),))
 
         _ensure_columns(cursor, "people", [
             ("key_face_id", "INTEGER"),

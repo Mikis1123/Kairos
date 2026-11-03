@@ -2,18 +2,25 @@
 <html lang="cs">
 <head>
 <meta charset="utf-8">
+<!-- Gate 2: the network allowlist (main.ALLOWED_WEB_HOSTS) as a CSP – the WebView2 host does
+     not route every request through Python; QtWebEngine still has its WebUrlInterceptor too.
+     test_gate2_webview2 pins the host list against main.ALLOWED_WEB_HOSTS. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src file: qrc: blob: 'unsafe-inline' 'unsafe-eval'; worker-src blob: file:; child-src blob:; style-src file: 'unsafe-inline'; font-src file: data:; media-src file: data: blob:; img-src file: data: blob: http://127.0.0.1:* https://server.arcgisonline.com https://tile.opentopomap.org https://tile.waymarkedtrails.org https://tiles.openfreemap.org https://elevation-tiles-prod.s3.amazonaws.com; connect-src file: data: blob: http://127.0.0.1:* https://server.arcgisonline.com https://tile.opentopomap.org https://tile.waymarkedtrails.org https://tiles.openfreemap.org https://elevation-tiles-prod.s3.amazonaws.com">
 <title>Kairos – Places</title>
 <!-- Batch 6: čistý MapLibre GL JS 5.24.0 (přibalený lokálně v vendor/, ověřené SHA-512 z npm) –
      skutečná 3D zeměkoule (projekce globe), atmosféra, 3D terén z AWS Terrain Tiles,
      piny fotek jako HTML značky, klidové otáčení, přelety a přehrávání Cesty.
      Podklady: Základní a Satelitní vektorově (OpenFreeMap, bez API klíče), bez stylu rastrová
      záloha (Esri); Turistická rastrově (OpenTopoMap + Waymarked Trails).
-     Vše ostatní blokuje WebUrlInterceptor v main.py (ALLOWED_WEB_HOSTS). -->
+     Vše ostatní blokuje CSP níže (hostitel WebView2, map_host.py) a v QtWebEngine navíc
+     WebUrlInterceptor v main.py (ALLOWED_WEB_HOSTS). -->
 <link rel="stylesheet" href="vendor/maplibre/maplibre-gl.css">
 <script src="vendor/maplibre/maplibre-gl.js"></script>
 <script src="director.js"></script>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <style>
+  body.drop-target::after { content: ''; position: fixed; inset: 6px; border-radius: 14px; pointer-events: none;
+    box-shadow: inset 0 0 0 2px var(--accent), inset 0 0 40px var(--accent-soft); z-index: 9999; }
   :root { --accent: #8B7CF6; --accent-soft: rgba(139,124,246,0.28);
           --glass: rgba(30,30,34,0.62); --glass-strong: rgba(30,30,34,0.86);
           --hair: rgba(255,255,255,0.12); --text: #F5F5F7; --text-2: #A1A1AA; --ease: cubic-bezier(.2,.8,.2,1); }
@@ -314,6 +321,21 @@
   var SPIN_DEG_PER_S = 2.4;
   var TERRAIN_MIN_ZOOM = 8;           // 3D terén až od přiblížení krajiny (na zeměkouli neviditelný)
   var TERRAIN_EXAGGERATION = 1.35;
+  // Gate 2 C: relief is exaggerated only where it reads as landscape; up close (valleys, a
+  // town, a trail) it eases to true scale so slopes and buildings are not stretched
+  var TERRAIN_TRUE_FROM = 10, TERRAIN_TRUE_AT = 13;
+  var MAX_PITCH = 60;                 // steeper tilts smear distant terrain tiles and break the horizon
+  function terrainExaggeration(z) {
+    var x = Math.max(0, Math.min(1, (z - TERRAIN_TRUE_FROM) / (TERRAIN_TRUE_AT - TERRAIN_TRUE_FROM)));
+    x = x * x * (3 - 2 * x);
+    return TERRAIN_EXAGGERATION + (1 - TERRAIN_EXAGGERATION) * x;
+  }
+  window.terrainExaggeration = terrainExaggeration;
+  // Sharp rasters on HiDPI screens: the sources offer no @2x tiles, so a capable machine asks
+  // for one zoom level deeper (tileSize 128) and gets 1:1 physical pixels instead of upscaling
+  function rasterTileSize() {
+    return (window.devicePixelRatio || 1) >= 1.5 && PERF.map_hidpi_raster ? 128 : 256;
+  }
   // Zeměkoule se do roviny překlopí dřív než výchozí „globe“ (z 11–12): terén a jeho mlha
   // MapLibre fungují jen v mercatoru („terrain is not fully supported on vertical perspective
   // projection“, „calculateFogMatrix is not supported on globe projection“ za každý snímek)
@@ -339,6 +361,44 @@
   // dává vzdálené polovině okna dlaždice o 3–4 úrovně hrubší = „půlka ostrá, půlka rozmazaná“.
   // 6 drží vzdálené dlaždice ostřejší za cenu pár dlaždic navíc (jen při náklonu).
   var TILE_LOD_ZOOM_LEVELS = 6, TILE_LOD_RATIO = 3;
+  // ── Gate 2: frame pacing cap ────────────────────────────────────────────────
+  // WebView2 paces requestAnimationFrame at the panel's rate (119.5 fps measured on 120 Hz).
+  // On battery the app asks for 60 fps: callbacks then run on every other vsync – an even
+  // 16.7 ms cadence, never a mix of 8 and 25 ms. MapLibre looks requestAnimationFrame up at
+  // call time, so wrapping window.requestAnimationFrame paces the whole map.
+  var rafDiv = 1, rafQueue = [], rafSeq = 0, rafPumpId = 0, rafVsync = 0;
+  var nativeRAF = window.requestAnimationFrame.bind(window), nativeCAF = window.cancelAnimationFrame.bind(window);
+  function rafPump(t) {
+    rafPumpId = 0;
+    rafVsync++;
+    if (rafDiv > 1 && rafVsync % rafDiv) { rafPumpId = nativeRAF(rafPump); return; }
+    var q = rafQueue;
+    rafQueue = [];
+    for (var i = 0; i < q.length; i++) {
+      try { q[i].cb(t); } catch (e) { setTimeout(function () { throw e; }, 0); }
+    }
+  }
+  window.requestAnimationFrame = function (cb) {
+    if (rafDiv === 1 && !rafQueue.length) return nativeRAF(cb);
+    var id = -(++rafSeq);
+    rafQueue.push({ id: id, cb: cb });
+    if (!rafPumpId) rafPumpId = nativeRAF(rafPump);
+    return id;
+  };
+  window.cancelAnimationFrame = function (id) {
+    if (id < 0) { rafQueue = rafQueue.filter(function (x) { return x.id !== id; }); return; }
+    nativeCAF(id);
+  };
+  var fpsCap = 0;
+  window.setFrameCap = function (fps) {                 // main.py: 60 on battery, 0 = panel rate
+    fpsCap = Math.max(0, +fps || 0);
+    var hz = PERF.refresh_hz || 60;
+    rafDiv = fpsCap && hz / fpsCap >= 1.8 ? Math.round(hz / fpsCap) : 1;
+    calibrateCadence();
+    return rafDiv;
+  };
+  window.getFrameCap = function () { return { fps: fpsCap, div: rafDiv }; };
+
   var bridge = null;
   var map = null;                     // maplibregl.Map, vzniká až na viditelné stránce
   var markers = [];                   // [{id, lat, lon, name, city, date, thumb}]
@@ -477,7 +537,7 @@
     return localizeStyle({
       version: 8, glyphs: base.glyphs, sprite: base.sprite,
       sources: {
-        esri: { type: 'raster', tileSize: 256, maxzoom: 19,
+        esri: { type: 'raster', tileSize: rasterTileSize(), maxzoom: 19,
                 tiles: [ESRI + 'World_Imagery/MapServer/tile/{z}/{y}/{x}'],
                 attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics' },
         openmaptiles: { type: 'vector', url: VECTOR_TILES_URL, attribution: OFM_ATTRIBUTION }
@@ -526,7 +586,7 @@
     var def = BASE_LAYERS[name], sources = {}, layers = [];
     def.layers.forEach(function (l, i) {
       var id = 'r' + i;
-      sources[id] = { type: 'raster', tiles: [l.url], tileSize: 256, maxzoom: def.maxZoom,
+      sources[id] = { type: 'raster', tiles: [l.url], tileSize: rasterTileSize(), maxzoom: def.maxZoom,
                       attribution: l.attribution || '' };
       var layer = { id: 'raster-' + i, type: 'raster', source: id, paint: { 'raster-fade-duration': 200 } };
       if (l.minZoom) layer.minzoom = l.minZoom;
@@ -865,7 +925,7 @@
     try {
       map = new maplibregl.Map({
         container: mapEl, style: built.style, center: [15.5, 49.8], zoom: GLOBE_ZOOM,
-        maxZoom: BASE_LAYERS[baseName].maxZoom, maxPitch: 72, attributionControl: { compact: true },
+        maxZoom: BASE_LAYERS[baseName].maxZoom, maxPitch: MAX_PITCH, attributionControl: { compact: true },
         fadeDuration: 180, canvasContextAttributes: { antialias: true }, transformRequest: transformRequest
       });
     } catch (e) {
@@ -887,12 +947,17 @@
     // pojistky se za KAŽDÝ snímek Cesty přepočítávaly shluky pinů a terén (piny jsou přitom skryté)
     map.on('zoomend', function () { if (director.directing) return; syncTerrain(); render(); });
     // oddalování (přelet zpět na zeměkouli): terén vypnout dřív, než se rovina zakřiví
-    map.on('zoom', function () { if (!director.directing && map.getTerrain() && !terrainAllowed()) syncTerrain(); });
+    map.on('zoom', function () {
+      if (director.directing) return;
+      if (map.getTerrain() && !terrainAllowed()) syncTerrain();
+      else followExaggeration();
+    });
     map.on('moveend', function () {
       setInteraction('map', false);     // vždy: pohyb začatý před Cestou jinak držel governor navždy
       if (director.directing) return;   // kamera Cesty jede po trase (jumpTo za snímek)
       terrainHold = false; syncTerrain(); render();
       restResolution();
+      settleDetail();
     });
     map.on('movestart', function (e) {
       hidePinCard();
@@ -906,6 +971,7 @@
         var now = performance.now();
         meterTick(mapMeter, now);
         adaptResolution(now);
+        motionDetailTick(now);
       }
     });
     map.on('mousemove', 'pins', onPinMove);
@@ -921,6 +987,7 @@
 
   function onStyleLoad() {
     styleReady = true;
+    resetDetailState();
     reliefLit = null;                   // nový styl = výchozí nasvícení reliéfu
     mapImages = {};                     // setStyle zahodí obrázky mapy – piny se přidají znovu
     tileSourceIds = Object.keys((map.getStyle() || {}).sources || {});
@@ -1057,7 +1124,10 @@
       }
       return;
     }
-    try { map.setTerrain(want ? { source: 'dem', exaggeration: TERRAIN_EXAGGERATION } : null); } catch (e) { /* styl se mění */ }
+    try { map.setTerrain(want ? { source: 'dem', exaggeration: terrainExaggeration(map.getZoom()) } : null); } catch (e) { /* styl se mění */ }
+  }
+  function followExaggeration() {     // zoom changed: relief scale follows (no-op without terrain)
+    if (map && map.getTerrain() && !journey.active) setExaggeration(terrainExaggeration(map.getZoom()));
   }
   function holdTerrain() {            // před dlouhým přeletem: rovina bez terénu, zapne se v cíli
     terrainHold = true;
@@ -1076,7 +1146,7 @@
   // grafice), v klidu se vrátí na plnou ostrost. LOD dlaždic a terén podle úrovně stroje.
   var PERF = { tier: 'high', refresh_hz: 60, map_pixel_ratio_max: 0, map_pixel_ratio_min: 1.25,
                map_lod_levels: TILE_LOD_ZOOM_LEVELS, map_lod_ratio: TILE_LOD_RATIO, map_terrain: true,
-               map_terrain_exaggeration: TERRAIN_EXAGGERATION, map_hillshade: true };
+               map_terrain_exaggeration: TERRAIN_EXAGGERATION, map_hillshade: true, map_hidpi_raster: false };
   var RES_STEP = 0.25, RES_SLOW = 1.35, RES_FAST = 0.9, RES_HOLD_MS = 900, RES_REST_MS = 450;
   var res = { ratio: 0, ema: 0, lastFrame: 0, slowSince: 0, fastSince: 0, changedAt: 0, restTimer: 0 };
   function nativeRatio() { return window.devicePixelRatio || 1; }
@@ -1138,9 +1208,166 @@
       if (map && !map.isMoving() && !director.directing) setRatio(maxRatio());
     }, RES_REST_MS);
   }
+  // ── Gate 2: adaptive detail while moving (LOD) ─────────────────────────────────
+  // At 120 Hz the budget is 8.3 ms. While the camera moves the map sheds detail in steps and
+  // gets all of it back the moment it settles:
+  //   1  relief shading fades out, coarser 3D-terrain mesh (64 instead of 128 per tile)
+  //   2  + canvas pixel ratio straight to the profile's floor, terrain mesh 32
+  // A high-refresh panel starts every motion at level 1. Level 2 is reached by measured MapLibre
+  // render CPU time or dropped frames, and remembered for the session; calm motions walk it back.
+  // At 60 Hz nothing changes unless frames really run over budget.
+  // Measured in the app at 120 Hz (2026-11-03, Radeon 860M, 1440×900 @2x): relief off cuts render
+  // p50 ~6.6 -> 5.5 ms. Rejected: coarser tile LOD while moving (re-requests tiles: 8.5 % dropped
+  // vs 4.3 %) and flat terrain while moving (no gain, mountains visibly collapse).
+  var MD_MAX = 2, MD_ESCALATE_MS = 250, MD_SETTLE_MS = 140, MD_FADE_MS = 220, MD_CALM_RUNS = 3;
+  var MD_OVER = 0.8, MD_CALM = 0.45;                    // render CPU share of the frame budget
+  var MD_DROP = 0.1;                                    // share of frames over 1.5x budget (EMA)
+  var MD_MESH = [128, 64, 32];
+  var md = { level: 0, learned: -1, cost: 0, drops: 0, last: 0, overSince: 0, worst: 0, calm: 0,
+             calmNeed: MD_CALM_RUNS, settleTimer: 0, fadeTimer: 0, relief: {}, ratioShed: false,
+             moving: false, levelTime: [0, 0, 0], levelSince: 0, hooked: false };
+  function highRefresh() { return frameBudgetMs() < 11; }
+  function detailFloor() {
+    if (md.learned < 0) md.learned = highRefresh() ? 1 : 0;     // first motion: proactive at 120 Hz
+    return Math.min(MD_MAX, md.learned);
+  }
+  function hookRenderCost() {                           // MapLibre render CPU per frame (_render)
+    if (md.hooked || !map || typeof map._render !== 'function') return;
+    var orig = map._render;
+    map._render = function (t) {
+      var a = performance.now(), r = orig.call(this, t), c = performance.now() - a;
+      md.cost = md.cost ? md.cost * 0.8 + c * 0.2 : c;
+      return r;
+    };
+    md.hooked = true;
+  }
+  function reliefIds() { return ['relief', 'relief-film'].filter(function (id) { return map.getLayer(id); }); }
+  function shedRelief(on) {
+    clearTimeout(md.fadeTimer);
+    reliefIds().forEach(function (id) {
+      try {
+        if (on) {
+          if (md.relief[id] || map.getLayoutProperty(id, 'visibility') === 'none') return;
+          md.relief[id] = { ex: map.getPaintProperty(id, 'hillshade-exaggeration') };
+          map.setPaintProperty(id, 'hillshade-exaggeration-transition', { duration: MD_FADE_MS, delay: 0 });
+          map.setPaintProperty(id, 'hillshade-exaggeration', 0);
+        } else if (md.relief[id]) {
+          var saved = md.relief[id];
+          delete md.relief[id];
+          if (saved.hidden) map.setLayoutProperty(id, 'visibility', 'visible');
+          map.setPaintProperty(id, 'hillshade-exaggeration-transition', { duration: 300, delay: 0 });
+          map.setPaintProperty(id, 'hillshade-exaggeration', saved.ex === undefined ? null : saved.ex);
+        }
+      } catch (e) { delete md.relief[id]; }
+    });
+    if (on) {                                           // faded out -> stop drawing it at all
+      md.fadeTimer = setTimeout(function () {
+        Object.keys(md.relief).forEach(function (id) {
+          if (md.level >= 1 && map.getLayer(id)) {
+            try { map.setLayoutProperty(id, 'visibility', 'none'); md.relief[id].hidden = true; } catch (e) { /* styl */ }
+          }
+        });
+      }, MD_FADE_MS + 30);
+    }
+  }
+  function setMesh(n) {
+    var t = map && map.terrain;
+    if (!t || t.meshSize === n) return;
+    t.meshSize = n;
+    t._meshCache = {};
+  }
+  function setDetail(level) {
+    if (!map || !styleReady) return;
+    level = Math.max(0, Math.min(MD_MAX, level));
+    if (level === md.level) return;
+    var now = performance.now();
+    if (md.levelSince) md.levelTime[md.level] += now - md.levelSince;
+    md.levelSince = now;
+    md.level = level;
+    try {
+      if (PERF.map_hillshade !== false) shedRelief(level >= 1);
+      setMesh(MD_MESH[level]);
+      var floor = level >= 2 && !journey.active;        // the film changes resolution only in dwells
+      if (floor !== md.ratioShed) {
+        md.ratioShed = floor;
+        if (floor) setRatio(minRatio());
+        else if (!map.isMoving() && !director.directing) setRatio(maxRatio());   // settled: full crispness
+      }
+    } catch (e) { /* styl se právě mění – onStyleLoad začne od plného detailu */ }
+    map.triggerRepaint();
+  }
+  function detailMoving() {                             // camera in motion (film: not in a dwell)
+    if (journey.active && film) {
+      var sg = film.segs[segIndexAt(director.t)];
+      return !!sg && sg.kind !== 'dwell';
+    }
+    return map.isMoving();
+  }
+  function motionDetailTick(now) {                      // from 'render' while moving / directing
+    hookRenderCost();
+    var moving = detailMoving();
+    if (!moving) { if (md.moving) settleDetail(); return; }
+    clearTimeout(md.settleTimer);
+    if (!md.moving) { md.moving = true; md.worst = 0; md.overSince = 0; md.last = 0; md.drops = 0; }
+    if (md.level < detailFloor()) setDetail(detailFloor());
+    var budget = frameBudgetMs(), share = md.cost / budget;
+    var dt = md.last ? now - md.last : 0;
+    md.last = now;
+    if (dt > 0 && dt < 250) md.drops = md.drops * 0.92 + (dt > 1.5 * budget ? 0.08 : 0);
+    md.worst = Math.max(md.worst, share);
+    if (share > MD_OVER || md.drops > MD_DROP) {
+      if (!md.overSince) md.overSince = now;
+      if (now - md.overSince > MD_ESCALATE_MS && md.level < MD_MAX) {
+        setDetail(md.level + 1);
+        md.learned = Math.max(md.learned, md.level);
+        md.calm = 0;
+        md.calmNeed = Math.min(12, md.calmNeed * 2);    // it was needed: decay more slowly
+        md.overSince = now;
+        md.cost = 0;
+        md.drops = 0;
+      }
+    } else {
+      md.overSince = 0;
+    }
+  }
+  function settleDetail(instant) {                      // camera at rest: full crispness back
+    clearTimeout(md.settleTimer);
+    function restore() {
+      if (md.moving) {
+        md.moving = false;
+        if (md.worst < MD_CALM && md.learned > 0 && md.level >= md.learned) {
+          if (++md.calm >= md.calmNeed) { md.learned--; md.calm = 0; }
+        } else if (md.worst >= MD_CALM) {
+          md.calm = 0;
+        }
+      }
+      setDetail(0);
+    }
+    if (instant) restore();
+    else md.settleTimer = setTimeout(restore, MD_SETTLE_MS);
+  }
+  function resetDetailState() {                         // new style: layers came back at full detail
+    clearTimeout(md.settleTimer);
+    clearTimeout(md.fadeTimer);
+    md.level = 0; md.relief = {}; md.ratioShed = false; md.moving = false;
+  }
+  window.setDetailMax = function (n) {                 // bench / tests: cap the deepest level
+    MD_MAX = Math.max(0, Math.min(2, n | 0));
+    md.learned = Math.min(md.learned, MD_MAX);
+    return MD_MAX;
+  };
+  window.getDetailState = function () {
+    var t = md.levelTime.slice();
+    if (md.levelSince) t[md.level] += performance.now() - md.levelSince;
+    return { level: md.level, learned: md.learned, cost: +md.cost.toFixed(2), moving: md.moving,
+             budget: +frameBudgetMs().toFixed(2), levelTime: t.map(function (x) { return Math.round(x); }) };
+  };
+
   window.setPerfProfile = function (p) {
     if (!p || typeof p !== 'object') return PERF.tier;
+    var hidpi = PERF.map_hidpi_raster;
     Object.keys(PERF).forEach(function (k) { if (p[k] !== undefined) PERF[k] = p[k]; });
+    if (map && styleReady && !!hidpi !== !!PERF.map_hidpi_raster && baseName !== 'standard') applyStyle();
     TERRAIN_EXAGGERATION = +PERF.map_terrain_exaggeration || TERRAIN_EXAGGERATION;
     TILE_LOD_ZOOM_LEVELS = +PERF.map_lod_levels || TILE_LOD_ZOOM_LEVELS;
     TILE_LOD_RATIO = +PERF.map_lod_ratio || TILE_LOD_RATIO;
@@ -1215,8 +1442,42 @@
     b.addEventListener('click', function () { setBaseLayer(b.dataset.layer, true); });
   });
 
-  if (window.qt && qt.webChannelTransport) {
+  if (window.__kairosBridge) {
+    bridge = window.__kairosBridge;        // Gate 2: WebView2 host (map_host.py, chrome.webview messages)
+  } else if (window.qt && qt.webChannelTransport) {
     new QWebChannel(qt.webChannelTransport, function (ch) { bridge = ch.objects.bridge; });
+  }
+
+  // Gate 2: under WebView2 a drag over the map never reaches Qt (drop_import.DropRouter), so the
+  // page takes files / folders itself and hands them to the host with their real paths.
+  if (window.__kairosBridge && window.__kairosBridge.dropFiles) {
+    var dropDepth = 0;
+    function hasFiles(e) { return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0; }
+    document.addEventListener('dragenter', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault(); dropDepth++; document.body.classList.add('drop-target');
+    });
+    document.addEventListener('dragover', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
+    });
+    document.addEventListener('dragleave', function (e) {
+      if (!hasFiles(e)) return;
+      dropDepth = Math.max(0, dropDepth - 1);
+      if (!dropDepth) document.body.classList.remove('drop-target');
+    });
+    document.addEventListener('drop', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault(); dropDepth = 0; document.body.classList.remove('drop-target');
+      var items = Array.prototype.slice.call(e.dataTransfer.items || []), handles = [];
+      items.forEach(function (it) {
+        if (it.kind === 'file' && it.getAsFileSystemHandle) handles.push(it.getAsFileSystemHandle());
+      });
+      if (!handles.length) { window.__kairosBridge.dropFiles(Array.prototype.slice.call(e.dataTransfer.files)); return; }
+      Promise.all(handles).then(function (hs) {
+        window.__kairosBridge.dropFiles(hs.filter(function (h) { return !!h; }));
+      }, function () { window.__kairosBridge.dropFiles(Array.prototype.slice.call(e.dataTransfer.files)); });
+    });
   }
 
   // Zvýraznění aplikace (tokens.accent) – trasa Cesty, odznaky, tlačítka. Běžící Cesta může mít
@@ -2095,17 +2356,41 @@
     // Sprint R: úsek, po kterém kamera už letí (nebo doletěla), se nemění – pozdní trasa dřív
     // přehodila dráhu uprostřed letu (skok kamery i čáry). Zůstane hladká křivka.
     if (legStarted(d.leg)) return;
-    (journey.trails || (journey.trails = {}))[d.leg] = d.path;
-    if (journey.legs && journey.i < d.leg) journey.legs[d.leg] = null;   // běžící úsek nepřekreslovat
+    if (journey.trueLegs && journey.trueLegs[d.leg]) return;       // GPX track is the real line
+    applyLegPath(d.leg, d.path);
+  }
+  function applyLegPath(leg, path) {
+    (journey.trails || (journey.trails = {}))[leg] = path;
+    if (journey.legs && journey.i < leg) journey.legs[leg] = null;   // běžící úsek nepřekreslovat
     var all = map && map.getSource('j-all');
     if (all) all.setData(lineFeature(allRouteCoords()));
-    var g = travelSegOf(d.leg);       // C1: dráha kamery jen v okolí změněného úseku
+    var g = travelSegOf(leg);         // C1: dráha kamery jen v okolí změněného úseku
     if (g && film) {
       resampleCamera(film, g.t0 - 1, g.t0 + g.dur + 1);
       director.pfUpTo = Math.min(director.pfUpTo || 0, Math.max(director.t, g.t0 - 1));   // nová dráha = nové dlaždice
     }
   }
   window.requestTrail = requestTrail;
+  // Gate 2 C: legs routed by the app along the whole corridor (route_corridor.py), independent
+  // of what the camera has loaded and of leg length. Arrives in the background; a leg the
+  // camera is already travelling keeps its curve, a GPX leg keeps its recorded line.
+  window.corridorRoute = function (journeyId, leg, path) {
+    if (!journey.active || !journey.data || journey.data.id !== journeyId) return false;
+    if (!Array.isArray(path) || path.length < 2 || leg < 1 || leg >= journey.data.stops.length) return false;
+    if (journey.trueLegs && journey.trueLegs[leg]) return false;
+    var trails = journey.trails || (journey.trails = {});
+    if (trails[leg] || legStarted(leg)) return false;
+    if (journey.trailPending) delete journey.trailPending[leg];
+    applyLegPath(leg, path);
+    return true;
+  };
+  function vectorTileTemplate() {
+    if (!map || !styleReady) return '';
+    var style = map.getStyle(), src = style && style.sources ? vectorSourceId(style) : null;
+    var s = src && map.getSource(src);
+    return s && s.tiles && s.tiles.length ? String(s.tiles[0]) : '';
+  }
+  window.vectorTileTemplate = vectorTileTemplate;
   var TRAIL_SWAP_MARGIN_S = 1.6;      // vyhlazení kamery sahá ~1,5 s do okolí úseku
   function travelSegOf(leg) {
     if (!film) return null;
@@ -2659,7 +2944,7 @@
       var c = pose.c;
       if (!isFinite(c[0]) || !isFinite(c[1]) || !isFinite(pose.z)) return;
       map.jumpTo({ center: [((c[0] + 540) % 360) - 180, Math.max(-85, Math.min(85, c[1]))],
-                   zoom: Math.max(0, Math.min(map.getMaxZoom(), pose.z)), pitch: Math.max(0, Math.min(72, pose.p)),
+                   zoom: Math.max(0, Math.min(map.getMaxZoom(), pose.z)), pitch: Math.max(0, Math.min(MAX_PITCH, pose.p)),
                    bearing: pose.b, padding: filmPadInto(seg, r.u) });
     }
     if (seg.kind === 'glide' || seg.kind === 'hop') setRouteLeg(seg.i, seg.i > 0 ? pose.frac : 1);
@@ -3120,6 +3405,7 @@
     return Array.isArray(v) && JSON.stringify(v).indexOf('["get"') >= 0;
   }
   function filmLook(on) {
+    settleDetail(true);                 // relief specs are cloned below: full detail first
     if (!map || !styleReady) return;
     try {
       if (on) { journey.hadTerrain = !!map.getTerrain(); if (journey.hadTerrain) map.setTerrain(null); }
@@ -3231,7 +3517,17 @@
     toggleList(false);
     stopSpin(); hideCard();
     journey = { active: true, data: data, i: -1, paused: false, ended: false, card: null, trailAsked: {},
-                tint: validHex(data.accent) ? data.accent : null };
+                tint: validHex(data.accent) ? data.accent : null, trails: {}, trueLegs: {} };
+    // Gate 2 C: GPX legs (recorded line, 1:1) take precedence over any reconstruction
+    if (data.tracks && typeof data.tracks === 'object') {
+      Object.keys(data.tracks).forEach(function (k) {
+        var leg = +k, line = data.tracks[k];
+        if (leg >= 1 && leg < data.stops.length && Array.isArray(line) && line.length >= 2) {
+          journey.trails[leg] = line;
+          journey.trueLegs[leg] = true;
+        }
+      });
+    }
     applyAccent(journey.tint || baseAccent);
     document.body.classList.add('journey');
     document.body.classList.remove('paused');
@@ -3257,6 +3553,8 @@
     if (map) map.stop();
     director.heading = map ? map.getBearing() : 0;
     film = planFilm(data, cameraNow(), filmPadding());
+    // Gate 2 C: the app routes every ground leg along its corridor in the background
+    if (bridge && bridge.routeJourney) bridge.routeJourney(data.id, vectorTileTemplate());
     music.loops = 0; music.lastT = 0; beatClock.reset();
     buildCamera(film);                             // C1: celá dráha kamery předem (~750 vzorků, < 10 ms)
     director.t = 0;
@@ -3314,7 +3612,7 @@
       }
       terrainHold = false; syncTerrain();          // mapa zase řídí terén sama (plné převýšení)
     }
-    setExaggeration(TERRAIN_EXAGGERATION);
+    setExaggeration(terrainExaggeration(map ? map.getZoom() : 0));
     if (journey.tint) { journey.tint = null; applyAccent(baseAccent); }
     document.body.classList.remove('journey', 'paused');
     setPinsVisible(true);
@@ -3432,7 +3730,7 @@
   }
   function musicStart() {
     if (!music.tracks.length || !journey.data) return;
-    var i = Math.abs(+journey.data.id || 0) % music.tracks.length;   // stejná Cesta = stejná skladba
+    var i = musicIndexFor(journey.data);                              // stejná Cesta = stejná skladba
     if (!music.el || music.track !== i) {
       if (music.el) music.el.pause();
       music.el = new Audio(music.tracks[i].url);
@@ -3464,9 +3762,20 @@
   // nebo pomalý start přehrávače rytmus nerozbije. Skok (kapitola, přetočení) posune hudbu za filmem.
   var BEAT_RELOCK_S = 2.5;
   var beatClock = new D.BeatClock({ offset: 0, relock: 1e9 });
+  // Gate 2 D: the app picks the track whose energy fits the trip (mood.py -> data.music.file);
+  // without a pick (older data, track removed) the trip id chooses, as before
+  function musicIndexFor(data) {
+    if (!music.tracks.length || !data) return -1;
+    var want = data.music && data.music.file;
+    if (want) {
+      for (var k = 0; k < music.tracks.length; k++) if (music.tracks[k].file === want) return k;
+    }
+    return Math.abs(+data.id || 0) % music.tracks.length;
+  }
+  window.musicIndexFor = musicIndexFor;
   function musicTrackFor(data) {
-    if (!music.tracks.length || !data) return null;
-    return music.tracks[Math.abs(+data.id || 0) % music.tracks.length];   // stejná volba jako musicStart
+    var i = musicIndexFor(data);
+    return i < 0 ? null : music.tracks[i];                                 // stejná volba jako musicStart
   }
   function musicGrid(data, until) {
     var tr = music.enabled ? musicTrackFor(data) : null;

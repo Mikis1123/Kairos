@@ -1001,3 +1001,33 @@ map-play-journey = Reproducir un viaje
 map-stop-n = Parada { $n }
 map-journey-end = Fin del viaje
 minimap-unavailable = Mapa no disponible
+# Gate 2 B: trip kinds
+event-kind-day-trip = Excursión de un día
+event-kind-journey = { $days ->
+    [one] Viaje · { $days } día
+   *[other] Viaje · { $days } días
+}
+# Gate 2 C: GPX tracks
+gpx-import = Importar GPX…
+gpx-import-tooltip = Añade una ruta grabada (reloj, móvil, ciclocomputador). Se asocia sola al viaje correspondiente y su recorrido sigue la línea exacta.
+gpx-import-pick = Elige rutas GPX
+gpx-file-filter = Rutas GPX (*.gpx)
+gpx-imported-bound = Ruta añadida a { $event }. El recorrido sigue ahora la línea grabada.
+gpx-imported = { $count ->
+    [one] { $count } ruta importada
+   *[other] { $count } rutas importadas
+} · { $bound } asociadas a viajes
+gpx-import-failed = No se pudo leer: { $files }
+# Gate 2 D: music
+settings-music = Música
+settings-music-own = Tus pistas
+settings-music-hint = El recorrido reproduce la pista cuya energía encaja con el viaje: sonrisas, hora del día, ritmo y el aspecto de las fotos. Tus pistas se copian a la carpeta de datos de Kairos; los originales se quedan donde están.
+music-add = Añadir música…
+music-open-folder = Abrir carpeta
+music-add-pick = Elige música
+music-file-filter = Audio (*.opus *.ogg *.webm *.mp3 *.m4a *.wav)
+music-added = { $count ->
+    [one] { $count } pista añadida. Los recorridos ya pueden usarla.
+   *[other] { $count } pistas añadidas. Los recorridos ya pueden usarlas.
+}
+music-add-failed = No se pudo añadir la música

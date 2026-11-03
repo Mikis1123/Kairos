@@ -13,6 +13,7 @@ from i18n import event_title, tr
 import math
 from collections import Counter
 
+import gpx_tracks
 from database import visible_media_sql
 
 STOP_RADII_KM = (0.4, 1.5, 4.0, 10.0, 25.0, 60.0, 150.0)   # zkouší se postupně, dokud zastávek není moc
@@ -245,6 +246,11 @@ def build_journey(conn, event_id, thumb_url=lambda p: "", image_url=None):
     if len(stops) < MIN_STOPS:
         return None
     location = ev[2] or next((s["city"] for s in stops if s["city"]), "")
-    return {"id": int(ev[0]), "title": event_title(ev[1]) if ev[1] else tr("journey"), "location": location,
+    data = {"id": int(ev[0]), "title": event_title(ev[1]) if ev[1] else tr("journey"), "location": location,
             "start": stops[0]["start"], "end": stops[-1]["end"],
             "count": sum(s["count"] for s in stops), "stops": stops}
+    # Gate 2 C: imported GPX tracks give legs their true line (gpx_tracks, bound by time)
+    tracks = gpx_tracks.leg_tracks(conn, stops)
+    if tracks:
+        data["tracks"] = {str(i): line for i, line in tracks.items()}
+    return data

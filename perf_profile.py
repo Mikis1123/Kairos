@@ -42,6 +42,7 @@ class Profile:
     map_hillshade: bool
     # paměť
     thumb_cache_mb: int          # RAM náhledů mřížky
+    map_hidpi_raster: bool = False   # Gate 2 C: one zoom deeper for raster tiles on HiDPI (sharp)
 
     @property
     def frame_budget_ms(self):
@@ -51,7 +52,8 @@ class Profile:
         """Část profilu pro window.setPerfProfile() v map_vault.html."""
         d = asdict(self)
         keep = ("tier", "refresh_hz", "map_pixel_ratio_max", "map_pixel_ratio_min", "map_lod_levels",
-                "map_lod_ratio", "map_terrain", "map_terrain_exaggeration", "map_hillshade")
+                "map_lod_ratio", "map_terrain", "map_terrain_exaggeration", "map_hillshade",
+                "map_hidpi_raster")
         return {k: d[k] for k in keep}
 
 
@@ -102,7 +104,7 @@ def build(tier, cores, ram_gb, refresh_hz):
         return Profile(tier, cores, ram_gb, refresh_hz, bg_threads=4, bg_item_pause_s=0.0, dense_strips=True,
                        proxy_playback=False, map_pixel_ratio_max=0.0, map_pixel_ratio_min=1.25,
                        map_lod_levels=6, map_lod_ratio=3.0, map_terrain=True, map_terrain_exaggeration=1.35,
-                       map_hillshade=True, thumb_cache_mb=512)
+                       map_hillshade=True, thumb_cache_mb=512, map_hidpi_raster=True)
     if tier == "standard":
         return Profile(tier, cores, ram_gb, refresh_hz, bg_threads=2, bg_item_pause_s=0.01, dense_strips=True,
                        proxy_playback=False, map_pixel_ratio_max=2.0, map_pixel_ratio_min=1.0,

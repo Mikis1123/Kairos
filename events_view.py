@@ -67,6 +67,17 @@ def split_event_title(title):
     return event_kicker(kicker), (event_place(text) if text else (title or tr("event-default-title")))
 
 
+def kind_kicker(event, fallback):
+    """Gate 2 B: 'Day trip' / 'Journey · 4 days' from the trip hierarchy; older events keep
+    the kicker parsed from the stored title."""
+    kind = (event or {}).get("kind")
+    if kind == "day_trip":
+        return tr("event-kind-day-trip")
+    if kind == "journey":
+        return tr("event-kind-journey", days=max(2, int(event.get("chapters") or 0)))
+    return fallback
+
+
 def format_event_dates(start, end):
     """'2026-07-06 10:00', '2026-07-12 18:00' -> '6.–12. 7. 2026' (kompaktně jako v Apple Photos)."""
     def parse(v):
@@ -279,13 +290,14 @@ class AmbientFramesJob(QRunnable):
 def fetch_event_cards(conn):
     """Události s alespoň jednou viditelnou položkou, od nejnovější."""
     events = conn.execute(f"""
-        SELECT e.id, e.title, e.location_name, e.start_date, e.end_date, e.cover_media_id, COUNT(m.id)
+        SELECT e.id, e.title, e.location_name, e.start_date, e.end_date, e.cover_media_id, COUNT(m.id),
+               e.kind, (SELECT COUNT(*) FROM events c WHERE c.parent_id = e.id)
         FROM events e JOIN media_items m ON m.event_id = e.id AND {visible_media_sql('m')}
         GROUP BY e.id HAVING COUNT(m.id) > 0
         ORDER BY e.start_date DESC, e.id DESC
     """).fetchall()
     cards = []
-    for eid, title, location, start, end, cover_id, count in events:
+    for eid, title, location, start, end, cover_id, count, kind, chapters in events:
         if not location:
             cities = [c for (c,) in conn.execute(
                 f"SELECT m.place_city FROM media_items m WHERE m.event_id = ? AND m.place_city IS NOT NULL "
@@ -295,6 +307,7 @@ def fetch_event_cards(conn):
             "id": eid, "title": title or tr("event-default-title"), "location": location or "",
             "start": start, "end": end, "count": int(count),
             "cover": select_event_cover(conn, eid, cover_id),
+            "kind": kind, "chapters": int(chapters or 0),
         })
     return cards
 
@@ -350,6 +363,7 @@ class EventCard(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.kicker, self.display_title = split_event_title(event["title"])
+        self.kicker = kind_kicker(event, self.kicker)
         self.setAccessibleName(f"{self.display_title}, {self.subtitle()}, {_czech_count(event['count'])}")
         self.setToolTip(event_title(self.event["title"]) + ("\n" + tr("events-journey-hint") if self.has_journey() else ""))
 

@@ -15,6 +15,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from database import get_connection, db_transaction, upsert_media_item
 import cloud_files
 import media_identity
+import trips
 import reverse_geocoder as rg
 from PIL import Image, ImageOps
 import color_manage
@@ -810,112 +811,18 @@ class MediaScannerThread(QThread):
             print(f"Chyba při geokódování: {e}")
 
     def _cluster_into_events(self, conn):
+        """Gate 2 B: adaptive trips (home inference, day trips vs. journeys with chapters).
+        Event ids stay stable across re-clusters, so covers and links survive (trips.apply)."""
         try:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id, date_taken, latitude, longitude, place_city 
-                FROM media_items 
-                WHERE date_taken IS NOT NULL AND date_taken != ''
-                  AND COALESCE(is_hidden, 0) = 0
-                ORDER BY date_taken ASC
-            """)
-            items = cursor.fetchall()
-            if not items:
-                return
-
-            # POŘADÍ JE DŮLEŽITÉ: nejdřív zrušit odkazy z media_items, teprve pak mazat events.
-            # (Cizí klíč media_items.event_id -> events.id je zapnutý; dřív to fungovalo jen
-            # proto, že INSERT OR REPLACE předtím smazal všechny řádky s odkazem.)
-            cursor.execute("UPDATE media_items SET event_id = NULL")
-            cursor.execute("DELETE FROM events")
-
-            events_clusters = []
-            current_cluster = []
-            last_dt, last_lat, last_lon = None, None, None
-
-            for item_id, dt_str, lat, lon, city in items:
-                try:
-                    dt = datetime.strptime(dt_str[:19], "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    continue
-
-                # i18n-ok: stored auto event name (localized at display)
-                item_dict = {"id": item_id, "dt": dt, "lat": lat, "lon": lon, "city": city or "Neznámé místo"}
-
-                if not current_cluster:
-                    current_cluster.append(item_dict)
-                    last_dt, last_lat, last_lon = dt, lat, lon
-                    continue
-
-                time_diff_hours = (dt - last_dt).total_seconds() / 3600.0
-                if time_diff_hours > 26.0:
-                    events_clusters.append(current_cluster)
-                    current_cluster = [item_dict]
-                else:
-                    if lat is not None and lon is not None and last_lat is not None and last_lon is not None:
-                        dist_km = haversine_distance_km(last_lat, last_lon, lat, lon)
-                        if dist_km > 45.0 and time_diff_hours > 8.0:
-                            events_clusters.append(current_cluster)
-                            current_cluster = [item_dict]
-                        else:
-                            current_cluster.append(item_dict)
-                    else:
-                        if time_diff_hours > 14.0:
-                            events_clusters.append(current_cluster)
-                            current_cluster = [item_dict]
-                        else:
-                            current_cluster.append(item_dict)
-
-                last_dt = dt
-                if lat is not None and lon is not None:
-                    last_lat, last_lon = lat, lon
-
-            if current_cluster:
-                events_clusters.append(current_cluster)
-
-            for cluster in events_clusters:
-                self._save_smart_event(cursor, cluster)
-
+            stats = trips.recluster(conn)
             conn.commit()
+            if stats.get("kinds"):
+                print(f"[Events] {stats['kinds']} | kept {stats['kept']}, new {stats['created']}, "
+                      f"removed {stats['deleted']}")
         except Exception as e:
             try:
                 conn.rollback()
             except Exception:
                 pass
-            print(f"Chyba při shlukování událostí: {e}")
+            print(f"[Events] clustering failed: {e}")
 
-    def _save_smart_event(self, cursor, cluster):
-        if not cluster:
-            return
-        start_dt = cluster[0]["dt"]
-        end_dt = cluster[-1]["dt"]
-
-        if start_dt.date() == end_dt.date():
-            date_label = start_dt.strftime("%d. %m. %Y")
-        else:
-            date_label = f"{start_dt.strftime('%d. %m.')} – {end_dt.strftime('%d. %m. %Y')}"
-
-        # i18n-ok: stored auto event name (localized at display)
-        cities = [c["city"] for c in cluster if c["city"] != "Neznámé místo"]
-        if cities:
-            dominant_city, _ = Counter(cities).most_common(1)[0]
-            unique_cities = list(dict.fromkeys(cities))
-            # i18n-ok: stored auto event name (localized at display)
-            title = f"Výlet: {dominant_city} a okolí ({date_label})" if len(unique_cities) > 1 else f"Výlet: {dominant_city} ({date_label})"
-            location_name = dominant_city
-        else:
-            # i18n-ok: stored auto event name (localized at display)
-            title = f"Výlet ({date_label})"
-            # i18n-ok: stored auto event name (localized at display)
-            location_name = "Neznámé místo"
-
-        cursor.execute("""
-            INSERT INTO events (title, location_name, start_date, end_date, item_count)
-            VALUES (?, ?, ?, ?, ?)
-        """, (title, location_name, start_dt.strftime("%Y-%m-%d %H:%M"), end_dt.strftime("%Y-%m-%d %H:%M"), len(cluster)))
-        event_id = cursor.lastrowid
-
-        cursor.executemany(
-            "UPDATE media_items SET event_id = ? WHERE id = ?",
-            [(event_id, c["id"]) for c in cluster],
-        )

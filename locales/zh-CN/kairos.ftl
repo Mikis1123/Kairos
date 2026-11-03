@@ -896,3 +896,24 @@ map-play-journey = 播放旅程
 map-stop-n = 第 { $n } 站
 map-journey-end = 旅程结束
 minimap-unavailable = 地图不可用
+# Gate 2 B: trip kinds
+event-kind-day-trip = 一日游
+event-kind-journey = 旅程 · { $days } 天
+# Gate 2 C: GPX tracks
+gpx-import = 导入 GPX…
+gpx-import-tooltip = 添加录制的轨迹（手表、手机、码表）。它会自动关联到对应的旅行，旅程将沿着精确的路线播放。
+gpx-import-pick = 选择 GPX 轨迹
+gpx-file-filter = GPX 轨迹 (*.gpx)
+gpx-imported-bound = 已将轨迹添加到 { $event }。旅程现在沿录制的路线播放。
+gpx-imported = 已导入 { $count } 条轨迹 · { $bound } 条已关联旅行
+gpx-import-failed = 无法读取：{ $files }
+# Gate 2 D: music
+settings-music = 音乐
+settings-music-own = 你的曲目
+settings-music-hint = 旅程会根据笑容、时段、拍摄节奏和照片氛围，播放能量与旅行相符的曲目。你的曲目会复制到 Kairos 数据文件夹，原文件保持不变。
+music-add = 添加音乐…
+music-open-folder = 打开文件夹
+music-add-pick = 选择音乐
+music-file-filter = 音频 (*.opus *.ogg *.webm *.mp3 *.m4a *.wav)
+music-added = 已添加 { $count } 首曲目，旅程现在可以使用。
+music-add-failed = 无法添加音乐

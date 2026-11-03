@@ -1002,3 +1002,33 @@ map-play-journey = Play a Journey
 map-stop-n = Stop { $n }
 map-journey-end = End of the Journey
 minimap-unavailable = Map unavailable
+# Gate 2 B: trip kinds
+event-kind-day-trip = Day trip
+event-kind-journey = { $days ->
+    [one] Journey · { $days } day
+   *[other] Journey · { $days } days
+}
+# Gate 2 C: GPX tracks
+gpx-import = Import GPX…
+gpx-import-tooltip = Add a recorded track (watch, phone, bike computer). It binds to the matching trip automatically, and its Journey follows the exact line.
+gpx-import-pick = Choose GPX Tracks
+gpx-file-filter = GPX tracks (*.gpx)
+gpx-imported-bound = Track added to { $event }. Its Journey now follows the recorded line.
+gpx-imported = { $count ->
+    [one] { $count } track imported
+   *[other] { $count } tracks imported
+} · { $bound } matched to trips
+gpx-import-failed = Couldn’t read: { $files }
+# Gate 2 D: music
+settings-music = Music
+settings-music-own = Your tracks
+settings-music-hint = Journeys play the track whose energy fits the trip: smiles, time of day, pace, and the look of the photos. Your tracks are copied to your Kairos data folder; the originals stay where they are.
+music-add = Add Music…
+music-open-folder = Open Folder
+music-add-pick = Choose Music
+music-file-filter = Audio (*.opus *.ogg *.webm *.mp3 *.m4a *.wav)
+music-added = { $count ->
+    [one] { $count } track added. Journeys can use it now.
+   *[other] { $count } tracks added. Journeys can use them now.
+}
+music-add-failed = Couldn’t add the music

@@ -7,8 +7,8 @@ Skladby jsou vlastní, vygenerované tímto souborem (deterministicky, bez cizí
 
     python ambient_music.py            # znovu vygenerovat všechny skladby (vyžaduje scipy)
 
-Za běhu jen tracks(): seznam přibalených souborů. Uživatel může do assets/music přidat
-vlastní .opus / .ogg / .mp3 / .m4a / .webm – Cesta je vezme také.
+Za běhu jen tracks(): přibalené skladby + vlastní skladby uživatele z USER_MUSIC_DIR
+(%APPDATA%/Kairos/music, Gate 2 D: Nastavení › Hudba › Přidat hudbu…).
 
 Sprint 4 – metrum pro Director: akord = jeden takt o BAR dobách (doba = chord_s / BAR), zvonky
 padají na osminy a každou dobu nese tichý tlumený úder (těžká doba hlasitěji) – střihy Reels
@@ -17,12 +17,16 @@ odhadne z nástupů zvuku (beat_detect, tempo autokorelací, fáze hřebenem).
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 
 import paths
 
 MUSIC_DIR = os.path.join(paths.RESOURCE_DIR, "assets", "music")
+# Gate 2 D: the user's own tracks live in the writable data folder (%APPDATA%\Kairos\music) -
+# the bundled folder can be read-only in Program Files
+USER_MUSIC_DIR = os.path.join(paths.DATA_DIR, "music")
 EXTENSIONS = (".opus", ".ogg", ".webm", ".mp3", ".m4a", ".wav")
 SAMPLE_RATE = 48000
 
@@ -40,18 +44,102 @@ BAR = 4                       # dob v taktu (= jeden akord)
 PULSE_GAIN = 0.32             # tlumený úder na dobu (těžká doba 1,0×, ostatní 0,45×)
 
 
-def tracks():
-    """[{file, title, path}] přibalených (nebo uživatelem přidaných) skladeb, abecedně."""
+def _listed(folder):
     try:
-        names = sorted(n for n in os.listdir(MUSIC_DIR) if n.lower().endswith(EXTENSIONS))
+        return sorted(n for n in os.listdir(folder) if n.lower().endswith(EXTENSIONS)
+                      and os.path.isfile(os.path.join(folder, n)))
     except OSError:
         return []
+
+
+def tracks():
+    """[{file, title, path, user}] - bundled tracks first, then the user's own (alphabetical)."""
     titles = {t["file"]: t["title"] for t in TRACKS}
-    return [{"file": n, "title": titles.get(n, os.path.splitext(n)[0]), "path": os.path.join(MUSIC_DIR, n)}
-            for n in names]
+    out = [{"file": n, "title": titles.get(n, os.path.splitext(n)[0]), "path": os.path.join(MUSIC_DIR, n),
+            "user": False} for n in _listed(MUSIC_DIR)]
+    bundled = {t["file"].lower() for t in out}
+    for n in _listed(USER_MUSIC_DIR):
+        if os.path.normcase(USER_MUSIC_DIR) == os.path.normcase(MUSIC_DIR) or n.lower() in bundled:
+            continue
+        out.append({"file": n, "title": os.path.splitext(n)[0], "path": os.path.join(USER_MUSIC_DIR, n),
+                    "user": True})
+    return out
 
 
-def beat_map(track):
+def user_tracks():
+    return [t for t in tracks() if t["user"]]
+
+
+def add_user_tracks(files):
+    """Copies audio files into USER_MUSIC_DIR (originals untouched). Returns the added tracks."""
+    os.makedirs(USER_MUSIC_DIR, exist_ok=True)
+    added = []
+    for src in files:
+        name = os.path.basename(src)
+        if not name.lower().endswith(EXTENSIONS) or not os.path.isfile(src):
+            continue
+        stem, ext = os.path.splitext(name)
+        target, k = os.path.join(USER_MUSIC_DIR, name), 2
+        if os.path.exists(target) and os.path.getsize(target) == os.path.getsize(src):
+            continue                                  # the same file again
+        while os.path.exists(target):
+            target = os.path.join(USER_MUSIC_DIR, f"{stem} ({k}){ext}")
+            k += 1
+        shutil.copy2(src, target)
+        added.append({"file": os.path.basename(target), "title": os.path.splitext(os.path.basename(target))[0],
+                      "path": target, "user": True})
+    return added
+
+
+def remove_user_track(file_name):
+    """Deletes a track from the user folder (its own copy; the original was never moved)."""
+    path = os.path.join(USER_MUSIC_DIR, os.path.basename(file_name))
+    if os.path.isfile(path):
+        os.remove(path)
+        return True
+    return False
+
+
+def _track_key(path):
+    return f"{os.path.abspath(path)}|{os.path.getsize(path)}|{int(os.path.getmtime(path))}"
+
+
+def track_profile(track, compute=True):
+    """{energy, brightness} 0..1 (mood.py). Bundled: from the generator spec. User: measured
+    once from the audio and cached; compute=False returns only a cached value (or None)."""
+    import mood
+    spec = next((t for t in TRACKS if t["file"] == track.get("file")), None)
+    if spec is not None and not track.get("user"):
+        return mood.spec_profile(spec)
+    path = track.get("path")
+    if not path or not os.path.exists(path):
+        return None
+    key = _track_key(path)
+    cache_path = os.path.join(paths.CACHE_ROOT, "track_profiles.json")
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if key in cache or not compute:
+        return cache.get(key)
+    try:
+        pcm = decode_mono(path)
+        prof = mood.audio_profile(pcm, DETECT_SR, beat_map(track))
+    except Exception as e:
+        print(f"[Music] {track.get('file')}: {e}")
+        return None
+    cache[key] = prof
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+    return prof
+
+
+def beat_map(track, compute=True):
     """Mřížka dob skladby pro Director: {period, bar, offset, length} (s), nebo None.
     Přibalené skladby: přesně z generátoru. Vlastní: odhad z nástupů zvuku (uložený v .cache)."""
     spec = next((t for t in TRACKS if t["file"] == track.get("file")), None)
@@ -60,7 +148,7 @@ def beat_map(track):
     path = track.get("path")
     if not path or not os.path.exists(path):
         return None
-    key = f"{os.path.abspath(path)}|{os.path.getsize(path)}|{int(os.path.getmtime(path))}"
+    key = _track_key(path)
     cache_path = os.path.join(paths.CACHE_ROOT, "beats.json")
     try:
         with open(cache_path, encoding="utf-8") as f:
@@ -68,6 +156,8 @@ def beat_map(track):
     except (OSError, ValueError):
         cache = {}
     if key not in cache:
+        if not compute:
+            return None                    # Gate 2 D: measured later in the background (warm-up)
         cache[key] = detect_beats(path)
         try:
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)

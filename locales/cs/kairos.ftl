@@ -1048,3 +1048,39 @@ map-play-journey = Přehrát cestu
 map-stop-n = Zastávka { $n }
 map-journey-end = Konec cesty
 minimap-unavailable = Mapa není k dispozici
+# Gate 2 B: trip kinds
+event-kind-day-trip = Jednodenní výlet
+event-kind-journey = { $days ->
+    [one] Cesta · { $days } den
+    [few] Cesta · { $days } dny
+    [many] Cesta · { $days } dne
+   *[other] Cesta · { $days } dní
+}
+# Gate 2 C: GPX tracks
+gpx-import = Importovat GPX…
+gpx-import-tooltip = Přidat zaznamenanou trasu (hodinky, telefon, cyklopočítač). Sama se přiřadí ke správnému výletu a jeho Cesta pojede přesně po ní.
+gpx-import-pick = Vyberte trasy GPX
+gpx-file-filter = Trasy GPX (*.gpx)
+gpx-imported-bound = Trasa přidána k { $event }. Cesta teď jede po zaznamenané linii.
+gpx-imported = { $count ->
+    [one] Importována { $count } trasa
+    [few] Importovány { $count } trasy
+    [many] Importováno { $count } trasy
+   *[other] Importováno { $count } tras
+} · přiřazeno k výletům: { $bound }
+gpx-import-failed = Nepodařilo se přečíst: { $files }
+# Gate 2 D: music
+settings-music = Hudba
+settings-music-own = Vaše skladby
+settings-music-hint = Cesta zahraje skladbu, jejíž energie sedí k výletu: úsměvy, denní doba, tempo a ráz fotek. Vaše skladby se zkopírují do datové složky Kairos; originály zůstanou na místě.
+music-add = Přidat hudbu…
+music-open-folder = Otevřít složku
+music-add-pick = Vyberte hudbu
+music-file-filter = Zvuk (*.opus *.ogg *.webm *.mp3 *.m4a *.wav)
+music-added = { $count ->
+    [one] Přidána { $count } skladba. Cesta ji teď může použít.
+    [few] Přidány { $count } skladby. Cesta je teď může použít.
+    [many] Přidáno { $count } skladby. Cesta je teď může použít.
+   *[other] Přidáno { $count } skladeb. Cesta je teď může použít.
+}
+music-add-failed = Hudbu se nepodařilo přidat

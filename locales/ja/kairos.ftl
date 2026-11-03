@@ -896,3 +896,24 @@ map-play-journey = 旅を再生
 map-stop-n = 立ち寄り先 { $n }
 map-journey-end = 旅の終わり
 minimap-unavailable = マップを利用できません
+# Gate 2 B: trip kinds
+event-kind-day-trip = 日帰り旅行
+event-kind-journey = 旅 · { $days }日間
+# Gate 2 C: GPX tracks
+gpx-import = GPX を読み込む…
+gpx-import-tooltip = 記録したトラック（時計、スマホ、サイコン）を追加します。該当する旅行に自動で結び付き、旅のルートが記録どおりの線をたどります。
+gpx-import-pick = GPX トラックを選択
+gpx-file-filter = GPX トラック (*.gpx)
+gpx-imported-bound = { $event } にトラックを追加しました。旅は記録した線をたどります。
+gpx-imported = { $count } 件のトラックを読み込みました · { $bound } 件を旅行に結び付け
+gpx-import-failed = 読み込めませんでした: { $files }
+# Gate 2 D: music
+settings-music = 音楽
+settings-music-own = 自分の曲
+settings-music-hint = 旅では、笑顔・時間帯・撮影ペース・写真の雰囲気から、旅に合ったエネルギーの曲が流れます。自分の曲は Kairos のデータフォルダーにコピーされ、元のファイルはそのまま残ります。
+music-add = 音楽を追加…
+music-open-folder = フォルダーを開く
+music-add-pick = 音楽を選択
+music-file-filter = オーディオ (*.opus *.ogg *.webm *.mp3 *.m4a *.wav)
+music-added = { $count } 曲を追加しました。旅で使えるようになりました。
+music-add-failed = 音楽を追加できませんでした

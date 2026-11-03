@@ -54,6 +54,9 @@ class Toast(QFrame):
         self._closing = False
         self.setObjectName("Toast")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # Gate 2: over the WebView2 map a toast needs its own HWND (map_host.AirspaceGuard)
+        self.setProperty("kairos_airspace", "native")
+        self.setProperty("kairos_airspace_radius", tokens.RADIUS["lg"])
         t = tokens.palette("dark")
         action = t["accent"] if self.kind == "info" else t[_KIND_TOKEN[self.kind]]
         self.setStyleSheet(f"""

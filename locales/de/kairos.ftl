@@ -1001,3 +1001,33 @@ map-play-journey = Reise abspielen
 map-stop-n = Station { $n }
 map-journey-end = Ende der Reise
 minimap-unavailable = Karte nicht verfügbar
+# Gate 2 B: trip kinds
+event-kind-day-trip = Tagesausflug
+event-kind-journey = { $days ->
+    [one] Reise · { $days } Tag
+   *[other] Reise · { $days } Tage
+}
+# Gate 2 C: GPX tracks
+gpx-import = GPX importieren…
+gpx-import-tooltip = Aufgezeichneten Track hinzufügen (Uhr, Handy, Fahrradcomputer). Er wird automatisch der passenden Reise zugeordnet, und ihre Reise folgt genau der Linie.
+gpx-import-pick = GPX-Tracks auswählen
+gpx-file-filter = GPX-Tracks (*.gpx)
+gpx-imported-bound = Track zu { $event } hinzugefügt. Die Reise folgt jetzt der aufgezeichneten Linie.
+gpx-imported = { $count ->
+    [one] { $count } Track importiert
+   *[other] { $count } Tracks importiert
+} · { $bound } Reisen zugeordnet
+gpx-import-failed = Nicht lesbar: { $files }
+# Gate 2 D: music
+settings-music = Musik
+settings-music-own = Eigene Titel
+settings-music-hint = Reisen spielen den Titel, dessen Energie zur Reise passt: Lächeln, Tageszeit, Tempo und die Stimmung der Fotos. Eigene Titel werden in den Kairos-Datenordner kopiert; die Originale bleiben, wo sie sind.
+music-add = Musik hinzufügen…
+music-open-folder = Ordner öffnen
+music-add-pick = Musik auswählen
+music-file-filter = Audio (*.opus *.ogg *.webm *.mp3 *.m4a *.wav)
+music-added = { $count ->
+    [one] { $count } Titel hinzugefügt. Reisen können ihn jetzt nutzen.
+   *[other] { $count } Titel hinzugefügt. Reisen können sie jetzt nutzen.
+}
+music-add-failed = Musik konnte nicht hinzugefügt werden

@@ -1001,3 +1001,33 @@ map-play-journey = Lire un voyage
 map-stop-n = Étape { $n }
 map-journey-end = Fin du voyage
 minimap-unavailable = Carte indisponible
+# Gate 2 B: trip kinds
+event-kind-day-trip = Excursion d’une journée
+event-kind-journey = { $days ->
+    [one] Voyage · { $days } jour
+   *[other] Voyage · { $days } jours
+}
+# Gate 2 C: GPX tracks
+gpx-import = Importer un GPX…
+gpx-import-tooltip = Ajoutez une trace enregistrée (montre, téléphone, compteur vélo). Elle se rattache seule au bon voyage, dont le parcours suit alors la ligne exacte.
+gpx-import-pick = Choisir des traces GPX
+gpx-file-filter = Traces GPX (*.gpx)
+gpx-imported-bound = Trace ajoutée à { $event }. Le parcours suit désormais la ligne enregistrée.
+gpx-imported = { $count ->
+    [one] { $count } trace importée
+   *[other] { $count } traces importées
+} · { $bound } rattachées à des voyages
+gpx-import-failed = Lecture impossible : { $files }
+# Gate 2 D: music
+settings-music = Musique
+settings-music-own = Vos morceaux
+settings-music-hint = Le parcours joue le morceau dont l’énergie correspond au voyage : sourires, moment de la journée, rythme et ambiance des photos. Vos morceaux sont copiés dans le dossier de données de Kairos ; les originaux restent en place.
+music-add = Ajouter de la musique…
+music-open-folder = Ouvrir le dossier
+music-add-pick = Choisir de la musique
+music-file-filter = Audio (*.opus *.ogg *.webm *.mp3 *.m4a *.wav)
+music-added = { $count ->
+    [one] { $count } morceau ajouté. Les parcours peuvent l’utiliser.
+   *[other] { $count } morceaux ajoutés. Les parcours peuvent les utiliser.
+}
+music-add-failed = Impossible d’ajouter la musique

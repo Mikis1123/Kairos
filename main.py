@@ -31,7 +31,7 @@ if __name__ == "__main__":
     data_migration.ensure_ready()
 
 import i18n
-from i18n import N_, fmt_number, tr
+from i18n import N_, event_title, fmt_number, tr
 
 from paths import (
     BASE_DIR, RESOURCE_DIR, THUMB_DIR as CACHE_DIR, FFMPEG_PATH as DEFAULT_FFMPEG, resolve_face_path,
@@ -95,6 +95,7 @@ import preview_cache
 import theme
 import tokens
 import motion
+import kinetic_scroll
 from ui_controls import (ActivityStatus, EmptyState, HintPill, KButton, MenuSelect, NavItem, NavSection,
                          SegmentedControl, SidebarNav, pin_overlay,
                          smooth_rect_path)
@@ -118,8 +119,14 @@ import perf_profile
 import scrub_strip
 import search_engine
 import ambient_music
+import threading
 import card_media
 import tile_store
+import map_host
+import route_corridor
+import mood
+import gpx_tracks
+import trips
 import video_proxy
 import video_frames
 import xmp_sync
@@ -554,9 +561,13 @@ class ThumbnailWorker(QRunnable):
         self.fallback_path = fallback_path
         self.tier = int(tier)
         self.signals = ThumbnailWorkerSignals()
+        self.started_ids = None     # Gate 2 A: model's set of dequeued ids (stale-queue cancel)
+        self._source_short = None   # true short edge of the decoded source (before scaled decode)
         self.setAutoDelete(True)
 
     def run(self):
+        if self.started_ids is not None:
+            self.started_ids.add(self.item_id)
         img = QImage()
         for path in (self.thumb_path, self.fallback_path):
             # Gate 0: originál jen v cloudu se kvůli mřížce nestahuje (posun = stovky souborů)
@@ -570,7 +581,7 @@ class ThumbnailWorker(QRunnable):
                      else THUMB_MISSING_FILE)
             self.signals.failed.emit(self.item_id, state)
             return
-        self.signals.source_short.emit(self.item_id, min(img.width(), img.height()))
+        self.signals.source_short.emit(self.item_id, self._source_short or min(img.width(), img.height()))
         self.signals.loaded.emit(self.item_id, _shrink_short_edge(img, self.tier))
 
     def _load(self, path):
@@ -591,6 +602,15 @@ class ThumbnailWorker(QRunnable):
                 pass
         reader = QImageReader(path)
         reader.setAutoTransform(True)
+        # Gate 2 A: decode straight at the tier (JPEG scales in the DCT - far cheaper than a
+        # full decode + shrink); the true source size is reported so later upgrades still work
+        src = reader.size()
+        if src.isValid() and min(src.width(), src.height()) > 0:
+            short = min(src.width(), src.height())
+            self._source_short = short
+            if short > self.tier * 1.05:
+                k = self.tier / short
+                reader.setScaledSize(QSize(max(1, round(src.width() * k)), max(1, round(src.height() * k))))
         img = reader.read()
         if not img.isNull():
             import color_manage
@@ -609,6 +629,8 @@ class VaultThumbnailWorker(ThumbnailWorker):
         self.vault = vault
 
     def run(self):
+        if self.started_ids is not None:
+            self.started_ids.add(self.item_id)
         try:
             data = self.vault.open_thumbnail(self.item_id)
             if data is None:
@@ -648,6 +670,31 @@ class ApplePhotoModel(QAbstractListModel):
         self._src_short = {}      # item_id -> kratší strana miniatury na disku (strop zlepšení)
         self.vault = None         # Stage 3: mřížka složky Skryté (miniatury z trezoru)
         self._vault_ids = set()   # id, jejichž (dešifrované) miniatury drží ram_cache
+        # Gate 2 A: speed-aware decoding. During a fast fling, new tiles decode at the smallest
+        # tier and sharper upgrades wait; when the fling settles, queued decodes for rows that
+        # flew past are cancelled so the rows now on screen go first.
+        self.fast = False
+        self._queued = set()      # ids handed to the pool
+        self._started = set()     # ids the pool has dequeued (written from worker threads)
+
+    def set_fast(self, fast: bool):
+        fast = bool(fast)
+        if fast == self.fast:
+            return False
+        self.fast = fast
+        if not fast:
+            self.cancel_stale()
+        return True
+
+    def cancel_stale(self):
+        """Drops decodes that have not started yet (rows that scrolled away); visible rows
+        re-request on the next paint."""
+        self.thread_pool.clear()
+        stale = self._queued - self._started
+        self.loading_ids.difference_update(stale)
+        self._queued.clear()
+        self._started.clear()
+        return len(stale)
 
     def set_tier(self, tier: int):
         """Velikost dlaždic se změnila: větší úroveň se dotáhne líně (data() vrací dosavadní
@@ -660,11 +707,14 @@ class ApplePhotoModel(QAbstractListModel):
 
     def _start_worker(self, item_id, rec):
         self.loading_ids.add(item_id)
+        tier = min(self.tier, THUMB_TIERS[0]) if self.fast else self.tier
         if self.vault is not None:
             self._vault_ids.add(item_id)
-            w = VaultThumbnailWorker(item_id, rec, self.tier, self.vault)
+            w = VaultThumbnailWorker(item_id, rec, tier, self.vault)
         else:
-            w = ThumbnailWorker(item_id, rec[5], rec[2], self.tier)
+            w = ThumbnailWorker(item_id, rec[5], rec[2], tier)
+        w.started_ids = self._started
+        self._queued.add(item_id)
         w.signals.source_short.connect(self._on_source_short)
         w.signals.loaded.connect(self._on_thumb_loaded)
         w.signals.failed.connect(self._on_thumb_failed)
@@ -735,7 +785,7 @@ class ApplePhotoModel(QAbstractListModel):
         if role == self.ThumbRole:
             pix = self.ram_cache.get(item_id)
             if pix is not None:
-                if item_id not in self.loading_ids and self._needs_upgrade(item_id, pix):
+                if not self.fast and item_id not in self.loading_ids and self._needs_upgrade(item_id, pix):
                     self._start_worker(item_id, rec)     # ostřejší úroveň; do té doby dosavadní
                 return pix
             if item_id not in self.loading_ids and item_id not in self.failed:
@@ -762,6 +812,8 @@ class ApplePhotoModel(QAbstractListModel):
             self.dataChanged.emit(idx, idx, roles)
 
     def _on_thumb_loaded(self, item_id: int, image: QImage):
+        self._queued.discard(item_id)
+        self._started.discard(item_id)
         if item_id in self._vault_ids and self.vault is None:
             self.loading_ids.discard(item_id)       # dorazilo až po zamčení: zahodit
             return
@@ -777,6 +829,8 @@ class ApplePhotoModel(QAbstractListModel):
         self._emit_row_changed(item_id, [self.ThumbRole, self.StateRole])
 
     def _on_thumb_failed(self, item_id: int, state: str):
+        self._queued.discard(item_id)
+        self._started.discard(item_id)
         self.loading_ids.discard(item_id)
         self.failed[item_id] = state      # už se nezkouší znovu při každém překreslení
         self._emit_row_changed(item_id, [self.ThumbRole, self.StateRole])
@@ -1082,6 +1136,7 @@ class ApplePhotoDelegate(QStyledItemDelegate):
 # Nejméně 3 sloupce: 2 obří dlaždice na širokém displeji působily jako rozbitá mřížka (test v praxi)
 GRID_MIN_COLUMNS, GRID_MAX_COLUMNS = 3, 14
 GRID_MIN_CELL, GRID_MAX_CELL = 90, 420
+FLING_ROWS_PER_S = 6               # Gate 2 A: faster than this = cheap decodes, upgrades wait
 SCROLL_IDLE_MS = 140               # tak dlouho po posledním posunu se vrací najetí myši
 PINCH_SETTLE_MS = 160              # touchpad (Ctrl + jemné kolečko): po tak dlouhém klidu se dosedne
 FROZEN_MAX_TILES = 600             # pojistka: tolik dlaždic nejvýš v jednom zmrazeném snímku
@@ -1224,6 +1279,16 @@ class AppleGridView(QListView):
         self._scroll_idle.setInterval(SCROLL_IDLE_MS)
         self._scroll_idle.timeout.connect(self._on_scroll_idle)
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        # Gate 2 A: pixel-smooth kinetic scrolling (spring glide per notch, touchpad momentum)
+        self._kinetic = kinetic_scroll.KineticScroller(self, reduced=motion.reduced)
+        self._kinetic.velocity_changed.connect(self._on_scroll_speed)
+        self._kinetic.settled.connect(lambda: self._on_scroll_speed(0.0))
+
+    def _on_scroll_speed(self, px_s):
+        """Fling = more than FLING_ROWS_PER_S rows a second: decode cheap, upgrade later."""
+        fast = px_s > FLING_ROWS_PER_S * max(1, self.cell_size)
+        if self.photo_model.set_fast(fast) and not fast:
+            self.viewport().update()            # visible rows ask for full quality now
 
     # ── velikost dlaždic ──
     def _update_thumb_tier(self):
@@ -1489,6 +1554,9 @@ class AppleGridView(QListView):
             event.accept()
             return
         self._finish_zoom()                  # běžný posun: zoom dosedne a mřížka jede dál
+        if self._kinetic.wheel(event):
+            event.accept()
+            return
         super().wheelEvent(event)
 
     def event(self, e):
@@ -2249,6 +2317,32 @@ class ClipRelay(QObject):
     ready = pyqtSignal(int, int, str)       # id Cesty (události), index zastávky, URL klipu
 
 
+class CorridorRouter(QThread):
+    """Gate 2 C: routes a Journey's ground legs along their whole corridor (route_corridor.py)
+    off the GUI thread, nearest leg first; each finished leg goes straight to the page."""
+    leg_ready = pyqtSignal(int, int, str)       # journey (event) id, leg index, JSON path
+
+    def __init__(self, journey_id, requests, fetch, parent=None):
+        super().__init__(parent)
+        self.journey_id, self.requests, self.fetch = int(journey_id), requests, fetch
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        for leg, wps, mode in self.requests:
+            if self._stop:
+                return
+            try:
+                path = route_corridor.route_leg(wps, mode, self.fetch)
+            except Exception as e:                  # one bad tile / leg never ends the Journey
+                print(f"[Journey] corridor leg {leg}: {e}")
+                path = None
+            if path and not self._stop:
+                self.leg_ready.emit(self.journey_id, int(leg), json.dumps(path))
+
+
 class MapBridge(QObject):
     def __init__(self, main_window):
         super().__init__()
@@ -2292,6 +2386,12 @@ class MapBridge(QObject):
         """Výběr Cesty v mapě -> data zastávek zpět do window.playJourney()."""
         if hasattr(self.main_window, "play_journey"):
             QTimer.singleShot(0, lambda: self.main_window.play_journey(int(event_id)))
+
+    @pyqtSlot(int, str)
+    def routeJourney(self, journey_id, tile_template):
+        """Gate 2 C: the Journey started -> route its legs along real roads in the background."""
+        if hasattr(self.main_window, "route_journey"):
+            QTimer.singleShot(0, lambda: self.main_window.route_journey(int(journey_id), str(tile_template or "")))
 
     @pyqtSlot()
     def journeyClosed(self):
@@ -3263,6 +3363,8 @@ class FrameStatsOverlay(QLabel):
         super().__init__(window)
         self._window = window
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setProperty(map_host.AIRSPACE_PROP, "native")     # own HWND above the WebView2 map
+        self.setProperty("kairos_airspace_radius", 8)
         f = QFont("Consolas")
         f.setPixelSize(12)
         self.setFont(f)
@@ -3288,7 +3390,8 @@ class FrameStatsOverlay(QLabel):
         if view is not None and getattr(self._window, "_map_loaded", False):
             view.page().runJavaScript("window.getFrameStats ? window.getFrameStats() : null", self._on_map_stats)
         prof = perf_profile.current()
-        lines = [f'Kairos · {prof.tier} · {fmt_number(prof.refresh_hz, 0)} Hz (budget {fmt_number(prof.frame_budget_ms, 1)} ms)']
+        lines = [f'Kairos · {prof.tier} · {fmt_number(prof.refresh_hz, 0)} Hz (budget {fmt_number(prof.frame_budget_ms, 1)} ms)'
+                 f' · map {getattr(self._window, "map_host_kind", "?")}']
         lines += [frame_meter.format_stats(s) for s in frame_meter.all_stats()]
         held = governor.get().reasons()
         state = ("paused (" + ", ".join(held) + ")" if held else ("idle" if not governor.get().busy() else "waiting for idle"))
@@ -3725,7 +3828,12 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         self.lbl_events_sub = QLabel("")
-        toolbar, _, _ = self._make_toolbar(tr("nav-events"), self.lbl_events_sub)
+        toolbar, tb_layout, _ = self._make_toolbar(tr("nav-events"), self.lbl_events_sub)
+        # Gate 2 C: recorded tracks (GPX) give a trip's Journey its true line
+        self.btn_import_gpx = KButton(tr("gpx-import"), variant="secondary", compact=True, icon="route")
+        self.btn_import_gpx.setToolTip(tr("gpx-import-tooltip"))
+        self.btn_import_gpx.clicked.connect(lambda _checked=False: self._import_gpx())
+        tb_layout.addWidget(self.btn_import_gpx)
         layout.addWidget(toolbar)
 
         # Bento m\u0159\u00ed\u017eka karet (events_view.py) ve scrollovac\u00ed oblasti
@@ -3760,7 +3868,66 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        self._map_layout = layout
+        self.map_host_kind = "qtwebengine"
+        self.map_bridge = MapBridge(self)
+        if map_host.available():
+            try:
+                self._build_map_view_webview2(layout)
+                return page
+            except Exception as e:
+                print(f"[Map] WebView2 host failed, using QtWebEngine: {e}")
+                self.map_view = None
+        self._build_map_view_qtwebengine(layout)
+        return page
 
+    def _map_html_path(self):
+        return os.path.join(RESOURCE_DIR, "map_vault.html")
+
+    def _build_map_view_webview2(self, layout):
+        """Gate 2: the map in WebView2 (paced 120 Hz; QtWebEngine is locked to 60 fps) – map_host.py."""
+        import paths as _paths
+        view = map_host.WebView2Host(user_data_dir=os.path.join(_paths.WEB_CACHE_DIR, "wv2"), tag="Mapa")
+        view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        view.page().setBackgroundColor(QColor("#1C1C1E"))
+        srv = tile_store.start(int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
+        if srv is not None:                  # C7e: like install_tile_store, before the page's scripts
+            view.add_init_script(f"window.TILE_STORE_CONFIG = {json.dumps(srv.config())};")
+        names = map_host.bridge_slot_names(MapBridge)
+        view.add_init_script(map_host.BRIDGE_JS % json.dumps(names))
+        self._map_messages = map_host.WebMessageBridge(self.map_bridge, names, view)
+        view.message.connect(self._map_messages.dispatch)
+        view.filesDropped.connect(self._on_map_files_dropped)
+        view.loadStarted.connect(self.map_bridge.release_all)      # nová stránka = staré holdy pryč
+        view.loadFinished.connect(self._on_map_loaded)
+        view.failed.connect(self._on_map_host_failed)
+        self.map_view = view
+        self.map_host_kind = "webview2"
+        if os.path.exists(self._map_html_path()):
+            view.load(QUrl.fromLocalFile(os.path.abspath(self._map_html_path())))
+        layout.addWidget(view)
+
+    def _on_map_host_failed(self, why):
+        """WebView2 could not start (runtime broken / blocked by policy) -> QtWebEngine instead."""
+        view = self.map_view
+        if not isinstance(view, map_host.WebView2Host):
+            return
+        self._map_loaded = False
+        self._map_layout.removeWidget(view)
+        view.close_webview()
+        view.hide()
+        view.deleteLater()
+        self.map_view = None
+        self._build_map_view_qtwebengine(self._map_layout)
+
+    def _on_map_files_dropped(self, paths_list):
+        """Files / folders dropped onto the WebView2 map (Qt never sees that drag)."""
+        folders, files = drop_import.classify_paths(paths_list)
+        if folders or files:
+            self.import_dropped(folders, files)
+
+    def _build_map_view_qtwebengine(self, layout):
+        self.map_host_kind = "qtwebengine"
         try:
             # Platí pro výchozí profil = mapa i minimapa prohlížeče (viz is_allowed_web_url)
             self._web_interceptor = WebUrlInterceptor(self)
@@ -3785,13 +3952,12 @@ class MainWindow(QMainWindow):
             settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
 
             self.map_channel = QWebChannel()
-            self.map_bridge = MapBridge(self)
             self.map_channel.registerObject("bridge", self.map_bridge)
             self.map_view.page().setWebChannel(self.map_channel)
             self.map_view.loadStarted.connect(self.map_bridge.release_all)   # nová stránka = staré holdy pryč
             self.map_view.loadFinished.connect(self._on_map_loaded)
 
-            map_html = os.path.join(RESOURCE_DIR, "map_vault.html")
+            map_html = self._map_html_path()
             if os.path.exists(map_html):
                 self.map_view.load(QUrl.fromLocalFile(os.path.abspath(map_html)))
             layout.addWidget(self.map_view)
@@ -3799,8 +3965,6 @@ class MainWindow(QMainWindow):
             layout.addWidget(EmptyState("map", tr("map-unavailable-title"),
                                         tr("map-unavailable-body", e=e)), 1)
             self.map_view = None
-
-        return page
 
     def _build_import_page(self):
         page = QWidget()
@@ -3834,6 +3998,7 @@ class MainWindow(QMainWindow):
                 print(f"[Init] Odstraněno {purged} osiřelých testovacích záznamů (černé karty v mřížce)")
         except Exception as e:
             print(f"[Init] Úklid osiřelých záznamů selhal: {e}")
+        self._migrate_trips()
         self._load_photos()
         self._load_people()
         self._load_events()
@@ -3843,6 +4008,20 @@ class MainWindow(QMainWindow):
         self._start_ai_daemon()
         QTimer.singleShot(VIEWER_PREWARM_DELAY_MS, self._prewarm_viewer)
         QTimer.singleShot(SMART_IMPORT_DELAY_MS, self._smart_import_check)
+
+    def _migrate_trips(self):
+        """A library clustered by an older trip algorithm is re-clustered once (stable ids keep
+        covers, tints and links); before this, recluster only ran when an import found new files."""
+        try:
+            with db_transaction() as conn:
+                t0 = time.perf_counter()
+                stats = trips.ensure_current(conn)
+            if stats is not None:
+                print(f"[Events] trips v{trips.ALGO_VERSION}: {stats.get('kinds')} | kept {stats['kept']}, "
+                      f"new {stats['created']}, removed {stats['deleted']} "
+                      f"({(time.perf_counter() - t0) * 1000:.0f} ms)")
+        except Exception as e:
+            print(f"[Events] trip migration failed: {e}")
 
     # ── Chytrý import (Patch 11) ──────────────────────────────────────────────
 
@@ -4822,6 +5001,7 @@ class MainWindow(QMainWindow):
         page = self.map_view.page()
         # adaptivní škálování mapy: meze rozlišení, LOD dlaždic a terénu podle profilu stroje
         page.runJavaScript(f"window.setPerfProfile && window.setPerfProfile({json.dumps(self.perf.for_map())});")
+        page.runJavaScript(f"window.setFrameCap && window.setFrameCap({self._map_fps_cap()});")
         page.runJavaScript(f"window.setBaseLayer && window.setBaseLayer({json.dumps(layer)});")
         page.runJavaScript(f"window.setJourneyMusic && window.setJourneyMusic({json.dumps(self._music_config())});")
         self._push_map_strings()
@@ -4853,6 +5033,24 @@ class MainWindow(QMainWindow):
             return
         active = self.stack.currentWidget() is self.page_map
         self.map_view.page().runJavaScript(f"window.setMapActive && window.setMapActive({json.dumps(active)});")
+        if active:                           # the power source may have changed since the last visit
+            self.map_view.page().runJavaScript(f"window.setFrameCap && window.setFrameCap({self._map_fps_cap()});")
+
+    def _map_fps_cap(self):
+        """Gate 2: map frame cap – 0 = the panel's own rate (120 Hz in WebView2), 60 on battery
+        (unless the battery policy is "full"); config "map_fps_cap" overrides both."""
+        try:
+            cap = int(self.config.get("map_fps_cap", 0) or 0)
+        except (TypeError, ValueError):
+            cap = 0
+        if cap > 0:
+            return cap
+        if self.config.get("battery_policy", power.DEFAULT_POLICY) == "full":
+            return 0
+        try:
+            return 60 if power.get().state().on_battery else 0
+        except Exception:
+            return 0
 
     def play_journey(self, event_id: int, return_here: bool = False):
         """Cesta: zastávky události -> kinematické přehrávání na mapě (journey.py).
@@ -4869,6 +5067,8 @@ class MainWindow(QMainWindow):
                     image_url=lambda p: get_local_thumb_url(preview_cache.get_preview(p, touch=False)))
                 row = conn.execute("SELECT tint FROM events WHERE id = ?", (int(event_id),)).fetchone()
                 clips = MainWindow._journey_clips(self, conn, data) if data is not None else []
+                if data is not None:
+                    MainWindow._journey_music(self, conn, data)
             finally:
                 conn.close()
         except Exception as e:
@@ -4890,18 +5090,144 @@ class MainWindow(QMainWindow):
                 self._refresh_map()
             else:
                 self._switch_page(3)
+        self._journey_data = data            # Gate 2 C: corridor routing reads the stops from here
         if not self._map_loaded:
             self._pending_journey = data
             return True
         self.map_view.page().runJavaScript(f"window.playJourney && window.playJourney({json.dumps(data)});")
         return True
 
+    def route_journey(self, journey_id: int, tile_template: str):
+        """Starts CorridorRouter for the playing Journey (legs with a GPX line are skipped)."""
+        old = getattr(self, "_corridor_router", None)
+        if old is not None:
+            old.stop()
+            try:
+                old.leg_ready.disconnect()
+            except TypeError:
+                pass
+        self._corridor_router = None
+        data = getattr(self, "_journey_data", None)
+        srv = tile_store.service()
+        if not data or int(data.get("id", -1)) != int(journey_id) or not tile_template or srv is None:
+            return False
+        skip = {int(k) for k in (data.get("tracks") or {})}
+        reqs = [r for r in route_corridor.leg_requests(data["stops"]) if r[0] not in skip]
+        if not reqs:
+            return False
+        worker = CorridorRouter(journey_id, reqs, route_corridor.store_fetcher(tile_template, srv.resolve), self)
+        worker.leg_ready.connect(self._on_corridor_leg)
+        worker.finished.connect(lambda w=worker: self._forget_router(w))
+        worker.finished.connect(worker.deleteLater)
+        self._corridor_router = worker
+        worker.start(QThread.Priority.LowPriority)
+        return True
+
+    def _import_gpx(self, files=None):
+        """Gate 2 C: GPX tracks -> library; each binds to the trip it overlaps in time."""
+        if files is None or isinstance(files, bool):  # clicked(bool) must never pose as a file list
+            files, _ = QFileDialog.getOpenFileNames(self, tr("gpx-import-pick"), "", tr("gpx-file-filter"))
+        if not files:
+            return []
+        results, failed = [], []
+        conn = get_connection()
+        try:
+            for path in files:
+                try:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                    results.append(gpx_tracks.import_gpx(conn, data, os.path.basename(path)))
+                except (OSError, gpx_tracks.GpxError) as e:
+                    print(f"[GPX] {path}: {e}")
+                    failed.append(os.path.basename(path))
+            conn.commit()
+        finally:
+            conn.close()
+        bound = [r for r in results if r.get("event_id")]
+        if bound and len(results) == 1:
+            show_toast(self, tr("gpx-imported-bound", event=event_title(bound[0]["event_title"] or "")), "success",
+                       action_text=tr("journey"),
+                       on_action=lambda eid=bound[0]["event_id"]: self._request_journey(eid))
+        elif results:
+            show_toast(self, tr("gpx-imported", count=len(results), bound=len(bound)),
+                       "success" if bound else "info")
+        if failed:
+            show_toast(self, tr("gpx-import-failed", files=", ".join(failed)), "error")
+        return results
+
+    def _forget_router(self, worker):
+        if getattr(self, "_corridor_router", None) is worker:
+            self._corridor_router = None
+
+    def _on_corridor_leg(self, journey_id, leg, path_json):
+        if getattr(self, "map_view", None) is None or not self._map_loaded:
+            return
+        self.map_view.page().runJavaScript(
+            f"window.corridorRoute && window.corridorRoute({int(journey_id)}, {int(leg)}, {path_json});")
+
+    def _journey_music(self, conn, data):
+        """Gate 2 D: the track whose energy fits the trip's mood (mood.py) -> data["music"]."""
+        try:
+            tracks = ambient_music.tracks()
+            if not tracks:
+                return None
+            for t in tracks:
+                t["profile"] = ambient_music.track_profile(t, compute=False)
+            m = mood.trip_mood(conn, data["id"])
+            best = mood.rank_tracks(tracks, m, salt=data["id"])[0]
+            data["music"] = {"file": best["file"], "energy": m["energy"], "brightness": m["brightness"]}
+            if self.config.get("cesta_music", False) and (
+                    any(t["profile"] is None for t in tracks) or not mood.load_prompt_bank()):
+                MainWindow._warm_music(self)          # next Journey matches on every signal
+            return data["music"]
+        except Exception as e:
+            print(f"[Music] mood: {e}")
+            return None
+
+    def _warm_music(self):
+        """Background: prompt bank for the vibe signal + profiles of user tracks (once)."""
+        if getattr(self, "_music_warming", False):
+            return
+        self._music_warming = True
+
+        def work():
+            try:
+                for t in ambient_music.tracks():
+                    ambient_music.track_profile(t)
+                mood.warm_prompt_bank()
+            except Exception as e:
+                print(f"[Music] warm-up: {e}")
+            finally:
+                self._music_warming = False
+        threading.Thread(target=work, name="music-warm", daemon=True).start()
+
+    def add_music(self, files=None, parent=None):
+        """Gate 2 D: Add Music… -> copies into %APPDATA%/Kairos/music; Journeys use it next."""
+        if files is None:
+            files, _ = QFileDialog.getOpenFileNames(parent or self, tr("music-add-pick"), "", tr("music-file-filter"))
+        if not files:
+            return []
+        try:
+            added = ambient_music.add_user_tracks(files)
+        except OSError as e:
+            print(f"[Music] {e}")
+            show_toast(self, tr("music-add-failed"), "error")
+            return []
+        if added:
+            show_toast(self, tr("music-added", count=len(added)), "success")
+            MainWindow._warm_music(self)
+            if getattr(self, "map_view", None) is not None and self._map_loaded:
+                self.map_view.page().runJavaScript(
+                    f"window.setJourneyMusic && window.setJourneyMusic({json.dumps(self._music_config())});")
+        return added
+
     def _music_config(self):
         """C6: přibalené skladby pro Cestu + volba uživatele (výchozí vypnuto)."""
         # Sprint 4: s mapou dob – Director přichytí příjezdy na zastávky na doby (director.js)
         return {"enabled": bool(self.config.get("cesta_music", False)),
                 "tracks": [{"title": t["title"], "url": QUrl.fromLocalFile(t["path"]).toString(),
-                            "beats": ambient_music.beat_map(t)}
+                            "file": t["file"], "user": t["user"],
+                            "beats": ambient_music.beat_map(t, compute=not t["user"])}
                            for t in ambient_music.tracks()]}
 
     def _journey_clips(self, conn, data):
@@ -4960,6 +5286,8 @@ class MainWindow(QMainWindow):
         """Mapa sundaná ze zásobníku (konec Cesty, Zpět, postranní panel): Cesta skončí tiše."""
         self._journey_return = False
         self._pending_journey = None
+        if getattr(self, "_corridor_router", None) is not None:
+            self._corridor_router.stop()          # Journey over: no more legs to route
         if getattr(self, "map_view", None) is not None and self._map_loaded:
             self.map_view.page().runJavaScript("window.endJourney && window.endJourney(true);")
         self._sync_sidebar()
@@ -6444,6 +6772,11 @@ class MainWindow(QMainWindow):
         # Démon a sken: zastavit a počkat. Kdo do limitu nedoběhne (rozdělaná položka), přejde
         # do úschovy a shutdown_app na něj počká před zánikem QApplication – dřív se okno
         # smazalo s běžícím QThread a proces při ukončení padal (Sprint R).
+        router = getattr(self, "_corridor_router", None)      # Gate 2 C: corridor routing thread
+        if router is not None and router.isRunning():
+            router.stop()
+            if not router.wait(3000):
+                park_thread(router)
         for thread in (self._ai_daemon, self._scanner):
             if thread is not None and thread.isRunning():
                 thread.stop()
@@ -6455,6 +6788,8 @@ class MainWindow(QMainWindow):
         if self._search_warmup is not None:
             self._search_warmup.wait()          # načítání modelu nejde přerušit; zničení běžícího QThread = pád
         self._person_card_pool.waitForDone(2000)
+        if isinstance(getattr(self, "map_view", None), map_host.WebView2Host):
+            self.map_view.close_webview()       # WebView2 browser process ends with its controller
         super().closeEvent(event)
 
 
