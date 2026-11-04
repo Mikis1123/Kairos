@@ -13,7 +13,10 @@ import privacy_export as pe
 from ui_controls import SegmentedControl, ToggleSwitch
 from ui_sheets import Sheet
 
-OPTION_KEYS = ("strip_gps", "strip_people", "strip_camera", "neutral_names", "include_live", "layout", "package")
+PRESET_NOTES = {"original": "export-preset-original-note", "web": "export-preset-web-note",
+                "archive": "export-preset-archive-note"}
+OPTION_KEYS = ("strip_gps", "strip_people", "strip_camera", "neutral_names", "include_live", "layout", "package",
+               "preset")
 
 
 def options_from_config(config, title="Export"):
@@ -26,6 +29,8 @@ def options_from_config(config, title="Export"):
         opts.layout = "files"
     if opts.package not in ("folder", "zip"):
         opts.package = "folder"
+    if opts.preset not in pe.PRESETS:
+        opts.preset = "original"
     return opts
 
 
@@ -60,6 +65,11 @@ class ExportSheet(Sheet):
                       (self.t_live, opts.include_live)):
             t.setChecked(bool(on))
             self.content.addWidget(t)
+        # Pillar 3: Original Master / Web & Social / High-Res Archive (files layout)
+        self.seg_preset = SegmentedControl([(tr("export-preset-original"), "original"),
+                                            (tr("export-preset-web"), "web"),
+                                            (tr("export-preset-archive"), "archive")], current=opts.preset)
+        self.content.addWidget(_row(tr("export-preset"), self.seg_preset))
         self.seg_layout = SegmentedControl([(tr("export-format-files"), "files"), (tr("export-format-web"), "web")], current=opts.layout)
         self.seg_package = SegmentedControl([(tr("export-format-folder"), "folder"), ("ZIP", "zip")], current=opts.package)
         self.content.addWidget(_row(tr("export-content"), self.seg_layout))
@@ -72,6 +82,7 @@ class ExportSheet(Sheet):
         for t in (self.t_gps, self.t_people, self.t_camera):
             t.toggled.connect(self._sync)
         self.seg_layout.changed.connect(lambda _k: self._sync())
+        self.seg_preset.changed.connect(lambda _k: self._sync())
         self._sync()
 
     @staticmethod
@@ -83,7 +94,9 @@ class ExportSheet(Sheet):
 
     def _sync(self):
         web = self._checked_key(self.seg_layout) == "web"
-        self.t_live.setEnabled(not web)
+        preset = self._checked_key(self.seg_preset)
+        self.seg_preset.setEnabled(not web)              # the web gallery has its own rendering
+        self.t_live.setEnabled(not web and preset == "original")
         strips = self.t_gps.isChecked() or self.t_people.isChecked() or self.t_camera.isChecked()
         if strips and not self.exiftool_ok:
             note = tr("export-exiftool-missing")
@@ -93,6 +106,8 @@ class ExportSheet(Sheet):
             note = tr("export-keep-all-note")
         if web:
             note += " " + tr("export-web-note")
+        else:
+            note = tr(PRESET_NOTES.get(preset, "export-preset-original-note")) + " " + note
         self.lbl_note.setText(note)
         self.btn_action.setEnabled(not (strips and not self.exiftool_ok))
 
@@ -105,6 +120,7 @@ class ExportSheet(Sheet):
         o.include_live = self.t_live.isChecked()
         o.layout = self._checked_key(self.seg_layout)
         o.package = self._checked_key(self.seg_package)
+        o.preset = self._checked_key(self.seg_preset)
         return o
 
 

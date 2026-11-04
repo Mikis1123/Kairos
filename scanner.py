@@ -16,7 +16,6 @@ from database import get_connection, db_transaction, upsert_media_item
 import cloud_files
 import media_identity
 import trips
-import reverse_geocoder as rg
 from PIL import Image, ImageOps
 import color_manage
 import fs_atomic
@@ -30,10 +29,13 @@ except ImportError:
 import raw_decode  # noqa: E402  ProRAW / camera RAW through every Image.open (raw_decode.py)
 raw_decode.register()
 
-try:
-    from mutagen.mp4 import MP4
-except ImportError:
-    MP4 = None
+def _mp4_reader():
+    """mutagen's MP4 (~20 ms import) only when a scan actually reads video atoms (pillar 5)."""
+    try:
+        from mutagen.mp4 import MP4
+        return MP4
+    except ImportError:
+        return None
 
 from paths import (
     BASE_DIR,
@@ -677,6 +679,7 @@ class MediaScannerThread(QThread):
             if not meta.get("Model"):
                 meta["Model"] = meta.get("AndroidModel")
 
+        MP4 = _mp4_reader()
         if MP4 is not None:
             for meta in result.values():
                 fp = meta.get("SourceFile", "")
@@ -786,6 +789,7 @@ class MediaScannerThread(QThread):
             # mode=1: jeden proces. Výchozí mode=2 spouští multiprocessing, což
             # v zabaleném (frozen) Windows buildu bez freeze_support() restartuje aplikaci.
             try:
+                import reverse_geocoder as rg     # pillar 5: scipy KD-tree (~450 ms) only when geocoding
                 results = rg.search(coords, mode=1, verbose=False)
             except TypeError:
                 results = rg.search(coords, mode=1)

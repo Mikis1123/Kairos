@@ -140,9 +140,10 @@ class _FullSignals(QObject):
 class FullResJob(QRunnable):
     """Originál v plném rozlišení (profil displeje, EXIF orientace) -> pyramida."""
 
-    def __init__(self, path, token):
+    def __init__(self, path, token, adjustments=None):
         super().__init__()
         self.path, self.token = path, token
+        self.adjustments = adjustments          # pillar 2: Quick Edit applied before the pyramid
         self.signals = _FullSignals()
 
     def run(self):
@@ -150,6 +151,9 @@ class FullResJob(QRunnable):
         try:
             from viewer_hud import load_image_file
             img = load_image_file(self.path, None, use_preview=False)
+            if not img.isNull() and self.adjustments is not None:
+                import quick_edit
+                img = quick_edit.render_qimage(img, self.adjustments)
             if not img.isNull():
                 levels = build_pyramid(img)
         except Exception as e:

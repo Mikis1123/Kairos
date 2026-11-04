@@ -4,6 +4,7 @@ P3.1 Asynchronní karty osob | P3.2 Debounce vyhledávání | P3.3 Přesun obli�
 P3.4 Mrtvý kód odstraněn    | P3.5 Duplicity dialog     | P3.6 Borderline Review
 P3.7 Nastavení prahu        | P3.8 Konfig. práh         | P3.9 Dynamická LRU cache
 """
+import boot_trace  # noqa: E402,F401 – first: cold-boot clock (pillar 5)
 import sys, os, time, json, math, subprocess, unicodedata
 from collections import OrderedDict
 from datetime import datetime
@@ -22,7 +23,23 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
 
 # Kairos dávka 5: při spuštění jako skript se nejdřív ukáže úvodní obrazovka – těžké importy
 # níže proběhnou až pod ní (splash.boot pak modul načte znovu jako „main“ a zavolá main())
-if __name__ == "__main__" and not os.environ.get("KAIROS_NO_SPLASH"):
+def _launch_intro_wanted():
+    """Pillar 5: the 1.5 s brand intro gates the window, so it is opt-in (config
+    "launch_intro"); a normal launch goes straight to the grid. KAIROS_SPLASH=1 forces it."""
+    if os.environ.get("KAIROS_NO_SPLASH"):
+        return False
+    if os.environ.get("KAIROS_SPLASH") == "1":
+        return True
+    try:
+        import data_migration
+        data_migration.ensure_ready()           # config lives in AppData (Gate 0)
+        from config import load_config
+        return bool(load_config().get("launch_intro", False))
+    except Exception:
+        return False
+
+
+if __name__ == "__main__" and _launch_intro_wanted():
     import splash
     sys.exit(splash.boot())
 if __name__ == "__main__":
@@ -555,10 +572,31 @@ def thumb_tier(cell_px_physical):
     return next((t for t in THUMB_TIERS if t >= need), THUMB_TIERS[-1])
 
 
+def cache_decode_divisor(w, h, tier, headroom=1.5):
+    """Largest JPEG DCT scale divisor (1, 2, 4, 8) that still leaves the short edge >= headroom×tier."""
+    short = min(int(w), int(h))
+    for d in (8, 4, 2):
+        if short / d >= tier * headroom:
+            return d
+    return 1
+
+
 def _shrink_short_edge(img, short):
     """QImage zmenšený (Lanczos3, imaging) tak, aby kratší strana byla `short` (menší se nezvětšuje)."""
     import imaging
     return imaging.shrink_qimage_short_edge(img, short)
+
+
+# Pillar 2: Quick Edits shown in every grid. media id -> quick_edit.Adjustments (edited items
+# only), filled by MainWindow._load_edits and updated when the viewer saves an edit. Workers read
+# it when they are created, so a tile is always rendered with the edit that was current then.
+EDITS = {}
+import weakref  # noqa: E402
+_LIVE_MODELS = weakref.WeakSet()
+
+
+def edit_for(item_id):
+    return EDITS.get(int(item_id)) if EDITS else None
 
 
 def tile_shade(meta):
@@ -612,7 +650,21 @@ class ThumbnailWorker(QRunnable):
         self.tile_geom = None       # (w_px, h_px, radius, dpr, shade): pre-render the grid tile too
         self.started_ids = None     # Gate 2 A: model's set of dequeued ids (stale-queue cancel)
         self._source_short = None   # true short edge of the decoded source (before scaled decode)
+        self.adjustments = None     # pillar 2: quick_edit.Adjustments applied before the tier shrink
         self.setAutoDelete(True)
+
+    def _apply_edit(self, img):
+        if self.adjustments is None or img.isNull():
+            return img
+        try:
+            import quick_edit
+            out = quick_edit.render_qimage(img, self.adjustments)
+            if self._source_short:
+                x, y, cw, ch = self.adjustments.crop
+                self._source_short = max(1, int(self._source_short * min(cw, ch)))
+            return out
+        except Exception:
+            return img
 
     def run(self):
         if self.started_ids is not None:
@@ -630,6 +682,7 @@ class ThumbnailWorker(QRunnable):
                      else THUMB_MISSING_FILE)
             self.signals.failed.emit(self.item_id, state)
             return
+        img = self._apply_edit(img)
         self.signals.source_short.emit(self.item_id, self._source_short or min(img.width(), img.height()))
         thumb = _shrink_short_edge(img, self.tier)
         self.signals.loaded.emit(self.item_id, thumb, self._tile(thumb))
@@ -659,12 +712,18 @@ class ThumbnailWorker(QRunnable):
             except Exception:
                 pass
         else:
-            # miniatura z cache: celé dekódování (840 px, ~3 ms) a zmenšení Lanczos v tomto
-            # vlákně – škálované čtení QImageReaderu by zmenšovalo hrubším filtrem Qt
+            # miniatura z cache, Lanczos zmenšení v tomto vlákně. Pillar 5: when the tier is far
+            # below the 840 px file, libjpeg decodes at an exact 1/2 or 1/4 in the DCT (no Qt
+            # resampling – the requested size is exactly libjpeg's output), keeping >= 1.5× the
+            # tier for the Lanczos step. Measured at boot: 10 + 13 ms -> ~3 + 3 ms per tile.
             reader = QImageReader(path)
+            src = reader.size()
+            div = cache_decode_divisor(src.width(), src.height(), self.tier) if src.isValid() else 1
+            if div > 1:
+                reader.setScaledSize(QSize(-(-src.width() // div), -(-src.height() // div)))
             img = reader.read()
             if not img.isNull():
-                self._source_short = min(img.width(), img.height())
+                self._source_short = min(src.width(), src.height()) if div > 1 else min(img.width(), img.height())
                 return img
         reader = QImageReader(path)
         reader.setAutoTransform(True)
@@ -708,6 +767,7 @@ class VaultThumbnailWorker(ThumbnailWorker):
             self.signals.failed.emit(self.item_id, THUMB_UNAVAILABLE if original and os.path.exists(original)
                                      else THUMB_MISSING_FILE)
             return
+        img = self._apply_edit(img)
         self.signals.source_short.emit(self.item_id, min(img.width(), img.height()))
         thumb = _shrink_short_edge(img, self.tier)
         self.signals.loaded.emit(self.item_id, thumb, self._tile(thumb))
@@ -722,6 +782,7 @@ class ApplePhotoModel(QAbstractListModel):
 
     def __init__(self, lru_capacity: int = 1200, parent=None):
         super().__init__(parent)
+        _LIVE_MODELS.add(self)            # pillar 2: an edit saved in the viewer refreshes every grid
         self.records = []
         self.possible = set()
         self.id_to_row = {}
@@ -790,6 +851,8 @@ class ApplePhotoModel(QAbstractListModel):
         else:
             w = ThumbnailWorker(item_id, rec[5], rec[2], tier, self._signals)
         w.started_ids = self._started
+        if rec[3] != "video":
+            w.adjustments = edit_for(item_id)
         if self.tile_geom is not None and self.vault is None:
             w.tile_geom = self.tile_geom + (tile_shade({"type": rec[3], "is_fav": rec[7]}),)
         self._queued.add(item_id)
@@ -845,6 +908,24 @@ class ApplePhotoModel(QAbstractListModel):
         self.loading_ids.clear()
         self.failed.clear()       # soubor se mohl mezitím objevit (připojený disk, opravený náhled)
         self.endResetModel()
+
+    def refresh_items(self, ids):
+        """Pillar 2: these items' pixels changed (Quick Edit saved): drop their thumbnails and
+        pre-rendered tiles and repaint – the next paint decodes them with the new edit."""
+        ids = {int(i) for i in ids}
+        self.ram_cache.discard(ids)
+        for item_id in ids:
+            old = self._pretiles.pop(item_id, None)
+            if old is not None:
+                self._pretile_bytes -= old[0].width() * old[0].height() * 4
+            self._src_short.pop(item_id, None)
+            self.failed.pop(item_id, None)
+        self.loading_ids.difference_update(ids)
+        for item_id in ids:
+            row = self.id_to_row.get(item_id)
+            if row is not None:
+                idx = self.index(row, 0)
+                self.dataChanged.emit(idx, idx)
 
     def invalidate_cache(self):
         self.ram_cache.clear()
@@ -1450,6 +1531,7 @@ class AppleGridView(QListView):
         self.grabGesture(Qt.GestureType.PinchGesture)
         # Polish P4: Live Photo se po ~350 ms pod kurzorem rozpohybuje (pás snímků scrub_strip)
         self.live_preview = live_hover.LivePreview(self)
+        self.live_preview.edit_for = edit_for       # pillar 2: hover loop with the still's edit
         # Během posouvání žádné najetí: zvedání dlaždic, Live Photo ani sledování myši – každá
         # dlaždice je jen kopie hotové pixmapy. Najetí se obnoví SCROLL_IDLE_MS po zastavení.
         self._scrolling = False
@@ -2413,6 +2495,10 @@ class AISearchWorker(QThread):
         self.search_finished.emit(result, self.query_text)
 
 
+REVEAL_FALLBACK_MS = 900      # direct launch: the window appears by then even if tiles are still decoding
+DEFERRED_SERVICES_MS = 500     # pillar 5: daemons / side pages start this long after the first grid frame
+DEFERRED_FALLBACK_MS = 2500    # … or after this, when the window opened somewhere without a grid frame
+MAP_PREBUILD_DELAY_MS = 1500   # map host (WebView2) built in the background after the deferred tick
 SEARCH_WARMUP_DELAY_MS = 5000   # textový model hledání se načte v klidu po startu, ne při 1. dotazu
 SIGLIP_READY_SHARE = 0.98       # přesné hledání se zapne, až má SigLIP 2 vektor ≥ 98 % knihovny
 SIGLIP_BATCH = 8
@@ -3982,6 +4068,27 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._hidden_startup_sweep)
         QTimer.singleShot(SEARCH_WARMUP_DELAY_MS, self._warm_search_model)
 
+    def start_deferred_services(self):
+        """Pillar 5: non-critical start-up work, DEFERRED_SERVICES_MS after the grid's first frame."""
+        if getattr(self, "_deferred_started", False):
+            return
+        self._deferred_started = True
+        QTimer.singleShot(DEFERRED_SERVICES_MS, self._run_deferred_services)
+
+    def _run_deferred_services(self):
+        if getattr(self, "_shutting_down", False):
+            return
+        boot_trace.mark("deferred_services")
+        self._load_people()
+        self._load_events()
+        self._check_siglip_ready()          # Sprint 4.0: přesné hledání, je-li zapnuté a index hotový
+        if not getattr(self, "_embeddings_loaded", False):
+            self._load_embeddings()
+        self._start_ai_daemon()
+        QTimer.singleShot(VIEWER_PREWARM_DELAY_MS, self._prewarm_viewer)
+        QTimer.singleShot(SMART_IMPORT_DELAY_MS, self._smart_import_check)
+        QTimer.singleShot(MAP_PREBUILD_DELAY_MS, self._ensure_map_view)     # map instant on first visit
+
     def _nav_back(self):
         if self.nav.current() is self._viewer and self._viewer is not None:
             self._viewer.request_close()      # zastaví přehrávání a pak se vrátí
@@ -4345,15 +4452,28 @@ class MainWindow(QMainWindow):
         self._map_layout = layout
         self.map_host_kind = "qtwebengine"
         self.map_bridge = MapBridge(self)
+        # Pillar 5: the map host (WebView2 + pythonnet / Chromium, ~620 ms) is NOT built during
+        # start-up – _ensure_map_view() builds it on first visit, for a Journey, or in
+        # start_deferred_services() shortly after the grid's first frame.
+        self.map_view = None
+        self._map_view_built = False
+        return page
+
+    def _ensure_map_view(self):
+        """Builds the map host once (WebView2, else QtWebEngine). True when a view exists."""
+        if getattr(self, "_map_view_built", True):          # absent = built eagerly elsewhere
+            return getattr(self, "map_view", None) is not None
+        self._map_view_built = True
+        layout = self._map_layout
         if map_host.available():
             try:
                 self._build_map_view_webview2(layout)
-                return page
+                return True
             except Exception as e:
                 print(f"[Map] WebView2 host failed, using QtWebEngine: {e}")
                 self.map_view = None
         self._build_map_view_qtwebengine(layout)
-        return page
+        return self.map_view is not None
 
     def _map_html_path(self):
         return os.path.join(RESOURCE_DIR, "map_vault.html")
@@ -4474,14 +4594,11 @@ class MainWindow(QMainWindow):
             print(f"[Init] Úklid osiřelých záznamů selhal: {e}")
         self._migrate_trips()
         self._load_photos()
-        self._load_people()
-        self._load_events()
-        self._check_siglip_ready()          # Sprint 4.0: přesné hledání, je-li zapnuté a index hotový
-        self._load_embeddings()
         self._refresh_memory()
-        self._start_ai_daemon()
-        QTimer.singleShot(VIEWER_PREWARM_DELAY_MS, self._prewarm_viewer)
-        QTimer.singleShot(SMART_IMPORT_DELAY_MS, self._smart_import_check)
+        # Pillar 5: People / Events / search vectors / the AI daemon are not needed for the first
+        # grid frame – start_deferred_services() runs them DEFERRED_SERVICES_MS after it paints
+        # (pages load their own data on visit; a search loads the vectors on demand).
+        QTimer.singleShot(DEFERRED_FALLBACK_MS, self.start_deferred_services)   # no grid frame (other page)
 
     def _migrate_trips(self):
         """A library clustered by an older trip algorithm is re-clustered once (stable ids keep
@@ -4639,7 +4756,42 @@ class MainWindow(QMainWindow):
                 and getattr(self, "folder_watcher", None) is not None:
             self.folder_watcher.window_activated()
 
+    def _load_edits(self):
+        """Pillar 2: Quick Edits of the library into the shared EDITS map (one small query)."""
+        try:
+            import quick_edit
+            conn = get_connection()
+            try:
+                edits = quick_edit.load_many(conn)
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[Edit] {e}")
+            edits = {}
+        EDITS.clear()
+        EDITS.update(edits)
+
+    def _on_edit_saved(self, media_id):
+        """The viewer saved / reverted a Quick Edit: refresh that tile in every grid."""
+        try:
+            import quick_edit
+            conn = get_connection()
+            try:
+                adj = quick_edit.load(conn, int(media_id))
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"[Edit] {e}")
+            adj = None
+        if adj is None or adj.is_identity():
+            EDITS.pop(int(media_id), None)
+        else:
+            EDITS[int(media_id)] = adj
+        for model in list(_LIVE_MODELS):
+            model.refresh_items([int(media_id)])
+
     def _load_photos(self):
+        self._load_edits()
         try:
             self._all_records = fetch_media_records()
             self._trash_records = fetch_media_records(trashed=True)
@@ -5013,6 +5165,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[Embeddings] {e}")
             self._embeddings_cache = {}
+        self._embeddings_loaded = True
         # démon opravil / doplnil embeddingy -> běžící hledání se zpřesní samo
         if self._search_query.strip() and self._search_result is not None:
             self._search_debounce.start()
@@ -5421,6 +5574,8 @@ class MainWindow(QMainWindow):
         # QThread.quit() vlákno bez event loopu nezastaví a přepsání reference by zničilo
         # běžící QThread (pád). Starší hledání doběhnou samy, jejich výsledky se zahodí.
         # Hledá se v aktuální kolekci (i v koši); fazety (místo, čas, typ) fungují i bez modelu.
+        if not getattr(self, "_embeddings_loaded", False):
+            self._load_embeddings()           # search typed before the deferred start-up tick
         universe = [int(r[0]) for r in self._collection_records()]
         worker = AISearchWorker(self._search_query, self._embeddings_cache, universe)
         worker.search_finished.connect(self._on_search_results)
@@ -5460,6 +5615,7 @@ class MainWindow(QMainWindow):
         elif idx == 2:
             self._load_events()
         elif idx == 3:
+            self._ensure_map_view()
             self._refresh_map()
 
     def _on_map_loaded(self, ok: bool):
@@ -5572,7 +5728,7 @@ class MainWindow(QMainWindow):
         Nenačtená mapa si data podrží (_pending_journey) a přehraje je v _on_map_loaded.
         return_here: mapa se vloží jako podstránka nad aktuální stránku (detail / přehled
         událostí) a konec Cesty nebo Zpět vrátí přesně tam – místo resetu na kořen Mapy."""
-        if getattr(self, "map_view", None) is None:
+        if not MainWindow._ensure_map_view(self):
             return False
         try:
             conn = get_connection()
@@ -5913,6 +6069,8 @@ class MainWindow(QMainWindow):
         if self._viewer is None:
             self._viewer = create_media_viewer([], 0)
             self._viewer.close_requested.connect(self._close_viewer)
+            self._viewer.edits_changed.connect(self._on_edit_saved)
+            self._viewer.export_requested.connect(lambda mid: self.export_media_ids([mid], tr("export-web-default-title")))
             self._viewer.favorite_changed_signal.connect(
                 lambda media_id, is_fav: self._on_favorite_changed(media_id, is_fav, self._viewer_model))
             self._viewer.fullscreen_toggled.connect(lambda on: self._set_immersive("viewer", on))
@@ -7355,16 +7513,31 @@ def main(app=None, splash=None):
     configure_display_pipeline(app, cfg)
     theme.apply(cfg.get("theme", theme.DEFAULT_THEME))
 
+    boot_trace.mark("main_ready")
     window = MainWindow()
+    boot_trace.mark("window_built")
     window_effects.style_for_theme(window)    # titulkový pruh v barvě aplikace (Windows 11)
+    grid = getattr(window, "grid_view", None)
     reveal = splash is not None and not motion.reduced()
-    if reveal:
+    # Pillar 5 direct launch: no splash, the window stays transparent until the grid's first
+    # finished frame (no blank-tile flash) and then appears at once; REVEAL_FALLBACK_MS caps it.
+    direct = splash is None and grid is not None and grid.isVisibleTo(window)
+    if reveal or direct:
         # Founder audit: okno se ukáže neviditelné (žádné šedé probliknutí prázdné mřížky),
         # splash drží obraz do prvního hotového snímku mřížky a pak se oba prolnou (250 ms).
         window.setWindowOpacity(0.0)
     window.show()
+    boot_trace.mark("window_shown")
+    if direct:
+        def _appear():
+            if window.windowOpacity() < 1.0:
+                window.setWindowOpacity(1.0)
+        grid.firstFrameRendered.connect(_appear)
+        QTimer.singleShot(REVEAL_FALLBACK_MS, _appear)
+    if grid is not None:
+        grid.firstFrameRendered.connect(lambda: boot_trace.finish(app))
+        grid.firstFrameRendered.connect(window.start_deferred_services)
     if splash is not None:
-        grid = getattr(window, "grid_view", None)
         if reveal and grid is not None and grid.isVisible():
             splash.hand_off(window, grid.firstFrameRendered)
         else:

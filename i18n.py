@@ -101,8 +101,10 @@ class Bundle:
             self.add_source(source)
 
     def add_source(self, source):
-        resource = FluentParser(with_spans=False).parse(source)
-        for entry in resource.body:
+        self.add_entries(FluentParser(with_spans=False).parse(source).body)
+
+    def add_entries(self, body):
+        for entry in body:
             if isinstance(entry, fast.Message):
                 if entry.value is not None:
                     self.messages[entry.id.name] = entry
@@ -229,14 +231,73 @@ def _load_bundle(lang):
         b = Bundle(lang)
         path = os.path.join(LOCALES_DIR, lang, CATALOG_NAME)
         try:
-            with open(path, encoding="utf-8") as f:
-                b.add_source(f.read())
+            body = _cached_body(path)
+            if body is not None:
+                b.add_entries(body)
+            else:
+                with open(path, encoding="utf-8") as f:
+                    resource = FluentParser(with_spans=False).parse(f.read())
+                b.add_entries(resource.body)
+                _store_body(path, resource.body)
         except OSError as e:
             b.errors.append(f"cannot read {path}: {e}")
         if b.errors:
             print(f"[i18n] {lang}: {len(b.errors)} catalog error(s): {b.errors[:3]}")
         _bundles[lang] = b
         return b
+
+
+# Pillar 5: parsing both start-up catalogs costs ~70 ms per launch. The parsed AST is pickled
+# next to the other caches, keyed by the catalog's size + mtime (+ format version); any edit to
+# the .ftl simply misses the cache and re-parses.
+PARSE_CACHE_VERSION = 1
+
+
+def _parse_cache_path(path):
+    try:
+        import paths
+        st = os.stat(path)
+    except Exception:
+        return None
+    lang = os.path.basename(os.path.dirname(path))
+    key = f"{lang}-{st.st_size}-{st.st_mtime_ns}-v{PARSE_CACHE_VERSION}"
+    return os.path.join(paths.CACHE_ROOT, "i18n", key + ".pickle")
+
+
+def _cached_body(path):
+    cache = _parse_cache_path(path)
+    if not cache or not os.path.exists(cache):
+        return None
+    try:
+        import pickle
+        with open(cache, "rb") as f:
+            body = pickle.load(f)
+        return body if isinstance(body, list) else None
+    except Exception:
+        return None
+
+
+def _store_body(path, body):
+    cache = _parse_cache_path(path)
+    if not cache:
+        return
+    try:
+        import glob
+        import pickle
+        folder = os.path.dirname(cache)
+        os.makedirs(folder, exist_ok=True)
+        lang = os.path.basename(cache).split("-", 1)[0]
+        for old in glob.glob(os.path.join(folder, lang + "-*.pickle")):     # stale catalog versions
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        tmp = cache + f".{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(body, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, cache)
+    except Exception:
+        pass
 
 
 def bundle(lang=None):
@@ -346,8 +407,7 @@ def set_language(code, retranslate=True):
     global _current
     code = normalize(code) or SOURCE_LANGUAGE
     old = _current
-    _load_bundle(code)
-    _load_bundle(SOURCE_LANGUAGE)
+    _load_bundle(code)               # the English fallback loads on the first missing key (tr)
     _current = code
     _apply_qt_locale(code)
     if code != old:

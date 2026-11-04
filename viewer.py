@@ -268,6 +268,8 @@ class FaceChip(QAbstractButton):
 
 
 class MediaViewerWidget(QWidget):
+    edits_changed = pyqtSignal(int)
+    export_requested = pyqtSignal(int)       # pillar 3: Export Sheet for the current item          # pillar 2: media id whose Quick Edit was saved / reverted
     web_profile_factory = None                     # instance: () -> trvalý profil mapy (main.create_media_viewer)
     page_setup = None                              # (QWebEnginePage) -> None: úložiště dlaždic (main.attach_tile_store)
     close_requested = pyqtSignal()
@@ -281,6 +283,10 @@ class MediaViewerWidget(QWidget):
         self.media_list = []
         self.current_index = 0
         self.is_live_playing = False
+        self._edit = None                 # pillar 2: quick_edit.Adjustments of the current photo
+        self._edit_source = None          # display-size QImage of the current photo, unedited
+        self._edited_cache = {}           # (path, edit key, size) -> edited QImage (last few)
+        self._editor = None               # edit_panel.EditController (built on first use)
         self.is_fullscreen = False
         self._is_video = False
         self._is_live = False
@@ -511,9 +517,14 @@ class MediaViewerWidget(QWidget):
         self.btn_info = HudIconButton("info", tr("viewer-info-tooltip"))
         self.btn_info.setCheckable(True)
         self.btn_info.clicked.connect(self.toggle_info_panel)
+        self.btn_edit = HudIconButton("adjust", tr("viewer-edit-tooltip"))
+        self.btn_edit.clicked.connect(self.start_edit)
+        self.btn_export = HudIconButton("share", tr("viewer-export-tooltip"))
+        self.btn_export.clicked.connect(self._request_export)
         self.btn_fullscreen = HudIconButton("fullscreen", tr("viewer-fullscreen-tooltip"))
         self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
-        for b in (self.btn_fav, self.btn_live, self.btn_slideshow, self.btn_info, self.btn_fullscreen):
+        for b in (self.btn_fav, self.btn_live, self.btn_slideshow, self.btn_edit, self.btn_export, self.btn_info,
+                  self.btn_fullscreen):
             top.addWidget(b)
 
         # Spodní kapsle videa: čas, posuvník, přehrávání, hlasitost, rychlost
@@ -602,6 +613,8 @@ class MediaViewerWidget(QWidget):
         self.canvas.content_changed.connect(self._backdrop_debounce.start)
 
     def _wanted_panels(self):
+        if self.is_editing():
+            return []                                   # the edit panel replaces the HUD
         panels = [self.top_hud]
         if self._is_video:
             panels.append(self.scrubber_panel)
@@ -635,6 +648,9 @@ class MediaViewerWidget(QWidget):
     def eventFilter(self, obj, event):
         if obj is self.canvas and event.type() == QEvent.Type.Resize:
             self._layout_hud()
+            if self.is_editing():
+                self._layout_crop_overlay()
+                QTimer.singleShot(0, lambda: self._editor.render(final=True))
         return super().eventFilter(obj, event)
 
     def showEvent(self, event):
@@ -746,7 +762,7 @@ class MediaViewerWidget(QWidget):
         path = getattr(zoom, "path", None)
         if not path or not os.path.exists(path):
             return
-        job = viewer_zoom.FullResJob(path, zoom.token)
+        job = viewer_zoom.FullResJob(path, zoom.token, adjustments=self._edit)
         job.signals.done.connect(lambda p, token, levels: zoom.set_full_levels(token, levels))
         self._full_pool.clear()                     # čekající originály dřívějších fotek už nejsou potřeba
         self._full_pool.start(job)
@@ -1125,10 +1141,18 @@ class MediaViewerWidget(QWidget):
         self.btn_live.setVisible(self._is_live)
 
         self._current_photo_path = None
+        if self._editor is not None and self._editor.active:
+            self._editor.cancel()                       # navigating away discards an open session
+        self._edit = None if self._is_video else self._load_edit(item_id)
+        self._edit_source = None
+        self.btn_edit.setVisible(not self._is_video)
         # Stage 2: nová položka = vešlá; přiblížit jde jen fotku (rozměr originálu z hlavičky, ~5 ms)
         zoomable = bool(not self._is_video and path and os.path.exists(path))
-        self.canvas.zoom.set_photo(path if zoomable else None,
-                                   viewer_zoom.original_size(path) if zoomable else None)
+        orig = viewer_zoom.original_size(path) if zoomable else None
+        if orig and self._edit is not None:
+            import quick_edit
+            orig = quick_edit.output_size(orig[0], orig[1], self._edit)
+        self.canvas.zoom.set_photo(path if zoomable else None, orig)
         self.canvas.zoom.set_enabled(zoomable)
         if self._is_video:
             # Plakát drží obraz, dokud video nevykreslí 1. snímek -> žádné černé bliknutí.
@@ -1203,15 +1227,135 @@ class MediaViewerWidget(QWidget):
         self._current_photo_path = path
         img = self._images.request(path) if path and os.path.exists(path) else None
         if img is not None:
-            self.canvas.set_image(QPixmap.fromImage(img))
+            self._present_photo(path, img)
         elif thumb and os.path.exists(thumb):
-            self.canvas.set_image(QPixmap(thumb))
+            self._present_photo(None, QImage(thumb))
         elif not (path and os.path.exists(path)):
             self.canvas.clear_image()
 
     def _on_image_loaded(self, path, image):
         if path == self._current_photo_path and not self.canvas.is_video_shown():
-            self.canvas.set_image(QPixmap.fromImage(image))
+            self._present_photo(path, image)
+
+    # ── pillar 2: Quick Edits ──────────────────────────────────────────────────
+    def _load_edit(self, item_id):
+        try:
+            import quick_edit
+            conn = get_connection()
+            try:
+                adj = quick_edit.load(conn, int(item_id))
+            finally:
+                conn.close()
+            return adj if adj is not None and not adj.is_identity() else None
+        except Exception as e:
+            print(f"[Edit] {e}")
+            return None
+
+    def _edited(self, path, image):
+        """The current edit applied to a display image (small LRU: ←/→ back and forth is free)."""
+        if self._edit is None or image is None or image.isNull():
+            return image
+        import quick_edit
+        key = (path, self._edit.key(), image.width(), image.height())
+        hit = self._edited_cache.get(key)
+        if hit is None:
+            hit = quick_edit.render_qimage(image, self._edit)
+            self._edited_cache[key] = hit
+            while len(self._edited_cache) > 4:
+                self._edited_cache.pop(next(iter(self._edited_cache)))
+        return hit
+
+    def _present_photo(self, path, image):
+        if image is None or image.isNull():
+            return
+        if path is not None:
+            self._edit_source = image                  # the editor starts from the full display image
+        if self._editor is not None and self._editor.active:
+            if path is not None and image is not self._editor.source:
+                self._editor.start(image, self._editor.adj)     # sharper source arrived mid-session
+            return
+        self.canvas.set_image(QPixmap.fromImage(self._edited(path, image)))
+
+    def _request_export(self):
+        if self.media_list and not self.is_editing():
+            self.export_requested.emit(int(self.media_list[self.current_index][0]))
+
+    def is_editing(self):
+        return self._editor is not None and self._editor.active
+
+    def _ensure_editor(self):
+        if self._editor is None:
+            from edit_panel import CropOverlay, EditController, EditPanel
+            self._edit_panel = EditPanel(self)
+            self._edit_panel.setVisible(False)
+            self.main_layout.addWidget(self._edit_panel)
+            self._crop_overlay = CropOverlay(self)
+            self._crop_overlay.setVisible(False)
+            self._editor = EditController(self.canvas, self._edit_panel, self._crop_overlay, self)
+            self._editor.finished.connect(self._on_edit_finished)
+        return self._editor
+
+    def start_edit(self):
+        """Opens the Quick Edits panel for the current photo (videos are not editable)."""
+        if self._is_video or not self.media_list or self.is_editing():
+            return
+        src = self._edit_source
+        if src is None or src.isNull():
+            return                                      # display image still decoding
+        if self.is_live_playing:
+            self.stop_live_smoothly()
+        self.canvas.zoom.reset(animate=False)
+        self.canvas.zoom.set_enabled(False)
+        editor = self._ensure_editor()
+        if self.btn_info.isChecked():
+            self.btn_info.setChecked(False)
+            self.toggle_info_panel()
+        self._edit_panel.setVisible(True)
+        for panel in self.hud_panels:
+            panel.setVisible(False)
+        self._crop_overlay.setVisible(True)
+        self._crop_overlay.raise_()
+        QApplication.processEvents()                    # canvas has its new (narrower) size
+        self._layout_crop_overlay()
+        editor.start(src, self._edit)
+
+    def _layout_crop_overlay(self):
+        if getattr(self, "_crop_overlay", None) is not None:
+            self._crop_overlay.setGeometry(self.canvas.geometry())
+
+    def _on_edit_finished(self, adj, saved):
+        self._crop_overlay.setVisible(False)
+        self._edit_panel.setVisible(False)
+        for panel in self.hud_panels:
+            panel.setVisible(True)
+        self.hud.sync()
+        item = self.media_list[self.current_index] if self.media_list else None
+        if saved and item is not None:
+            import quick_edit
+            try:
+                conn = get_connection()
+                try:
+                    quick_edit.save(conn, int(item[0]), adj)
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as e:
+                print(f"[Edit] save failed: {e}")
+                saved = False
+            if saved:
+                self._edit = None if adj.is_identity() else adj
+                self._edited_cache.clear()
+                self.edits_changed.emit(int(item[0]))
+        zoomable = bool(item is not None and not self._is_video and self._current_photo_path)
+        if zoomable:
+            orig = viewer_zoom.original_size(self._current_photo_path)
+            if orig and self._edit is not None:
+                import quick_edit
+                orig = quick_edit.output_size(orig[0], orig[1], self._edit)
+            self.canvas.zoom.set_photo(self._current_photo_path, orig)
+        self.canvas.zoom.set_enabled(zoomable)
+        if self._edit_source is not None:
+            self.canvas.set_image(QPixmap.fromImage(self._edited(self._current_photo_path, self._edit_source)))
 
     def _prefetch_neighbors(self):
         """Sousední fotky (←/→) se dekódují dopředu, aby se při listování ukázaly ostré hned."""
@@ -1467,6 +1611,17 @@ class MediaViewerWidget(QWidget):
         key = event.key()
         mods = event.modifiers()
         video = self._is_video
+        if self.is_editing():                          # pillar 2: the edit session owns the keys
+            if key == Qt.Key.Key_Escape:
+                self._editor.cancel()
+            elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._editor.commit()
+            event.accept()
+            return
+        if key == Qt.Key.Key_E and not video and not mods:
+            self.start_edit()
+            event.accept()
+            return
 
         if key == Qt.Key.Key_Left:
             if mods & Qt.KeyboardModifier.ShiftModifier and video:

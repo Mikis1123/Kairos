@@ -47,6 +47,10 @@ class LivePreview(QObject):
 
     def __init__(self, grid, strips=None):
         super().__init__(grid)
+        # pillar 2: media id -> quick_edit.Adjustments | None (the grid's EDITS); the motion is
+        # shown with the still's crop and tone, so hover never "un-edits" the photo
+        self.edit_for = lambda _media_id: None
+        self._edit = None
         self.grid = grid
         self._strips = strips
         self.row = -1                 # řádek pod kurzorem (kandidát)
@@ -140,9 +144,17 @@ class LivePreview(QObject):
         dpr = self.grid.devicePixelRatioF()
         return QSize(max(1, round(rect.width() * dpr)), max(1, round(rect.height() * dpr)))
 
+    def _row_edit(self, row):
+        model = self.grid.photo_model
+        try:
+            return self.edit_for(int(model.records[row][0])) if 0 <= row < len(model.records) else None
+        except Exception:
+            return None
+
     def _play(self, strip):
         size = self._cell_size()
-        key = (self._video, size.width(), size.height())
+        self._edit = self._row_edit(self.row)
+        key = (self._video, size.width(), size.height(), self._edit.key() if self._edit is not None else "")
         entry = self.cache.get(key)
         if entry is None or len(entry.indices) != len(pick_indices(len(strip))):
             entry = _Entry(pick_indices(len(strip)))
@@ -161,13 +173,25 @@ class LivePreview(QObject):
             return
         self._pos = (self._pos + 1) % len(self._entry.indices)
         if self._entry.frames[self._pos] is None:          # jeden dekód za tik
-            img = self._strip.decode(self._entry.indices[self._pos], self._size)
+            img = self._decode_frame(self._entry.indices[self._pos])
             if img is not None:
                 pm = QPixmap.fromImage(img)
                 pm.setDevicePixelRatio(self.grid.devicePixelRatioF())
                 self._entry.frames[self._pos] = pm
         self._shown += 1
         self.grid._repaint_row(self.playing_row)
+
+    def _decode_frame(self, index):
+        if self._edit is None:
+            return self._strip.decode(index, self._size)
+        img = self._strip.decode(index, None)               # full frame: the crop is in its coordinates
+        if img is None:
+            return None
+        import quick_edit
+        from PyQt6.QtCore import Qt
+        img = quick_edit.render_qimage(img, self._edit, fast=True)
+        return img.scaled(self._size, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                          Qt.TransformationMode.SmoothTransformation)
 
     # ── kreslení ──
     def frame_for(self, row):

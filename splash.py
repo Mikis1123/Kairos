@@ -332,6 +332,7 @@ def _preload():
 
 def boot():
     """Vstupní bod z main.py: QApplication, splash, načtení na pozadí, pak main.main()."""
+    import boot_trace
     from PyQt6 import QtWebEngineWidgets  # noqa: F401 – musí být načten před QApplication
     app = QApplication(sys.argv)
     app.setApplicationName(brand.APP_NAME)
@@ -355,10 +356,13 @@ def boot():
     splash.show()
     splash.play()
     app.processEvents()
+    boot_trace.mark("splash_shown")
     loader = threading.Thread(target=_preload, name="kairos-preload", daemon=True)
     loader.start()
     splash.wait_until(lambda: not loader.is_alive())
     splash.repaint()
+    boot_trace.mark("preload_done")
 
     import main
+    boot_trace.mark("main_imported")
     return main.main(app=app, splash=splash)

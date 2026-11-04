@@ -16,7 +16,19 @@ Postup na každou kopii:
   4. co ani potom neprojde, do exportu NEJDE (fail closed) a zpráva to vyjmenuje
 
 Webová prezentace: index.html bez jediného odkazu ven (inline CSS / JS), fotky jako JPEG
-s barevným profilem, ale bez EXIF; videa jako ověřené kopie.
+v sRGB, ale bez EXIF; videa jako ověřené kopie.
+
+Pillar 3 presets (ExportOptions.preset) for the files layout:
+  * original – the master file byte for byte (then only the privacy edits the user switched on);
+    Quick Edits are NOT applied – this is the untouched original.
+  * web      – Quick Edits applied, long edge ≤ 2048 px, JPEG q90 4:2:0, converted to sRGB with an
+    embedded sRGB profile (Display P3 / Adobe RGB / ProPhoto would look dull or garish once a
+    social network strips the profile).
+  * archive  – Quick Edits applied, full resolution, JPEG q95 4:4:4, the source's own (wide-gamut)
+    profile kept: nothing is clipped.
+  Rendered stills get the original's metadata back (ExifTool -TagsFromFile, orientation reset to
+  normal because the pixels are upright, the source ICC not copied) and then go through the same
+  strip + verify pass as copies, so the privacy toggles apply equally.
 
 Skryté položky (Stage 3) se neexportují nikdy – ani když je o ně někdo požádá přímo.
 """
@@ -39,6 +51,24 @@ VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".3gp", ".mts", ".m2ts"}
 WEB_VIDEO_EXTS = {".mp4", ".m4v", ".mov"}
 WEB_EDGE = 2048
 WEB_THUMB = 480
+
+
+@dataclass(frozen=True)
+class ExportPreset:
+    key: str
+    edge: int = 0                    # long edge cap in px (0 = full resolution)
+    quality: int = 90
+    srgb: bool = True                # convert wide gamut to sRGB (else keep the source profile)
+    subsampling: int = 2             # Pillow: 0 = 4:4:4, 2 = 4:2:0
+    render: bool = True              # False = byte copy of the master (no edits)
+
+
+PRESETS = {
+    "original": ExportPreset("original", render=False),
+    "web": ExportPreset("web", edge=WEB_EDGE, quality=90, srgb=True, subsampling=2),
+    "archive": ExportPreset("archive", edge=0, quality=95, srgb=False, subsampling=0),
+}
+PRESET_ORDER = ("original", "web", "archive")
 _SKIP_FAMILIES = {"SourceFile", "ExifTool", "File", "System", "Composite"}
 _LOCATION_TAGS = {"city", "country", "countrycode", "country-primarylocationname", "country-primarylocationcode",
                   "state", "province-state", "sub-location", "sublocation", "location", "locationname",
@@ -68,7 +98,12 @@ class ExportOptions:
     include_live: bool = True         # pohybové video Live Photo vedle fotky
     layout: str = "files"             # files | web
     package: str = "folder"           # folder | zip
+    preset: str = "original"          # original | web | archive (pillar 3, files layout)
     title: str = "Export"
+
+    @property
+    def preset_spec(self):
+        return PRESETS.get(self.preset, PRESETS["original"])
 
     @property
     def strips_anything(self):
@@ -157,6 +192,11 @@ def collect(conn, media_ids):
         is_hidden_path = locked_folder.is_hidden_path
     except Exception:
         is_hidden_path = lambda _p: False                       # noqa: E731
+    try:
+        import quick_edit
+        edits = quick_edit.load_many(conn, ids)
+    except Exception:
+        edits = {}                                              # no media_edits table yet
     items, skipped = [], []
     for mid in ids:
         r = rows.get(mid)
@@ -177,7 +217,7 @@ def collect(conn, media_ids):
             paired = None
         items.append({"id": mid, "path": path, "name": label, "type": mtype or _kind(path), "date": date,
                       "paired": paired, "city": city, "country": country,
-                      "people": sorted(people.get(mid, ()), key=str.casefold)})
+                      "people": sorted(people.get(mid, ()), key=str.casefold), "edit": edits.get(mid)})
     return items, skipped
 
 
@@ -447,23 +487,115 @@ def _fallback_preview(path, media_type):
         return None
 
 
-def render_web_image(src, dst, edge=WEB_EDGE, media_type="photo"):
-    """JPEG pro web: orientace z EXIF zapečená, barevný profil zachovaný, žádná jiná metadata.
-    Vrací (šířka, výška) nebo None."""
-    from PIL import Image
+_SRGB_ICC = None
+
+
+def srgb_icc_bytes():
+    global _SRGB_ICC
+    if _SRGB_ICC is None:
+        from PIL import ImageCms
+        _SRGB_ICC = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    return _SRGB_ICC
+
+
+def to_srgb(img, icc):
+    """PIL RGB/RGBA in the `icc` space -> the same image in sRGB (relative colorimetric, the
+    imaging pipeline's intent). No / sRGB profile = unchanged. Returns (image, converted?)."""
+    import color_manage
+    if not icc or color_manage.is_srgb_profile(icc):
+        return img, False
+    import io
+    from PIL import ImageCms
     try:
-        img, icc = _open_image(src)
+        src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+        dst = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+        tr_ = ImageCms.buildTransform(src, dst, img.mode, img.mode,
+                                      renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC)
+        out = ImageCms.applyTransform(img, tr_)
+        out.info.pop("icc_profile", None)
+        return out, True
+    except Exception:
+        return img, False                           # broken profile: leave the numbers alone
+
+
+def _decode_for_export(src, media_type):
+    """(PIL image oriented upright, its ICC or None) – RAW / HEIC through the imaging door,
+    anything PIL can't read through the app's preview (videos never come here)."""
+    try:
+        import imaging
+        dec = imaging.open_oriented(src)
+        return dec.image, dec.icc
     except Exception:
         alt = _fallback_preview(src, media_type)        # RAW / formát, který PIL neumí: náhled aplikace
         if not alt:
-            return None
-        img, icc = _open_image(alt)
-    img.thumbnail((edge, edge), Image.Resampling.LANCZOS)
-    kw = {"quality": 88, "optimize": True, "progressive": True}
+            return None, None
+        return _open_image(alt)
+
+
+def render_export_image(src, dst, preset, adjustments=None, media_type="photo"):
+    """The one still renderer of export: decode -> Quick Edit (source encoding) -> long-edge cap
+    (Lanczos) -> sRGB for sharing presets -> JPEG with an embedded profile. Returns (w, h) or None."""
+    img, icc = _decode_for_export(src, media_type)
+    if img is None:
+        return None
+    import imaging
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    if adjustments is not None and not adjustments.is_identity():
+        import quick_edit
+        img = quick_edit.render_pil(img, adjustments)
+    if preset.edge:
+        target = imaging.fit_box(img.size[0], img.size[1], preset.edge, preset.edge)
+        img = imaging.resample(img, target)
+    if preset.srgb:
+        img, _ = to_srgb(img, icc)
+        icc = srgb_icc_bytes()
+    img = imaging.flatten(img)
+    kw = {"quality": int(preset.quality), "optimize": True, "progressive": True,
+          "subsampling": int(preset.subsampling)}
     if icc:
         kw["icc_profile"] = icc
-    img.convert("RGB").save(dst, "JPEG", **kw)
+    img.save(dst, "JPEG", **kw)
     return img.size
+
+
+def render_web_image(src, dst, edge=WEB_EDGE, media_type="photo", adjustments=None):
+    """JPEG pro web: orientace z EXIF zapečená, převedeno do sRGB (s profilem), žádná jiná
+    metadata. Vrací (šířka, výška) nebo None."""
+    preset = ExportPreset("web", edge=edge, quality=90, srgb=True, subsampling=2)
+    try:
+        return render_export_image(src, dst, preset, adjustments, media_type)
+    except Exception:
+        return None
+
+
+def copy_metadata(pairs, exiftool=None, timeout=900):
+    """Rendered still <- the original's metadata, one ExifTool process for all pairs. The
+    orientation is reset (pixels are already upright), the source ICC / embedded previews are not
+    copied. The privacy strip + verify pass runs afterwards. Returns the files that failed."""
+    exe = exiftool or EXIFTOOL_PATH
+    if not pairs or not exiftool_available(exe):
+        return list(dst for _src, dst in pairs)
+    lines = []
+    for src, dst in pairs:
+        lines += ["-overwrite_original", "-m", "-TagsFromFile", src, "-all:all", "--ICC_Profile:all",
+                  "--ThumbnailImage", "--PreviewImage", "--JpgFromRaw", "--MPImage*", "-Orientation=1", "-n",
+                  dst, "-execute"]
+    fd, argfile = tempfile.mkstemp(suffix=".args", prefix="kairos-meta-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        # -common_args (must be last): the charset applies to every -execute block, not just the first
+        subprocess.run([exe, "-@", argfile, "-common_args", "-charset", "filename=utf8"], capture_output=True,
+                       timeout=timeout, startupinfo=_hidden_startupinfo())
+    except Exception:
+        return [dst for _src, dst in pairs]
+    finally:
+        try:
+            os.remove(argfile)
+        except OSError:
+            pass
+    return []
 
 
 def video_poster(src, dst, edge=WEB_EDGE, ffmpeg=None):
@@ -646,6 +778,8 @@ def export(items, opts, dest, names=(), progress=None, cancelled=None, exiftool=
         patterns = _name_patterns(names)
         stems = plan_names(items, opts, patterns)
         produced = {}                    # media_id -> {"main": cesta, "motion": cesta|None, "poster": …}
+        preset = opts.preset_spec
+        rendered = []                    # (original, rendered still) – metadata copied back below
         for i, it in enumerate(items):
             check()
             stem = stems[it["id"]]
@@ -654,9 +788,20 @@ def export(items, opts, dest, names=(), progress=None, cancelled=None, exiftool=
             entry = {"main": None, "motion": None, "poster": None, "thumb": None, "size": None}
             if web and it["type"] != "video":
                 dst = os.path.join(media_dir, stem + ".jpg")
-                entry["size"] = render_web_image(src, dst, WEB_EDGE, it["type"])
+                entry["size"] = render_web_image(src, dst, WEB_EDGE, it["type"], it.get("edit"))
                 if entry["size"]:
                     entry["main"] = dst
+            elif not web and preset.render and it["type"] != "video":
+                dst = os.path.join(media_dir, stem + ".jpg")
+                try:
+                    entry["size"] = render_export_image(src, dst, preset, it.get("edit"), it["type"])
+                except Exception as e:
+                    print(f"[Export] {it['name']}: {e}")
+                    entry["size"] = None
+                if entry["size"]:
+                    entry["main"] = dst
+                    entry["rendered"] = True
+                    rendered.append((src, dst))
             elif web and ext not in WEB_VIDEO_EXTS:
                 dst = os.path.join(media_dir, stem + ".jpg")       # prohlížeč by video nepřehrál: jen snímek
                 entry["size"] = video_poster(src, dst, WEB_EDGE, ffmpeg)
@@ -679,7 +824,7 @@ def export(items, opts, dest, names=(), progress=None, cancelled=None, exiftool=
                 if show:
                     thumb = os.path.join(thumbs_dir, stem + ".jpg")
                     entry["thumb"] = thumb if render_web_image(show, thumb, WEB_THUMB) else None
-            if opts.include_live and it.get("paired") and not web:
+            if opts.include_live and it.get("paired") and not web and not entry.get("rendered"):
                 mext = os.path.splitext(it["paired"])[1].lower() or ".mov"
                 mdst = os.path.join(media_dir, stem + mext)
                 if os.path.normcase(os.path.abspath(mdst)) != os.path.normcase(os.path.abspath(entry["main"])):
@@ -689,6 +834,14 @@ def export(items, opts, dest, names=(), progress=None, cancelled=None, exiftool=
             tick(0.0, 0.45, (i + 1) / len(items))
 
         all_files = [p for e in produced.values() for p in (e["main"], e["motion"], e["poster"], e["thumb"]) if p]
+        if rendered:
+            copy_metadata(rendered, exe)       # date taken etc. back on the rendered stills
+            for src, dst in rendered:          # the file's own date like the original's
+                try:
+                    st = os.stat(src)
+                    os.utime(dst, (st.st_atime, st.st_mtime))
+                except OSError:
+                    pass
         for p in all_files:              # pojistka: staging nikdy nesmí ukazovat na originál
             if os.path.normcase(os.path.abspath(p)) in sources:
                 raise ExportError(tr("export-error-overlap"))

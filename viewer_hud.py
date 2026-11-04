@@ -280,6 +280,28 @@ class MediaCanvas(QGraphicsView):
             self.photo_item.setVisible(True)
         return True
 
+    def show_edit_frame(self, image):
+        """Pillar 2: a Quick Edits frame (drag proxy or full display size) fitted at paint time
+        with setScale – no smooth re-fit of the source per slider step. set_image() is the rest
+        state (the cropped result once the edit session ends)."""
+        pm = QPixmap.fromImage(image) if isinstance(image, QImage) else image
+        if pm is None or pm.isNull():
+            return False
+        vw, vh = self.viewport().width(), self.viewport().height()
+        if vw <= 0 or vh <= 0:
+            return False
+        self._fade.stop()
+        self.back_item.setVisible(False)
+        pm.setDevicePixelRatio(1.0)
+        scale = min(vw / pm.width(), vh / pm.height())
+        self.photo_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self.photo_item.setPixmap(pm)
+        self.photo_item.setScale(scale)
+        self.photo_item.setPos((vw - pm.width() * scale) / 2, (vh - pm.height() * scale) / 2)
+        self.photo_item.setOpacity(1.0)
+        self.photo_item.setVisible(True)
+        return True
+
     def end_scrub_frames(self):
         """Konec tažení: vrátit původní obraz (plakát / fotku) v plném rozlišení."""
         if getattr(self, "_scrub_frames", False):

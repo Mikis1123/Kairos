@@ -1053,3 +1053,25 @@ dup-badge-larger = Archivo más grande
 dup-megapixels = { $mp } MP
 dup-file-size = { $mb } MB
 dup-mode-tooltip = Comparar en paralelo o superpuestas con un deslizador (tecla S)
+
+## Quick Edits + export presets (pillars 2-3)
+viewer-edit-tooltip = Editar (E)
+viewer-export-tooltip = Exportar…
+edit-title = Editar
+edit-section-crop = Recortar y enderezar
+edit-section-light = Luz y color
+edit-aspect-free = Libre
+edit-straighten = Enderezar
+edit-exposure = Exposición
+edit-highlights = Luces
+edit-shadows = Sombras
+edit-contrast = Contraste
+edit-warmth = Calidez
+edit-revert = Volver al original
+export-preset = Ajuste
+export-preset-original = Original
+export-preset-web = Web y redes
+export-preset-archive = Archivo
+export-preset-original-note = Copia exacta del archivo original: no se aplican las ediciones.
+export-preset-web-note = Con ediciones, hasta 2048 px, JPEG en sRGB para cualquier pantalla o red social.
+export-preset-archive-note = Con ediciones, resolución completa, JPEG de alta calidad con el perfil de color original.

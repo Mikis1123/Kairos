@@ -41,6 +41,11 @@ ICONS = {
     "back": '<path d="M14.5 5.5L8 12l6.5 6.5"/>',
     "live": '<circle cx="12" cy="12" r="2.5"/><circle cx="12" cy="12" r="5.5" stroke-dasharray="2 2.2"/><circle cx="12" cy="12" r="8.5"/>',
     "check": '<path d="M5.5 12.5l4 4 9-9"/>',
+    # Export (pillar 3): tray with an arrow leaving it
+    "share": '<path d="M12 14.5V3.5M8 7.5l4-4 4 4M7.5 10.5H6a2 2 0 0 0-2 2V19a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6.5a2 2 0 0 0-2-2h-1.5"/>',
+    # Quick Edits (pillar 2): three sliders with knobs
+    "adjust": '<path d="M4 7h7M15 7h5M4 12h3M11 12h9M4 17h11M19 17h1"/>'
+              '<circle cx="13" cy="7" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17" r="2"/>',
     "slideshow": '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M10.2 9.4v5.2l4.4-2.6z"/>',
     "refresh": '<path d="M19.5 11A7.5 7.5 0 0 0 6.2 7.2M4.5 4.5v3.7h3.7M4.5 13a7.5 7.5 0 0 0 13.3 3.8M19.5 19.5v-3.7h-3.7"/>',
     "face_question": '<circle cx="10" cy="8" r="3.5"/><path d="M3.5 20c.8-3.6 3.4-5.5 6.5-5.5 1.2 0 2.3.3 3.2.8"/>'

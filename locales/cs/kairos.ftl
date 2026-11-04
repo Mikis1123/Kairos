@@ -1106,3 +1106,25 @@ dup-badge-larger = Větší soubor
 dup-megapixels = { $mp } MP
 dup-file-size = { $mb } MB
 dup-mode-tooltip = Porovnání vedle sebe nebo posuvníkem přes sebe (klávesa S)
+
+## Quick Edits + export presets (pillars 2-3)
+viewer-edit-tooltip = Upravit (E)
+viewer-export-tooltip = Exportovat…
+edit-title = Upravit
+edit-section-crop = Oříznutí a narovnání
+edit-section-light = Světlo a barva
+edit-aspect-free = Volné
+edit-straighten = Narovnat
+edit-exposure = Expozice
+edit-highlights = Světla
+edit-shadows = Stíny
+edit-contrast = Kontrast
+edit-warmth = Teplota
+edit-revert = Vrátit originál
+export-preset = Předvolba
+export-preset-original = Originál
+export-preset-web = Web a sítě
+export-preset-archive = Archiv
+export-preset-original-note = Přesná kopie původního souboru – úpravy se nepoužijí.
+export-preset-web-note = S úpravami, nejvýš 2048 px, JPEG v sRGB pro každou obrazovku i sociální síť.
+export-preset-archive-note = S úpravami, plné rozlišení, JPEG ve vysoké kvalitě s původním barevným profilem.

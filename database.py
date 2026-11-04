@@ -390,6 +390,17 @@ def init_db():
         );
         """)
 
+        # Pillar 2: nedestruktivní úpravy (quick_edit.Adjustments jako JSON). Originál se nikdy
+        # nemění; prázdná úprava = žádný řádek.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS media_edits (
+            media_id INTEGER PRIMARY KEY,
+            params TEXT NOT NULL,
+            updated_at TEXT,
+            FOREIGN KEY (media_id) REFERENCES media_items (id) ON DELETE CASCADE
+        );
+        """)
+
         # Sprint 2: ruční a chytrá alba
         import albums
         albums.ensure_tables(cursor)

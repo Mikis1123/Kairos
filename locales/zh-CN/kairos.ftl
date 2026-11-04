@@ -939,3 +939,25 @@ dup-badge-larger = 文件更大
 dup-megapixels = { $mp } MP
 dup-file-size = { $mb } MB
 dup-mode-tooltip = 并排比较或用滑块叠加比较（S 键）
+
+## Quick Edits + export presets (pillars 2-3)
+viewer-edit-tooltip = 编辑（E）
+viewer-export-tooltip = 导出…
+edit-title = 编辑
+edit-section-crop = 裁剪与拉直
+edit-section-light = 光效与颜色
+edit-aspect-free = 自由
+edit-straighten = 拉直
+edit-exposure = 曝光
+edit-highlights = 高光
+edit-shadows = 阴影
+edit-contrast = 对比度
+edit-warmth = 色温
+edit-revert = 复原为原件
+export-preset = 预设
+export-preset-original = 原件
+export-preset-web = 网页与社交
+export-preset-archive = 归档
+export-preset-original-note = 原始文件的精确副本——不应用编辑。
+export-preset-web-note = 应用编辑，最长边 2048 像素，sRGB JPEG，适合任何屏幕和社交网络。
+export-preset-archive-note = 应用编辑，完整分辨率，高质量 JPEG，保留原始颜色配置文件。
