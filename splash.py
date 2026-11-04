@@ -333,7 +333,8 @@ def _preload():
 def boot():
     """Vstupní bod z main.py: QApplication, splash, načtení na pozadí, pak main.main()."""
     import boot_trace
-    from PyQt6 import QtWebEngineWidgets  # noqa: F401 – musí být načten před QApplication
+    import web_engine
+    web_engine.prepare_app()           # QtWebEngine se pak smí načíst až při prvním použití (lazy)
     app = QApplication(sys.argv)
     app.setApplicationName(brand.APP_NAME)
     app.setOrganizationName(brand.APP_NAME)

@@ -552,6 +552,20 @@ class TestCrashGuardAndBootClock(unittest.TestCase):
             from PyQt6.QtCore import qWarning
             qWarning(b"kairos test warning without console")             # handler must not raise
 
+    def test_startup_modules_do_not_load_qtwebengine(self):
+        """Qt6WebEngineCore (~200 MB) is imported at first use only (web_engine.py); main, the
+        viewer and the WebView2 host's console filter must not pull it in."""
+        code = ("import sys, os; os.environ['KAIROS_NO_SPLASH']='1'; import data_migration; "
+                "data_migration.ensure_ready(); import web_engine; web_engine.prepare_app(); "
+                "from PyQt6.QtWidgets import QApplication; app = QApplication([]); "
+                "import main, viewer, web_console, map_host; from web_console import is_noise; "
+                "print('LOADED' if web_engine.loaded() else 'LAZY'); "
+                "from web_console import QuietWebPage; print('LOADED' if web_engine.loaded() else 'LAZY')")
+        out = subprocess.run([sys.executable, "-c", code], cwd=HERE, capture_output=True, text=True, timeout=120,
+                             env=dict(os.environ, QT_QPA_PLATFORM="offscreen"))
+        lines = [ln for ln in out.stdout.splitlines() if ln in ("LOADED", "LAZY")]
+        self.assertEqual(lines, ["LAZY", "LOADED"], out.stdout + out.stderr)
+
     @unittest.skipUnless(sys.platform == "win32", "process creation time is a Windows API here")
     def test_boot_clock_counts_interpreter_start(self):
         import boot_trace

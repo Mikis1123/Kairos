@@ -11,7 +11,6 @@ from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QSize, QTimer, QEvent, QPoint, QR
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent, QPainter, QColor, QPainterPath, QIcon, QFont, QPen
 from PyQt6.QtMultimedia import QMediaPlayer
 import media_engine
-from PyQt6.QtWebEngineWidgets import QWebEngineView
 from viewer_hud import (MediaCanvas, GlassPanel, HudIconButton, HudAutoHider, VIDEO_REVEAL_DELAY_MS,
                         load_image_file, ImagePipeline, VideoScrubber, quiet_ffmpeg_logs,
                         quiet_qt_ffmpeg_noise)
@@ -36,7 +35,6 @@ STRIP_TOLERANCE_MS = 1200    # snímek pásu dál než tohle od cíle = pás tam
 SCRUB_REVEAL_TIMEOUT_MS = 600  # po puštění: přesný snímek nepřišel -> odkrýt video i tak
 from database import get_connection, toggle_favorite
 from paths import RESOURCE_DIR, resolve_face_path
-from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
 
 MINI_MAP_PAGE = "mini_map.html"          # vedle map_vault.html v RESOURCE_DIR
 
@@ -1033,6 +1031,8 @@ class MediaViewerWidget(QWidget):
         """Minimapa = mini_map.html (přibalený MapLibre GL, jako hlavní mapa). Načte se jednou;
         další fotky jen posunou pin přes window.showPlace."""
         if self.mini_map is None:
+            from PyQt6.QtWebEngineCore import QWebEngineSettings   # lazy QtWebEngine (web_engine.py)
+            from PyQt6.QtWebEngineWidgets import QWebEngineView
             m = QWebEngineView()
             profile = self.web_profile_factory() if self.web_profile_factory else None
             from web_console import QuietWebPage   # konzole WebGL bez opakovaných hlášení

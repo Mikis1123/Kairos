@@ -78,12 +78,8 @@ from PyQt6.QtGui import (
     QPainterPath, QLinearGradient, QRadialGradient, QPen, QKeySequence, QShortcut, QCursor, QImageReader,
     QImageIOHandler, QPolygonF,
 )
-from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import (
-    QWebEngineSettings, QWebEngineProfile, QWebEngineUrlRequestInterceptor, QWebEnginePage, QWebEngineScript,
-)
-from PyQt6.QtWebChannel import QWebChannel
-from web_console import QuietWebPage
+# QtWebEngine (Qt6WebEngineCore.dll, ~200 MB) is imported at first use only – see web_engine.py
+import web_engine
 
 from database import (
     init_db, get_connection, save_image_embedding, get_all_embeddings, get_media_needing_embedding,
@@ -348,10 +344,28 @@ def is_allowed_web_url(url):
     return scheme == "https" and u.host().lower() in ALLOWED_WEB_HOSTS
 
 
-class WebUrlInterceptor(QWebEngineUrlRequestInterceptor):
-    def interceptRequest(self, info):
-        if not is_allowed_web_url(info.requestUrl()):
-            info.block(True)
+_interceptor_cls = None
+
+
+def _web_url_interceptor_class():
+    """QWebEngineUrlRequestInterceptor subclass, defined on first use (lazy QtWebEngine)."""
+    global _interceptor_cls
+    if _interceptor_cls is None:
+        from PyQt6.QtWebEngineCore import QWebEngineUrlRequestInterceptor
+
+        class WebUrlInterceptor(QWebEngineUrlRequestInterceptor):
+            def interceptRequest(self, info):
+                if not is_allowed_web_url(info.requestUrl()):
+                    info.block(True)
+
+        _interceptor_cls = WebUrlInterceptor
+    return _interceptor_cls
+
+
+def __getattr__(name):                     # main.WebUrlInterceptor for callers outside this module
+    if name == "WebUrlInterceptor":
+        return _web_url_interceptor_class()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 _map_profile = None
@@ -447,6 +461,7 @@ def map_web_profile():
             import paths
             root = paths.WEB_CACHE_DIR           # čteno za běhu (testy ho přesměrují)
             os.makedirs(root, exist_ok=True)
+            from PyQt6.QtWebEngineCore import QWebEngineProfile
             # rodič = aplikace: profil musí přežít všechny své stránky
             profile = QWebEngineProfile("omni_map", QApplication.instance())
             profile.setPersistentStoragePath(os.path.join(root, "storage"))
@@ -454,7 +469,7 @@ def map_web_profile():
             profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
             profile.setHttpCacheMaximumSize(MAP_HTTP_CACHE_MB * 1024 * 1024)
             profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
-            profile._interceptor = WebUrlInterceptor(profile)
+            profile._interceptor = _web_url_interceptor_class()(profile)
             profile.setUrlRequestInterceptor(profile._interceptor)
             _map_profile = profile
         except Exception as e:
@@ -483,6 +498,7 @@ def attach_tile_store(page):
 
 
 def _inject_tile_store(page, srv):
+    from PyQt6.QtWebEngineCore import QWebEngineScript
     script = QWebEngineScript()
     script.setName("kairos-tile-store")
     script.setSourceCode(f"window.TILE_STORE_CONFIG = {json.dumps(srv.config())};")
@@ -4530,7 +4546,11 @@ class MainWindow(QMainWindow):
         self.map_host_kind = "qtwebengine"
         try:
             # Platí pro výchozí profil = mapa i minimapa prohlížeče (viz is_allowed_web_url)
-            self._web_interceptor = WebUrlInterceptor(self)
+            from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
+            from PyQt6.QtWebEngineWidgets import QWebEngineView
+            from PyQt6.QtWebChannel import QWebChannel
+            from web_console import QuietWebPage
+            self._web_interceptor = _web_url_interceptor_class()(self)
             QWebEngineProfile.defaultProfile().setUrlRequestInterceptor(self._web_interceptor)
 
             self.map_view = QWebEngineView()
@@ -7504,6 +7524,7 @@ def main(app=None, splash=None):
     import paths as _paths
     crash_guard.install(_paths.LOG_DIR)          # idempotent; also covers splash.boot() / embedding
     if app is None:
+        web_engine.prepare_app()                 # QtWebEngine may then be imported later (lazily)
         app = QApplication(sys.argv)
         app.setApplicationName(brand.APP_NAME)
         app.setOrganizationName(brand.APP_NAME)
