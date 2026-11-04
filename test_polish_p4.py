@@ -209,6 +209,7 @@ class TestMainWindowTint(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.w = main.MainWindow()
+        self.w._ensure_map_view()                 # pillar 5: the map host is built lazily
         self.addCleanup(lambda: (self.w.close(), self.w.deleteLater()))
         tokens.set_adaptive(True)
 

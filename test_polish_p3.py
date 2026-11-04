@@ -253,6 +253,7 @@ class TestMainWindowDrop(TmpDir):
             p.start()
             self.addCleanup(p.stop)
         self.w = main.MainWindow()
+        self.w._ensure_map_view()                 # pillar 5: the map host is built lazily
         self.w.config["library_folders"], self.w.config["watched_folders"] = [], []
         self.w.resize(1200, 760)
         self.w.show()

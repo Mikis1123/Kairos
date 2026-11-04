@@ -419,6 +419,145 @@ class TestQtSurfaces(unittest.TestCase):
         self.assertGreater(edited.pixelColor(50, 50).red(), plain.pixelColor(50, 50).red())
 
 
+class TestLiveViewerRegressions(unittest.TestCase):
+    """Field defects that headless unit tests missed: a REAL MediaViewerWidget, shown on screen."""
+
+    @classmethod
+    def setUpClass(cls):
+        app()
+        import main
+        cls.main = main
+
+    def setUp(self):
+        from PyQt6.QtCore import QEventLoop, QTimer
+        self.tmp = tempfile.mkdtemp(prefix="kairos-live-")
+        self.src = os.path.join(self.tmp, "p.jpg")
+        Image.new("RGB", (1600, 1000), (120, 90, 60)).save(self.src, "JPEG")
+        rec = (987654321, "p.jpg", self.src, "photo", None, None, "2024-01-01", 0)
+        self.v = self.main.create_media_viewer([rec], 0)
+        self.v.resize(1200, 800)
+        self.v.show()
+        loop = QEventLoop()
+        deadline = time.perf_counter() + 5
+        while self.v._edit_source is None and time.perf_counter() < deadline:
+            QTimer.singleShot(20, loop.quit)
+            loop.exec()
+        self.assertIsNotNone(self.v._edit_source, "display image decoded")
+
+    def tearDown(self):
+        if self.v.is_editing():
+            self.v._editor.cancel()
+        self.v.cleanup_playback()
+        self.v.close()
+        self.v.deleteLater()
+        app().processEvents()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pump(self, ms):
+        from PyQt6.QtCore import QEventLoop, QTimer
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    def test_every_hud_button_paints_its_icon(self):
+        """Edit / Export were blank slots: HudIconButton drew only its hand-made names."""
+        import viewer_hud
+        from PyQt6.QtGui import QPainter, QColor
+        for btn in self.v.findChildren(viewer_hud.HudIconButton):
+            img = QImage(btn.size(), QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(0)
+            p = QPainter(img)
+            viewer_hud.HudIconButton._paint_icon(p, btn.icon_name(), QRectF_(img), QColor("#FFFFFF"))
+            p.end()
+            lit = sum(1 for x in range(img.width()) for y in range(img.height()) if img.pixelColor(x, y).alpha() > 40)
+            self.assertGreater(lit, 10, f"HUD icon {btn.icon_name()!r} paints nothing")
+
+    def test_start_edit_does_not_reenter_the_event_loop(self):
+        """processEvents() in start_edit ran queued timers (Esc, Export, …) before the session existed."""
+        from PyQt6.QtCore import QTimer
+        ran = []
+        QTimer.singleShot(0, lambda: ran.append(self.v.is_editing()))
+        self.v.start_edit()
+        self.assertEqual(ran, [], "a queued timer fired inside start_edit")
+        self.assertTrue(self.v.is_editing())
+        self._pump(30)
+        self.assertEqual(ran, [True], "queued work runs after the session is fully started")
+        self.assertTrue(self.v._edit_panel.isVisible())
+        self.assertGreaterEqual(self.v._edit_panel.width(), 280)
+        self.assertGreater(self.v._edit_panel.height(), 400, "panel must not collapse")
+        self.assertTrue(all(s.isVisible() for s in self.v._edit_panel.tone_sliders.values()))
+
+    def test_leaving_edit_restores_only_the_photo_panels(self):
+        """Cancel made every HUD panel visible – the video scrubber appeared over a still."""
+        self.v.start_edit()
+        self.v._editor.cancel()
+        self._pump(30)
+        self.assertFalse(self.v.scrubber_panel.isVisible(), "video scrubber over a photo")
+        self.assertTrue(self.v.top_hud.isVisible())
+
+    def test_e_before_decode_opens_editor_on_arrival(self):
+        self.v._edit_source = None
+        self.v.start_edit()
+        self.assertFalse(self.v.is_editing())
+        self.v._present_photo(self.src, QImage(self.src))
+        self._pump(30)
+        self.assertTrue(self.v.is_editing(), "E pressed while decoding is not lost")
+
+    def test_export_sheet_card_is_opaque_and_populated(self):
+        import export_sheet
+        sheet = export_sheet.ExportSheet(self.v, 1, export_sheet.options_from_config({}, "t"), True)
+        sheet.open()
+        self._pump(700)
+        self.assertGreaterEqual(sheet._progress.value, 0.999, "sheet animation reached rest")
+        self.assertGreater(sheet.card.height(), 300)
+        from PyQt6.QtWidgets import QLabel
+        texts = [lbl.text() for lbl in sheet.card.findChildren(QLabel) if lbl.isVisible() and lbl.text()]
+        self.assertGreater(len(texts), 3, "export sheet controls are empty")
+        sheet.reject()
+        self._pump(400)
+
+
+def QRectF_(img):
+    from PyQt6.QtCore import QRectF
+    s = min(img.width(), img.height()) * 0.5
+    return QRectF((img.width() - s) / 2, (img.height() - s) / 2, s, s)
+
+
+class TestCrashGuardAndBootClock(unittest.TestCase):
+    def test_slot_exception_is_logged_not_fatal(self):
+        import crash_guard
+        tmp = tempfile.mkdtemp(prefix="kairos-guard-")
+        try:
+            old = crash_guard._log_dir
+            crash_guard._log_dir = tmp
+            try:
+                raise RuntimeError("synthetic")
+            except RuntimeError:
+                crash_guard.report(*sys.exc_info())
+            finally:
+                crash_guard._log_dir = old
+            text = open(os.path.join(tmp, crash_guard.CRASH_LOG), encoding="utf-8").read()
+            self.assertIn("RuntimeError: synthetic", text)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_report_survives_missing_console(self):
+        import crash_guard
+        with mock.patch.object(sys, "stderr", None):
+            crash_guard.report(ValueError, ValueError("x"), None)       # must not raise
+
+    def test_qt_message_handler_survives_missing_console(self):
+        import viewer_hud
+        with mock.patch.object(sys, "stderr", None):
+            from PyQt6.QtCore import qWarning
+            qWarning(b"kairos test warning without console")             # handler must not raise
+
+    @unittest.skipUnless(sys.platform == "win32", "process creation time is a Windows API here")
+    def test_boot_clock_counts_interpreter_start(self):
+        import boot_trace
+        self.assertGreater(boot_trace._process_age_ms(), 0.0, "GetProcessTimes failed -> boot numbers too low")
+
+
 # ── pillar 3: export presets ─────────────────────────────────────────────────
 
 def _p3_profile():

@@ -383,6 +383,7 @@ class TestMapLayerPersistence(TempEnv):
             self.addCleanup(p.stop)
         self.save = main.save_config
         self.w = main.MainWindow()
+        self.w._ensure_map_view()                 # pillar 5: the map host is built lazily
         self.addCleanup(lambda: (self.w.close(), self.w.deleteLater()))
 
     def test_choice_is_saved_once(self):

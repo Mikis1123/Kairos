@@ -6,6 +6,12 @@ P3.7 Nastavení prahu        | P3.8 Konfig. práh         | P3.9 Dynamická LRU 
 """
 import boot_trace  # noqa: E402,F401 – first: cold-boot clock (pillar 5)
 import sys, os, time, json, math, subprocess, unicodedata
+if __name__ == "__main__":
+    # An exception in a Qt slot must not kill the app silently (PyQt6 default = qFatal, exit 127
+    # without a word under pythonw): log it to logs/crash.log and keep running.
+    import crash_guard
+    import paths as _paths
+    crash_guard.install(_paths.LOG_DIR)
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -7494,6 +7500,9 @@ def configure_display_pipeline(app, cfg):
 
 def main(app=None, splash=None):
     """Hlavní okno. app/splash předává splash.boot(); bez nich (KAIROS_NO_SPLASH) se vytvoří tady."""
+    import crash_guard
+    import paths as _paths
+    crash_guard.install(_paths.LOG_DIR)          # idempotent; also covers splash.boot() / embedding
     if app is None:
         app = QApplication(sys.argv)
         app.setApplicationName(brand.APP_NAME)

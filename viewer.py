@@ -287,6 +287,7 @@ class MediaViewerWidget(QWidget):
         self._edit_source = None          # display-size QImage of the current photo, unedited
         self._edited_cache = {}           # (path, edit key, size) -> edited QImage (last few)
         self._editor = None               # edit_panel.EditController (built on first use)
+        self._edit_pending = False        # E pressed before the display image decoded
         self.is_fullscreen = False
         self._is_video = False
         self._is_live = False
@@ -1145,6 +1146,7 @@ class MediaViewerWidget(QWidget):
             self._editor.cancel()                       # navigating away discards an open session
         self._edit = None if self._is_video else self._load_edit(item_id)
         self._edit_source = None
+        self._edit_pending = False
         self.btn_edit.setVisible(not self._is_video)
         # Stage 2: nová položka = vešlá; přiblížit jde jen fotku (rozměr originálu z hlavičky, ~5 ms)
         zoomable = bool(not self._is_video and path and os.path.exists(path))
@@ -1275,6 +1277,8 @@ class MediaViewerWidget(QWidget):
                 self._editor.start(image, self._editor.adj)     # sharper source arrived mid-session
             return
         self.canvas.set_image(QPixmap.fromImage(self._edited(path, image)))
+        if path is not None and getattr(self, "_edit_pending", False):
+            QTimer.singleShot(0, self.start_edit)       # E was pressed while this was decoding
 
     def _request_export(self):
         if self.media_list and not self.is_editing():
@@ -1301,7 +1305,9 @@ class MediaViewerWidget(QWidget):
             return
         src = self._edit_source
         if src is None or src.isNull():
-            return                                      # display image still decoding
+            self._edit_pending = True                   # display image still decoding: open on arrival
+            return
+        self._edit_pending = False
         if self.is_live_playing:
             self.stop_live_smoothly()
         self.canvas.zoom.reset(animate=False)
@@ -1312,10 +1318,13 @@ class MediaViewerWidget(QWidget):
             self.toggle_info_panel()
         self._edit_panel.setVisible(True)
         for panel in self.hud_panels:
-            panel.setVisible(False)
+            panel.hide_now()
         self._crop_overlay.setVisible(True)
         self._crop_overlay.raise_()
-        QApplication.processEvents()                    # canvas has its new (narrower) size
+        # canvas gets its new (narrower) size synchronously. NOT processEvents(): that re-entered
+        # the event loop before the session existed, so queued timers / keys / an Export ran in
+        # the middle of start_edit (Esc lost, export sheet opened over a half-started editor).
+        self.main_layout.activate()
         self._layout_crop_overlay()
         editor.start(src, self._edit)
 
@@ -1326,8 +1335,9 @@ class MediaViewerWidget(QWidget):
     def _on_edit_finished(self, adj, saved):
         self._crop_overlay.setVisible(False)
         self._edit_panel.setVisible(False)
-        for panel in self.hud_panels:
-            panel.setVisible(True)
+        # only the panels this item wants (a photo must not get the video scrubber back)
+        for panel in self._wanted_panels():
+            panel.fade_in()
         self.hud.sync()
         item = self.media_list[self.current_index] if self.media_list else None
         if saved and item is not None:

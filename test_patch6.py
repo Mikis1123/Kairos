@@ -376,6 +376,7 @@ class WindowEnv(TempEnv):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.w = main.MainWindow()
+        self.w._ensure_map_view()                 # pillar 5: the map host is built lazily
         self.w.resize(1280, 820)
         self.w.show()
         _app.processEvents()

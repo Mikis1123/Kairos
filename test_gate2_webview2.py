@@ -414,6 +414,7 @@ class TestMainWindowHost(unittest.TestCase):
                 mock.patch.object(main.MainWindow, "_start_ai_daemon", lambda self: None), \
                 mock.patch.object(main.MainWindow, "_smart_import_check", lambda self: None):
             w = main.MainWindow()
+            w._ensure_map_view()                 # pillar 5: the map host is built lazily
             try:
                 self.assertEqual(w.map_host_kind, "webview2")
                 self.assertIsInstance(w.map_view, map_host.WebView2Host)

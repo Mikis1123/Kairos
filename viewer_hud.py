@@ -654,6 +654,12 @@ class HudIconButton(QPushButton):
             p.drawText(ring, Qt.AlignmentFlag.AlignCenter, "10")
         elif name == "back":
             p.drawPath(_icon_path("prev", r))
+        else:
+            # every other name (adjust, share, …) from the shared SVG set – without this fallback
+            # a new HUD button painted nothing at all (Quick Edits / Export looked like empty slots)
+            import icons
+            if name in icons.names():
+                icons.paint(p, name, r, color)
 
 
 # ── Skleněný panel ────────────────────────────────────────────────────────────
@@ -1022,7 +1028,7 @@ def quiet_qt_ffmpeg_noise():
             return
         if previous is not None:
             previous(mode, context, message)
-        else:
+        elif _sys.stderr is not None:          # pythonw / shortcut: no console, stderr is None
             _sys.stderr.write(message + "\n")
 
     previous = qInstallMessageHandler(handler)

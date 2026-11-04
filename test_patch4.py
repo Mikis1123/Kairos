@@ -324,7 +324,7 @@ class TestSearchWorkerLifetime(unittest.TestCase):
     def test_overlapping_searches_keep_workers_alive(self):
         fake = types.SimpleNamespace(
             _search_query="les", _search_workers=set(),
-            _embeddings_cache={1: b"neplatny"},     # nevalidní -> obraz nic nevrátí, model netřeba
+            _embeddings_cache={1: b"neplatny"}, _embeddings_loaded=True,     # nevalidní -> obraz nic nevrátí, model netřeba
             _apply_filter_and_sort=lambda: None,
             _collection_records=lambda: [],
         )

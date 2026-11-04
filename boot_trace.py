@@ -21,6 +21,10 @@ def _process_age_ms():
         import ctypes
         from ctypes import wintypes
         k32 = ctypes.windll.kernel32
+        # restype matters: the default c_int truncates the pseudo-handle (-1) to 0xFFFFFFFF on
+        # 64-bit and GetProcessTimes then fails with "invalid handle" -> offset silently 0
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
         ft = [wintypes.FILETIME() for _ in range(4)]
         if not k32.GetProcessTimes(k32.GetCurrentProcess(), *[ctypes.byref(f) for f in ft]):
             return 0.0
