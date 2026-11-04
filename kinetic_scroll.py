@@ -22,6 +22,7 @@ from the Qt animation timer (one step per frame) and reports velocity, which the
 defer full-quality thumbnail decodes during fast flings.
 """
 import math
+import sys
 
 try:
     from PyQt6.QtCore import QElapsedTimer, QObject, Qt, QTimer, pyqtSignal
@@ -194,6 +195,23 @@ def classify_wheel(angle_dy, pixel_dy):
 
 
 if HAS_QT:
+    _period = {"held": False}
+
+    def _timer_resolution(fine):
+        """1 ms system timer resolution while a glide runs, released when it settles.
+        Measured: without it the 8 ms precise timer fired every ~16 ms (Windows' default
+        15.6 ms tick), and the opaque grid that now paints a frame in ~6 ms still glided at
+        62 fps. Chromium raises it the same way for its animations."""
+        if fine == _period["held"] or sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            winmm = ctypes.WinDLL("winmm")
+            (winmm.timeBeginPeriod if fine else winmm.timeEndPeriod)(1)
+            _period["held"] = fine
+        except (OSError, AttributeError):
+            pass
+
     class _FrameTicker(QObject):
         """Per-frame callback at the panel's refresh rate.
 
@@ -221,13 +239,117 @@ if HAS_QT:
             return max(4, int(1000.0 / max(30.0, min(hz, 240.0))))
 
         def start(self):
-            self._timer.start(self.interval_ms())
+            ms = self.interval_ms()
+            _timer_resolution(ms < 15)
+            self._timer.start(ms)
 
         def stop(self):
             self._timer.stop()
+            _timer_resolution(False)
 
         def running(self):
             return self._timer.isActive()
+
+    class _VBlank:
+        """Blocking wait for the display's vertical blank (D3DKMTWaitForVerticalBlankEvent on
+        the primary output, as Chromium paces its animations). None when unavailable."""
+
+        @staticmethod
+        def open():
+            if sys.platform != "win32":
+                return None
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class _Luid(ctypes.Structure):
+                    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+                class _Open(ctypes.Structure):
+                    _fields_ = [("hDc", wintypes.HDC), ("hAdapter", ctypes.c_uint), ("AdapterLuid", _Luid),
+                                ("VidPnSourceId", ctypes.c_uint)]
+
+                class _Wait(ctypes.Structure):
+                    _fields_ = [("hAdapter", ctypes.c_uint), ("hDevice", ctypes.c_uint),
+                                ("VidPnSourceId", ctypes.c_uint)]
+
+                gdi32, user32 = ctypes.WinDLL("gdi32"), ctypes.WinDLL("user32")
+                user32.GetDC.restype = wintypes.HDC
+                user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+                hdc = user32.GetDC(None)
+                o = _Open(hDc=hdc)
+                ok = gdi32.D3DKMTOpenAdapterFromHdc(ctypes.byref(o)) == 0
+                user32.ReleaseDC(None, hdc)
+                if not ok:
+                    return None
+                w = _Wait(hAdapter=o.hAdapter, hDevice=0, VidPnSourceId=o.VidPnSourceId)
+                ref = ctypes.byref(w)
+                fn = gdi32.D3DKMTWaitForVerticalBlankEvent
+                return lambda: fn(ref) == 0          # ctypes releases the GIL while it blocks
+            except (OSError, AttributeError, ValueError):
+                return None
+
+    class _VsyncTicker(QObject):
+        """Per-frame callback on the display's real vblank.
+
+        Measured (eval/bench_massive_scale.py, 20 000 items): the 8 ms precise QTimer was
+        quantised to Windows' 15.6 ms tick once the GUI event queue was busy, even with a 1 ms
+        timer period, so the glide stayed at 62 fps although a frame cost ~6 ms. A thread
+        waits for each vblank (8.3 ms at 120 Hz, 16.7 ms at 60 Hz: the refresh is followed
+        automatically) and posts one tick to the GUI thread. Ticks coalesce: a busy GUI never
+        builds a backlog. The thread lives only while a glide runs (0 wakeups at rest)."""
+
+        _tick_signal = pyqtSignal()
+
+        def __init__(self, cb, wait, parent=None):
+            super().__init__(parent)
+            import threading
+            self._cb = cb
+            self._wait = wait
+            self._run = False
+            self._pending = threading.Event()
+            self._thread = None
+            self._tick_signal.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
+
+        def _loop(self):
+            while self._run:
+                if not self._wait():
+                    self._run = False
+                    break
+                if self._run and not self._pending.is_set():
+                    self._pending.set()
+                    self._tick_signal.emit()
+
+        def _deliver(self):
+            self._pending.clear()
+            if self._run:
+                self._cb()
+
+        def start(self):
+            import threading
+            if self._run and self._thread is not None and self._thread.is_alive():
+                return
+            self._run = True
+            self._pending.clear()
+            self._thread = threading.Thread(target=self._loop, name="kairos-vsync", daemon=True)
+            self._thread.start()
+
+        def stop(self):
+            self._run = False
+
+        def running(self):
+            return self._run
+
+        def interval_ms(self):
+            return 0                                 # paced by the display, not a timer
+
+    def make_ticker(cb, area, parent=None):
+        """The vblank ticker where the platform offers it, else the precise-timer ticker."""
+        import os
+        wait = None if os.environ.get("KAIROS_TICKER") == "timer" else _VBlank.open()
+        if wait is not None:
+            return _VsyncTicker(cb, wait, parent)
+        return _FrameTicker(cb, area, parent)
 
     class KineticScroller(QObject):
         """Drives a QAbstractScrollArea's vertical scrollbar with KineticPhysics."""
@@ -246,7 +368,7 @@ if HAS_QT:
             self._clock.start()
             self._last_t = None
             self._writing = False
-            self._ticker = _FrameTicker(self._tick, area, self)
+            self._ticker = make_ticker(self._tick, area, self)
             self.bar.valueChanged.connect(self._on_value)
             self.bar.rangeChanged.connect(self._on_range)
             self._on_range(self.bar.minimum(), self.bar.maximum())

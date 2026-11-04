@@ -544,6 +544,7 @@ THUMB_UNAVAILABLE = "unavailable"     # soubor je, ale náhled se nepodařilo na
 # berou jen v rozlišení, které dlaždice potřebuje (kratší strana ve fyzických px) – hustá
 # mřížka (14 sloupců) tak nedrží 4 MB na dlaždici, velké dlaždice (3 sloupce) nejsou rozmazané.
 THUMB_TIERS = (256, 512, 840)
+PRETILE_BYTES = 96 * 1024 * 1024      # grid tiles pre-rendered by the thumbnail workers
 DECODE_THREADS_REST = 4               # thumbnail decoders while the grid rests
 DECODE_THREADS_FLING = 2              # ...and while it glides (the GUI thread keeps its frame budget)
 
@@ -560,8 +561,37 @@ def _shrink_short_edge(img, short):
     return imaging.shrink_qimage_short_edge(img, short)
 
 
+def tile_shade(meta):
+    """What the badge shade of a tile depends on (part of every tile cache key)."""
+    return (meta.get("type") in ("live_photo", "video"), bool(meta.get("is_fav")))
+
+
+def compose_tile_image(img, w_px, h_px, radius, dpr, shade):
+    """The resting grid tile without its badge icons, as a QImage at device resolution: the
+    thumbnail cover-scaled (Qt smooth), clipped to the smooth rounded rect, plus the badge
+    shade. Thread-safe (QImage + QPainter only), so thumbnail workers build it off the GUI
+    thread. ApplePhotoDelegate._tile draws the same steps when no pre-rendered tile matches."""
+    out = QImage(max(1, int(w_px)), max(1, int(h_px)), QImage.Format.Format_ARGB32_Premultiplied)
+    out.fill(Qt.GlobalColor.transparent)
+    out.setDevicePixelRatio(dpr)
+    w, h = w_px / dpr, h_px / dpr
+    frame = QRectF(0, 0, w, h)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    p.setClipPath(smooth_rect_path(frame, radius))
+    scaled = img.scaled(QSize(int(w_px), int(h_px)), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation)
+    scaled.setDevicePixelRatio(dpr)
+    size = scaled.deviceIndependentSize()
+    p.drawImage(QPointF(w / 2 - size.width() / 2, h / 2 - size.height() / 2), scaled)
+    ApplePhotoDelegate._paint_badge_shade(p, frame, {"type": "video" if shade[0] else "photo", "is_fav": shade[1]})
+    p.end()
+    return out
+
+
 class ThumbnailWorkerSignals(QObject):
-    loaded = pyqtSignal(int, QImage)
+    loaded = pyqtSignal(int, QImage, QImage)     # id, thumbnail (tier), pre-rendered tile (or null)
     failed = pyqtSignal(int, str)
     source_short = pyqtSignal(int, int)      # kratší strana zdroje (víc z něj nevytěžíme)
 
@@ -579,6 +609,7 @@ class ThumbnailWorker(QRunnable):
         # the model hands every worker ONE shared signals object (connected once): a QObject plus
         # three connects per tile cost ~0.3 ms of GUI time per request during a fling
         self.signals = signals if signals is not None else ThumbnailWorkerSignals()
+        self.tile_geom = None       # (w_px, h_px, radius, dpr, shade): pre-render the grid tile too
         self.started_ids = None     # Gate 2 A: model's set of dequeued ids (stale-queue cancel)
         self._source_short = None   # true short edge of the decoded source (before scaled decode)
         self.setAutoDelete(True)
@@ -600,7 +631,16 @@ class ThumbnailWorker(QRunnable):
             self.signals.failed.emit(self.item_id, state)
             return
         self.signals.source_short.emit(self.item_id, self._source_short or min(img.width(), img.height()))
-        self.signals.loaded.emit(self.item_id, _shrink_short_edge(img, self.tier))
+        thumb = _shrink_short_edge(img, self.tier)
+        self.signals.loaded.emit(self.item_id, thumb, self._tile(thumb))
+
+    def _tile(self, thumb):
+        if self.tile_geom is None or thumb.isNull():
+            return QImage()
+        try:
+            return compose_tile_image(thumb, *self.tile_geom)
+        except Exception:                              # the GUI path renders it instead
+            return QImage()
 
     def _load(self, path):
         import color_manage
@@ -669,7 +709,8 @@ class VaultThumbnailWorker(ThumbnailWorker):
                                      else THUMB_MISSING_FILE)
             return
         self.signals.source_short.emit(self.item_id, min(img.width(), img.height()))
-        self.signals.loaded.emit(self.item_id, _shrink_short_edge(img, self.tier))
+        thumb = _shrink_short_edge(img, self.tier)
+        self.signals.loaded.emit(self.item_id, thumb, self._tile(thumb))
 
 
 # ── ApplePhotoModel ───────────────────────────────────────────────────────────
@@ -687,6 +728,9 @@ class ApplePhotoModel(QAbstractListModel):
         self.ram_cache = LRUCache(lru_capacity, max_bytes=THUMB_RAM_BUDGET_MB * 1024 * 1024, sizer=pixmap_bytes)
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(DECODE_THREADS_REST)
+        self.tile_geom = None     # (w_px, h_px, radius, dpr) of a resting tile, from the view
+        self._pretiles = OrderedDict()   # item_id -> (QPixmap, (w_px, h_px, radius, dpr, shade))
+        self._pretile_bytes = 0
         self._signals = ThumbnailWorkerSignals(self)     # shared by every worker (one set of connects)
         self._signals.source_short.connect(self._on_source_short)
         self._signals.loaded.connect(self._on_thumb_loaded)
@@ -746,8 +790,47 @@ class ApplePhotoModel(QAbstractListModel):
         else:
             w = ThumbnailWorker(item_id, rec[5], rec[2], tier, self._signals)
         w.started_ids = self._started
+        if self.tile_geom is not None and self.vault is None:
+            w.tile_geom = self.tile_geom + (tile_shade({"type": rec[3], "is_fav": rec[7]}),)
         self._queued.add(item_id)
         self.thread_pool.start(w)
+
+    def set_tile_geom(self, w_px, h_px, radius, dpr):
+        """Resting tile size in device px (the view's cell minus its inset): workers pre-render
+        tiles of exactly this size. A new size drops the stale pre-rendered tiles."""
+        geom = (int(w_px), int(h_px), round(float(radius), 2), float(dpr))
+        if geom != self.tile_geom:
+            self.tile_geom = geom
+            self._pretiles.clear()
+            self._pretile_bytes = 0
+
+    def pretile(self, item_id, w_px, h_px, radius, dpr, shade):
+        """The pre-rendered tile (QPixmap) when it matches this geometry and shade, else None."""
+        hit = self._pretiles.get(item_id)
+        if hit is None or hit[1] != (int(w_px), int(h_px), round(float(radius), 2), float(dpr), shade):
+            return None
+        self._pretiles.move_to_end(item_id)
+        return hit[0]
+
+    def _keep_pretile(self, item_id, tile):
+        if tile.isNull() or self.tile_geom is None:
+            return
+        rec = self.records[self.id_to_row[item_id]] if item_id in self.id_to_row else None
+        if rec is None:
+            return
+        geom = (tile.width(), tile.height(), self.tile_geom[2], tile.devicePixelRatio(),
+                tile_shade({"type": rec[3], "is_fav": rec[7]}))
+        if geom[:2] != self.tile_geom[:2] or abs(geom[3] - self.tile_geom[3]) > 1e-6:
+            return                                   # rendered for an older cell size
+        old = self._pretiles.pop(item_id, None)
+        if old is not None:
+            self._pretile_bytes -= old[0].width() * old[0].height() * 4
+        pm = QPixmap.fromImage(tile)
+        self._pretiles[item_id] = (pm, geom)
+        self._pretile_bytes += pm.width() * pm.height() * 4
+        while self._pretile_bytes > PRETILE_BYTES and len(self._pretiles) > 1:
+            _, (old_pm, _g) = self._pretiles.popitem(last=False)
+            self._pretile_bytes -= old_pm.width() * old_pm.height() * 4
 
     def _on_source_short(self, item_id: int, short: int):
         self._src_short[item_id] = int(short)
@@ -840,7 +923,7 @@ class ApplePhotoModel(QAbstractListModel):
             idx = self.index(row, 0)
             self.dataChanged.emit(idx, idx, roles)
 
-    def _on_thumb_loaded(self, item_id: int, image: QImage):
+    def _on_thumb_loaded(self, item_id: int, image: QImage, tile: QImage = None):
         self._queued.discard(item_id)
         self._started.discard(item_id)
         if item_id in self._vault_ids and self.vault is None:
@@ -853,6 +936,8 @@ class ApplePhotoModel(QAbstractListModel):
             self.loading_ids.discard(item_id)
             return
         self.ram_cache.put(item_id, QPixmap.fromImage(image))   # QPixmap až v GUI vlákně
+        if tile is not None:
+            self._keep_pretile(item_id, tile)
         self.loading_ids.discard(item_id)
         self.failed.pop(item_id, None)
         self._emit_row_changed(item_id, [self.ThumbRole, self.StateRole])
@@ -1011,16 +1096,32 @@ class ApplePhotoDelegate(QStyledItemDelegate):
         if tile is not None:
             self._tiles.move_to_end(key)
             return tile
-        tile = QPixmap(max(1, round(size.width() * dpr)), max(1, round(size.height() * dpr)))
-        tile.setDevicePixelRatio(dpr)
-        tile.fill(Qt.GlobalColor.transparent)
-        p = QPainter(tile)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        w_px, h_px = max(1, round(size.width() * dpr)), max(1, round(size.height() * dpr))
         frame = QRectF(0, 0, size.width(), size.height())
-        self._paint_photo(p, frame, smooth_rect_path(frame, radius), pixmap, 1.0, meta)
-        self._paint_badges(p, frame, meta)
-        p.end()
+        model = self.parent().model() if self.parent() is not None else None
+        pre = None
+        if not meta.get("possible") and model is not None and hasattr(model, "pretile") and "id" in meta:
+            pre = model.pretile(meta["id"], w_px, h_px, radius, dpr, tile_shade(meta))
+        if pre is not None:
+            # composed off the GUI thread (compose_tile_image); only the badge icons are added here
+            if tile_shade(meta) == (False, False):
+                tile = pre
+            else:
+                tile = QPixmap(pre)
+                p = QPainter(tile)
+                p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                self._paint_badges(p, frame, meta)
+                p.end()
+        else:
+            tile = QPixmap(w_px, h_px)
+            tile.setDevicePixelRatio(dpr)
+            tile.fill(Qt.GlobalColor.transparent)
+            p = QPainter(tile)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            self._paint_photo(p, frame, smooth_rect_path(frame, radius), pixmap, 1.0, meta)
+            self._paint_badges(p, frame, meta)
+            p.end()
         self._tiles[key] = tile
         self._tiles_bytes += tile.width() * tile.height() * 4
         while self._tiles_bytes > TILE_CACHE_BYTES and len(self._tiles) > 1:
@@ -1082,7 +1183,17 @@ class ApplePhotoDelegate(QStyledItemDelegate):
             return False
         pixmap = index.data(ApplePhotoModel.ThumbRole)
         if pixmap is None or pixmap.isNull():
-            return False
+            if (index.data(ApplePhotoModel.StateRole) or THUMB_LOADING) != THUMB_LOADING:
+                return False                            # failure card (icon + text): full paint
+            rect = option.rect.adjusted(4, 4, -4, -4)
+            if rect.width() > 0 and rect.height() > 0:
+                # a loading tile during a fling: one blit of a cached rounded placeholder
+                dev = painter.device()
+                dpr = dev.devicePixelRatioF() if dev is not None else 1.0
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+                painter.drawPixmap(rect.topLeft(), self._placeholder_tile(rect.size(),
+                                                                          max(6.0, min(14.0, rect.width() * 0.07)), dpr))
+            return True
         rect = option.rect.adjusted(4, 4, -4, -4)
         if rect.width() <= 0 or rect.height() <= 0:
             return True
@@ -1094,6 +1205,23 @@ class ApplePhotoDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         painter.drawPixmap(rect.topLeft(), self._tile(pixmap, rect.size(), radius, meta, dpr))
         return True
+
+    def _placeholder_tile(self, size, radius, dpr):
+        key = ("placeholder", size.width(), size.height(), round(radius, 2), dpr, theme.current())
+        tile = self._tiles.get(key)
+        if tile is None:
+            tile = QPixmap(max(1, round(size.width() * dpr)), max(1, round(size.height() * dpr)))
+            tile.setDevicePixelRatio(dpr)
+            tile.fill(Qt.GlobalColor.transparent)
+            p = QPainter(tile)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.fillPath(smooth_rect_path(QRectF(0, 0, size.width(), size.height()), radius), self.placeholder_color)
+            p.end()
+            self._tiles[key] = tile
+            self._tiles_bytes += tile.width() * tile.height() * 4
+        else:
+            self._tiles.move_to_end(key)
+        return tile
 
     def _hover(self, index):
         view = self.parent()
@@ -1282,6 +1410,12 @@ class AppleGridView(QListView):
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.verticalScrollBar().setSingleStep(28)
+        # Opaque viewport (paintEvent fills the dirty rect with the page background): Qt then
+        # scrolls by blitting the backing store and repaints only the newly exposed strip.
+        # Measured (eval/bench_massive_scale.py, 20 000 items): a transparent viewport made
+        # every glide step repaint all ~25 visible tiles and flush the whole viewport (12 ms
+        # per frame, so vsync halved the glide to 60 fps).
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         # posuvník vždy místo zabraný (tenký, průhledná dráha): šířka mřížky se pak nemění,
         # když se objeví – jinak by poslední sloupec přeskočil na další řádek
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
@@ -1341,6 +1475,11 @@ class AppleGridView(QListView):
         model = getattr(self, "photo_model", None)
         if model is not None and hasattr(model, "set_tier"):
             model.set_tier(thumb_tier(self.cell_size * self.viewport().devicePixelRatioF()))
+        if model is not None and hasattr(model, "set_tile_geom"):
+            dpr = self.viewport().devicePixelRatioF()
+            side = self.cell_size - 8                # option.rect.adjusted(4, 4, -4, -4)
+            if side > 0:
+                model.set_tile_geom(round(side * dpr), round(side * dpr), max(6.0, min(14.0, side * 0.07)), dpr)
 
     def set_cell_size(self, px: int):
         # strop tří sloupců až u rozvržené mřížky: při startu je viewport ~100 px a strop by
@@ -1504,6 +1643,9 @@ class AppleGridView(QListView):
         self.viewport().update()
 
     def paintEvent(self, event):
+        bg = QPainter(self.viewport())        # opaque viewport: the gaps between tiles are ours to paint
+        bg.fillRect(event.rect(), theme.qcolor("bg"))
+        bg.end()
         if self._frozen is not None:
             self._paint_frozen()
         else:
