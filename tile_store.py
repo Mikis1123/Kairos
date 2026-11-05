@@ -26,13 +26,25 @@ Fidelity pass (2026-11-03): three download queues by priority, worked by one poo
     hotspots). Lowest priority, at most BACKGROUND_PER_HOST at once per server.
 The most recently used tiles also stay in RAM (HOT_CACHE_MB), so a hot tile is served without
 touching SQLite. There are 8 ports (8 × 6 Chromium connections).
+
+Sprint 3 item 3 (offline): region packs. A pack is one MBTiles file (SQLite, the standard
+metadata + tiles(zoom_level, tile_column, tile_row TMS) schema) in paths.MAP_PACKS_DIR that
+stands in for one tile source (SOURCE_PATTERNS: OpenMapTiles vector, Esri imagery / street map,
+OpenTopoMap, terrain). route() / resolve() look into packs after a store miss, before the
+network, so a pack-covered region renders with the network unplugged. Packs are outside the LRU
+budget and outside "Clear map cache"; they come from an import (any OpenMapTiles .mbtiles
+extract, e.g. planetiler / openmaptiles tools) or from build_region_pack() (a bulk download of
+a REGIONS bounding box into a new pack). Pack metadata is read on a worker thread (scan_async).
 """
 import http.client
 import http.server
 import json
+import math
 import os
 import queue
+import re
 import secrets
+import shutil
 import socketserver
 import sqlite3
 import threading
@@ -54,6 +66,7 @@ WARM_MAX_KEYS = 12000               # one warm request (a trip region z10-16 is 
 BACKGROUND_MAX_QUEUE = 30000        # oldest background work is dropped beyond this
 HOT_CACHE_MB = 96                   # RAM copy of the most recently used tiles
 BACKGROUND_THREADS = 4              # of BAKE_WORKERS; the rest stay free for urgent / film
+GATE_POLL_S = 0.1                   # a gated background worker looks again after this
 BAKE_BODY_MAX = 2 * 1024 * 1024     # seznam klíčů jedné Cesty (~6000 × 80 B)
 PRIORITIES = ("urgent", "film", "background")
 UPSTREAM_TIMEOUT_S = 20
@@ -204,10 +217,27 @@ class TileStore:
         return {"bytes": self.bytes, "budget": self.budget, "hits": self.hits, "misses": self.misses,
                 "stale": self.stale, "redirects": self.redirects}
 
-    def clear(self):
+    def clear(self, timeout=10):
+        """Deletes every stored tile and gives the disk space back (VACUUM on the writer thread).
+        Blocks up to timeout: call it from a worker thread (map_precache.clear_cache_async)."""
         done = threading.Event()
         self._writes.put(("clear", done))
-        done.wait(10)
+        return done.wait(timeout)
+
+    def set_budget(self, budget_mb):
+        """New disk budget; a lower one evicts on the writer thread right away."""
+        self.budget = int(budget_mb) * 1024 * 1024
+        self._writes.put(("sync", threading.Event()))
+
+    def disk_bytes(self):
+        """Size of the store files on disk (stat only, no SQLite: safe on the GUI thread)."""
+        total = 0
+        for suffix in ("", "-wal"):
+            try:
+                total += os.path.getsize(self.path + suffix)
+            except OSError:
+                pass
+        return total
 
     def _open_writer(self):
         """Writer connection + covering indexes, so size bookkeeping never reads tile data.
@@ -242,6 +272,7 @@ class TileStore:
                     break
                 batch.append(nxt)
             events = []
+            vacuum = False
             try:
                 for op in batch:
                     kind = op[0]
@@ -262,11 +293,18 @@ class TileStore:
                             self._hot.clear()
                             self._hot_bytes = 0
                         events.append(op[1])
+                        vacuum = True
                     elif kind == "sync":
                         events.append(op[1])
                 if self.bytes > self.budget:
                     self._evict(conn)
                 conn.commit()
+                if vacuum:                      # "Clear map cache": the file shrinks too
+                    try:
+                        conn.execute("VACUUM")
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except sqlite3.Error as e:
+                        print(f"[TileStore] vacuum: {e}")
             except sqlite3.Error as e:
                 print(f"[TileStore] zápis selhal: {e}")
                 try:
@@ -343,11 +381,334 @@ class _Upstream:
         raise OSError("unreachable")
 
 
+# ── Offline region packs (Sprint 3 item 3) ─────────────────────────────────────
+# Which tile source a store key belongs to: (source id, key regex, axis order of the groups).
+# A pack declares one source id (metadata "kairos:source"); OpenMapTiles vector extracts are
+# recognised without it (format pbf). OpenFreeMap versions its planet path, every version
+# shares the OpenMapTiles schema, so one vector pack serves all of them.
+SOURCE_PATTERNS = (
+    ("openmaptiles", re.compile(r"^tiles\.openfreemap\.org/planet/[^/?]+/(\d+)/(\d+)/(\d+)\.pbf$"), "zxy"),
+    ("esri", re.compile(r"^server\.arcgisonline\.com/ArcGIS/rest/services/(.+?)/MapServer/tile/(\d+)/(\d+)/(\d+)$"), "nzyx"),
+    ("opentopomap", re.compile(r"^tile\.opentopomap\.org/(\d+)/(\d+)/(\d+)\.png$"), "zxy"),
+    ("terrarium", re.compile(r"^elevation-tiles-prod\.s3\.amazonaws\.com/terrarium/(\d+)/(\d+)/(\d+)\.png$"), "zxy"),
+)
+PACK_FORMATS = {"pbf": "application/x-protobuf", "png": "image/png", "jpg": "image/jpeg",
+                "jpeg": "image/jpeg", "webp": "image/webp"}
+PACK_SUFFIX = ".mbtiles"
+# Built-in regions for build_region_pack(): (west, south, east, north), WGS84
+REGIONS = {
+    "cz": (12.09, 48.55, 18.87, 51.06),
+    "sk": (16.83, 47.73, 22.57, 49.61),
+    "at": (9.53, 46.37, 17.16, 49.02),
+    "de": (5.87, 47.27, 15.04, 55.06),
+    "pl": (14.12, 49.00, 24.15, 54.84),
+    "ch": (5.96, 45.82, 10.49, 47.81),
+    "hu": (16.11, 45.74, 22.90, 48.59),
+    "si": (13.38, 45.42, 16.61, 46.88),
+    "hr": (13.49, 42.39, 19.45, 46.56),
+}
+REGION_ZMAX = 14                    # OpenMapTiles' deepest level (MapLibre overzooms beyond)
+# Average stored tile size in KB per zoom (measured 2026-11-05 on the real store, OpenFreeMap
+# planet), used for size estimates before a download
+VECTOR_AVG_KB = {0: 430, 1: 430, 2: 430, 3: 232, 4: 121, 5: 137, 6: 142, 7: 187, 8: 148, 9: 134,
+                 10: 95, 11: 53, 12: 30, 13: 17, 14: 11}
+MAX_LAT = 85.05112878
+
+
+def parse_key(key):
+    """'host/path' -> (source id, z, x, y) or None. Esri ids carry the service name."""
+    for sid, rx, order in SOURCE_PATTERNS:
+        m = rx.match(key)
+        if not m:
+            continue
+        g = m.groups()
+        if order == "nzyx":
+            return f"esri:{g[0]}", int(g[1]), int(g[3]), int(g[2])
+        return sid, int(g[0]), int(g[1]), int(g[2])
+    return None
+
+
+def lon2tile(lon, z):
+    n = 2 ** z
+    return max(0, min(n - 1, int(math.floor((float(lon) + 180.0) / 360.0 * n))))
+
+
+def lat2tile(lat, z):
+    n = 2 ** z
+    r = math.radians(max(-MAX_LAT, min(MAX_LAT, float(lat))))
+    return max(0, min(n - 1, int(math.floor((1.0 - math.log(math.tan(r) + 1.0 / math.cos(r)) / math.pi) / 2.0 * n))))
+
+
+def bbox_tiles(bbox, z):
+    """(x0, y0, x1, y1) tile range covering a (w, s, e, n) box at zoom z."""
+    w, s, e, n = bbox
+    return lon2tile(w, z), lat2tile(n, z), lon2tile(e, z), lat2tile(s, z)
+
+
+def region_tiles(bbox, zmin=0, zmax=REGION_ZMAX):
+    """(z, x, y) of a box, parents first."""
+    for z in range(zmin, zmax + 1):
+        x0, y0, x1, y1 = bbox_tiles(bbox, z)
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                yield z, x, y
+
+
+def estimate_region(bbox, zmax=REGION_ZMAX):
+    """(tiles, bytes) of a vector region pack z0..zmax (pure math, safe on the GUI thread)."""
+    tiles = size = 0
+    for z in range(0, zmax + 1):
+        x0, y0, x1, y1 = bbox_tiles(bbox, z)
+        n = (x1 - x0 + 1) * (y1 - y0 + 1)
+        tiles += n
+        size += n * VECTOR_AVG_KB.get(z, 11) * 1024
+    return tiles, size
+
+
+def packs_dir():
+    return paths.MAP_PACKS_DIR                  # read at call time (tests redirect it)
+
+
+class RegionPack:
+    """One MBTiles file, read-only, one SQLite connection per reading thread."""
+
+    def __init__(self, path):
+        self.path = path
+        self.name = os.path.splitext(os.path.basename(path))[0]
+        self._local = threading.local()
+        self._conns = []
+        self._lock = threading.Lock()
+        self.closed = False
+        try:
+            meta = dict(self._conn().execute("SELECT name, value FROM metadata").fetchall())
+            self._conn().execute("SELECT 1 FROM tiles LIMIT 1").fetchall()
+        except sqlite3.Error:
+            self.close()
+            raise
+        self.meta = meta
+        self.format = (meta.get("format") or "").lower()
+        self.source = meta.get("kairos:source") or ("openmaptiles" if self.format == "pbf" else "")
+        if not self.source or self.format not in PACK_FORMATS:
+            self.close()
+            raise ValueError(f"unsupported pack (format {self.format!r}, source {self.source!r})")
+        self.title = meta.get("kairos:title") or meta.get("name") or self.name
+        self.minzoom = int(meta.get("minzoom") or 0)
+        self.maxzoom = int(meta.get("maxzoom") or REGION_ZMAX)
+        try:
+            b = tuple(float(v) for v in (meta.get("bounds") or "").split(","))
+            self.bounds = b if len(b) == 4 else None
+        except ValueError:
+            self.bounds = None
+        self.size = os.path.getsize(path)
+        self.ctype = PACK_FORMATS[self.format]
+
+    def _conn(self):
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            if self.closed:
+                raise sqlite3.ProgrammingError("pack closed")
+            uri = "file:" + os.path.abspath(self.path).replace("\\", "/") + "?mode=ro"
+            c = sqlite3.connect(uri, uri=True, timeout=5, check_same_thread=False)
+            self._local.conn = c
+            with self._lock:
+                self._conns.append(c)
+        return c
+
+    def covers(self, z, x, y):
+        if z < self.minzoom or z > self.maxzoom:
+            return False
+        if self.bounds is None:
+            return True
+        x0, y0, x1, y1 = bbox_tiles(self.bounds, z)
+        return x0 <= x <= x1 and y0 <= y <= y1
+
+    def get(self, z, x, y):
+        """(data, ctype, enc) or None. MBTiles rows are TMS (y counted from the south)."""
+        if self.closed or not self.covers(z, x, y):
+            return None
+        try:
+            row = self._conn().execute(
+                "SELECT tile_data FROM tiles WHERE zoom_level = ? AND tile_column = ? AND tile_row = ?",
+                (z, x, (2 ** z) - 1 - y)).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None or not row[0]:
+            return None
+        data = bytes(row[0])
+        return data, self.ctype, "gzip" if data[:2] == b"\x1f\x8b" else None
+
+    def info(self):
+        return {"name": self.name, "title": self.title, "source": self.source, "format": self.format,
+                "minzoom": self.minzoom, "maxzoom": self.maxzoom, "bounds": self.bounds, "bytes": self.size,
+                "path": self.path}
+
+    def close(self):
+        self.closed = True
+        with self._lock:
+            conns, self._conns = self._conns, []
+        for c in conns:
+            try:
+                c.close()
+            except sqlite3.Error:
+                pass
+
+
+class PackManager:
+    """Installed region packs (paths.MAP_PACKS_DIR/*.mbtiles). Lookups read an immutable tuple
+    (no lock on the tile path); scan / install / remove swap it."""
+
+    def __init__(self, directory=None):
+        self.dir = directory or packs_dir()
+        self._packs = ()                    # RegionPack, deepest maxzoom first
+        self._lock = threading.Lock()
+        self.errors = {}                    # file name -> why it was skipped
+        self.ready = threading.Event()
+        self.hits = 0
+
+    def scan(self):
+        """Opens every pack (reads its metadata). Worker thread only, never the GUI thread."""
+        try:
+            names = sorted(n for n in os.listdir(self.dir) if n.lower().endswith(PACK_SUFFIX))
+        except OSError:
+            names = []
+        with self._lock:
+            old = {p.path: p for p in self._packs}
+        found, errors = [], {}
+        for n in names:
+            path = os.path.join(self.dir, n)
+            if path in old and os.path.getsize(path) == old[path].size:
+                found.append(old.pop(path))
+                continue
+            try:
+                found.append(RegionPack(path))
+            except (sqlite3.Error, ValueError, OSError) as e:
+                errors[n] = str(e)
+        for p in old.values():
+            p.close()
+        found.sort(key=lambda p: -p.maxzoom)
+        with self._lock:
+            self._packs = tuple(found)
+            self.errors = errors
+        self.ready.set()
+        return self.list()
+
+    def scan_async(self):
+        threading.Thread(target=self.scan, name="tile-packs-scan", daemon=True).start()
+
+    def list(self):
+        return [p.info() for p in self._packs]
+
+    def total_bytes(self):
+        return sum(p.size for p in self._packs)
+
+    def lookup(self, key):
+        packs = self._packs
+        if not packs:
+            return None
+        parsed = parse_key(key)
+        if parsed is None:
+            return None
+        sid, z, x, y = parsed
+        for p in packs:
+            if p.source == sid:
+                got = p.get(z, x, y)
+                if got is not None:
+                    self.hits += 1
+                    return got
+        return None
+
+    def has(self, key):
+        return self.lookup(key) is not None
+
+    def install(self, src_path):
+        """Validates an .mbtiles file and copies it into the packs folder (worker thread).
+        -> pack info; ValueError when the file is not a usable pack."""
+        try:
+            probe = RegionPack(src_path)
+        except sqlite3.Error as e:
+            raise ValueError(f"not an MBTiles file: {e}") from e
+        probe.close()
+        os.makedirs(self.dir, exist_ok=True)
+        base = re.sub(r"[^\w.-]+", "_", os.path.splitext(os.path.basename(src_path))[0]) or "pack"
+        dest = os.path.join(self.dir, base + PACK_SUFFIX)
+        if os.path.normcase(os.path.abspath(dest)) != os.path.normcase(os.path.abspath(src_path)):
+            tmp = dest + ".part"
+            shutil.copyfile(src_path, tmp)
+            self.remove(base)               # an older copy of the same pack
+            os.replace(tmp, dest)
+        self.scan()
+        return next((p for p in self.list() if p["name"] == base), None)
+
+    def remove(self, name):
+        """Deletes an installed pack (its connections close first: Windows locks open files)."""
+        with self._lock:
+            gone = [p for p in self._packs if p.name == name]
+            self._packs = tuple(p for p in self._packs if p.name != name)
+        for p in gone:
+            p.close()
+        path = os.path.join(self.dir, name + PACK_SUFFIX)
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+        return bool(gone)
+
+    def close(self):
+        with self._lock:
+            packs, self._packs = self._packs, ()
+        for p in packs:
+            p.close()
+
+
+def write_pack(path, source, fmt, tiles, title="", bounds=None, minzoom=None, maxzoom=None, should_stop=None):
+    """Writes an MBTiles pack from an iterable of (z, x, y, data). -> tiles written. The zoom
+    range defaults to what was written. Stopped early (should_stop) or failed: no file is left."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".part"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    conn = sqlite3.connect(tmp)
+    n, zmin, zmax = 0, 99, -1
+    try:
+        conn.execute("CREATE TABLE metadata (name TEXT, value TEXT)")
+        conn.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
+        conn.execute("CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row)")
+        for z, x, y, data in tiles:
+            if should_stop is not None and should_stop():
+                raise InterruptedError("stopped")
+            conn.execute("INSERT OR REPLACE INTO tiles VALUES (?, ?, ?, ?)", (z, x, (2 ** z) - 1 - y, data))
+            n += 1
+            zmin, zmax = min(zmin, z), max(zmax, z)
+            if n % 500 == 0:
+                conn.commit()
+        meta = {"name": title or os.path.splitext(os.path.basename(path))[0], "format": fmt,
+                "kairos:source": source, "kairos:title": title, "type": "baselayer",
+                "minzoom": str(minzoom if minzoom is not None else (zmin if n else 0)),
+                "maxzoom": str(maxzoom if maxzoom is not None else (zmax if n else 0))}
+        if bounds:
+            meta["bounds"] = ",".join(f"{v:.5f}" for v in bounds)
+        conn.executemany("INSERT INTO metadata VALUES (?, ?)", list(meta.items()))
+        conn.commit()
+        conn.close()
+        os.replace(tmp, path)
+        return n
+    except BaseException:
+        conn.close()
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 class TileServer:
     """Místní HTTP server nad TileStore: http://127.0.0.1:<port>/<token>/<host>/<cesta>."""
 
-    def __init__(self, store, hosts=TILE_HOSTS, shards=SHARDS, online=True, redirect_misses=True):
+    def __init__(self, store, hosts=TILE_HOSTS, shards=SHARDS, online=True, redirect_misses=True, packs=None):
         self.store = store
+        self.packs = packs                  # PackManager or None (offline region packs)
+        # Sprint 3 item 3: callable -> False while background work must wait (the user is
+        # interacting: governor busy). urgent / film never wait.
+        self.background_gate = None
         self.hosts = frozenset(h.lower() for h in hosts)
         self.token = secrets.token_hex(8)
         self.online = online
@@ -434,6 +795,19 @@ class TileServer:
             self.warming["urgent"]["total"] += 1
             self._spawn()
 
+    def has_tile(self, key):
+        """Available without the network: fresh in the store or inside an installed pack."""
+        return self.store.has(key) or (self.packs is not None and self.packs.has(key))
+
+    def _pack_hit(self, key):
+        got = self.packs.lookup(key) if self.packs is not None else None
+        return (200, got[0], got[1], got[2], "pack") if got is not None else None
+
+    def kick(self):
+        """Background work may continue (the gate opened again): wake enough workers."""
+        with self._bake_lock:
+            self._spawn()
+
     def state(self):
         with self._bake_lock:
             queued = {p: len(q) for p, q in self._queues.items()}
@@ -441,7 +815,9 @@ class TileServer:
             warming = {p: dict(v) for p, v in self.warming.items()}
             threads = self._bake_threads
         return {"queued": queued, "film": film, "warming": warming, "threads": threads,
-                "store": self.store.stats(), "hot": self.store.hot_stats(), "ports": len(self.ports)}
+                "store": self.store.stats(), "hot": self.store.hot_stats(), "ports": len(self.ports),
+                "packs": len(self.packs.list()) if self.packs is not None else 0,
+                "pack_hits": self.packs.hits if self.packs is not None else 0}
 
     def route(self, key):
         """Co udělat s požadavkem mapy: ('serve', výsledek) nebo ('redirect', https adresa).
@@ -452,6 +828,9 @@ class TileServer:
         if row is not None and self.store.fresh(row, key):
             self.store.hits += 1
             return "serve", (200, row[0], row[1], row[2], "store")
+        hit = self._pack_hit(key)
+        if hit is not None:
+            return "serve", hit
         if row is not None and self.online:
             self.store.stale += 1
             self.persist_async(key)
@@ -470,21 +849,32 @@ class TileServer:
         for p in ("urgent", "film"):
             if self._queues[p]:
                 return p, self._queues[p].pop()
-        if self._queues["background"] and self._bg_active < BACKGROUND_THREADS:
+        gate = self.background_gate
+        if self._queues["background"] and self._bg_active < BACKGROUND_THREADS and (gate is None or gate()):
             self._bg_active += 1
             return "background", self._queues["background"].pop()
         return None
 
     def _bake_loop(self):
         while True:
+            parked = False
             with self._bake_lock:
                 job = self._next_job() if self._servers else None
                 if job is None:
-                    self._bake_threads -= 1
-                    return
+                    # background work held by the gate (the user is interacting) or by the
+                    # BACKGROUND_THREADS cap: up to that many workers wait for it instead of
+                    # exiting (nothing else would wake them when the user stops)
+                    if self._servers and self._queues["background"] and self._bake_threads <= BACKGROUND_THREADS:
+                        parked = True
+                    else:
+                        self._bake_threads -= 1
+                        return
+            if parked:
+                time.sleep(GATE_POLL_S)
+                continue
             prio, key = job
             try:
-                if not self.store.has(key):
+                if not self.has_tile(key):
                     self.resolve(key, lane="background" if prio == "background" else "bake")
             except Exception:
                 pass
@@ -512,6 +902,9 @@ class TileServer:
         if row is not None and self.store.fresh(row, key):
             self.store.hits += 1
             return 200, row[0], row[1], row[2], "store"
+        hit = self._pack_hit(key)
+        if hit is not None:
+            return hit
         # stejnou dlaždici chce přednačtení i mapa zároveň -> stáhnout jednou
         with self._inflight_lock:
             pending = self._inflight.get(key)
@@ -655,18 +1048,30 @@ _service = None
 _service_lock = threading.Lock()
 
 
+def _user_idle():
+    try:
+        import governor
+        return not governor.get().busy()
+    except Exception:                       # noqa: BLE001 – never block tiles on a broken gate
+        return True
+
+
 def start(budget_mb=DEFAULT_BUDGET_MB):
     """Jedna služba za běh aplikace. None, když ji nelze spustit (mapa pak jde přímo na servery)."""
     global _service
     with _service_lock:
         if _service is None:
             try:
-                _service = TileServer(TileStore(budget_mb=budget_mb))
+                packs = PackManager()
+                _service = TileServer(TileStore(budget_mb=budget_mb), packs=packs)
+                packs.scan_async()              # pack metadata is read off the calling thread
+                # Sprint 3 item 3: background warm-up waits while the user interacts
+                _service.background_gate = _user_idle
             except Exception as e:
                 print(f"[TileStore] úložiště dlaždic nelze spustit: {e}")
                 return None
         else:
-            _service.store.budget = int(budget_mb) * 1024 * 1024
+            _service.store.set_budget(budget_mb)
     return _service
 
 
@@ -681,3 +1086,5 @@ def stop():
     if srv is not None:
         srv.shutdown()
         srv.store.close()
+        if srv.packs is not None:
+            srv.packs.close()

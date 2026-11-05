@@ -82,6 +82,10 @@ WEB_CACHE_DIR = os.path.join(CACHE_ROOT, "web")
 # ZAHODITELNÉ: místní úložiště mapových dlaždic (SQLite, tile_store.py, config „tile_store_mb“).
 TILE_STORE_PATH = os.path.join(CACHE_ROOT, "tiles.sqlite")
 
+# Offline map region packs (MBTiles, tile_store.PackManager): downloaded or imported by the user,
+# re-downloadable, so they live with the cache (and move with it), outside the store budget.
+MAP_PACKS_DIR = os.path.join(CACHE_ROOT, "map_packs")
+
 # ZAHODITELNÉ: 3s klipy WebM pro karty Cesty (Live Photo, video; card_media.py).
 HIGHLIGHT_DIR = os.path.join(CACHE_ROOT, "highlights")
 
@@ -109,7 +113,7 @@ def use_legacy_layout():
     """Nouzový režim, když migrace do AppData selže: tento běh pracuje se starým rozložením
     (vše vedle aplikace), aby nevznikla prázdná knihovna v novém místě. Volat dřív, než si
     jiné moduly cesty převezmou (data_migration.ensure_ready na začátku startu)."""
-    global DATA_DIR, LOCAL_DIR, DB_PATH, CONFIG_PATH, CACHE_ROOT, DEFAULT_CACHE_ROOT, THUMB_DIR,         PREVIEW_DIR, PROXY_DIR, WEB_CACHE_DIR, TILE_STORE_PATH, HIGHLIGHT_DIR, FACE_DIR, BACKUP_DIR, VAULT_DIR
+    global DATA_DIR, LOCAL_DIR, DB_PATH, CONFIG_PATH, CACHE_ROOT, DEFAULT_CACHE_ROOT, THUMB_DIR,         PREVIEW_DIR, PROXY_DIR, WEB_CACHE_DIR, TILE_STORE_PATH, MAP_PACKS_DIR, HIGHLIGHT_DIR, FACE_DIR, BACKUP_DIR, VAULT_DIR
     DATA_DIR = LOCAL_DIR = LEGACY_DIR
     DB_PATH = os.path.join(DATA_DIR, "photos.db")
     CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
@@ -119,6 +123,7 @@ def use_legacy_layout():
     PROXY_DIR = os.path.join(CACHE_ROOT, "proxies")
     WEB_CACHE_DIR = os.path.join(CACHE_ROOT, "web")
     TILE_STORE_PATH = os.path.join(CACHE_ROOT, "tiles.sqlite")
+    MAP_PACKS_DIR = os.path.join(CACHE_ROOT, "map_packs")
     HIGHLIGHT_DIR = os.path.join(CACHE_ROOT, "highlights")
     FACE_DIR = os.path.join(CACHE_ROOT, "faces")
     BACKUP_DIR = os.path.join(DATA_DIR, "backups")

@@ -145,6 +145,7 @@ import ambient_music
 import threading
 import card_media
 import tile_store
+import map_precache
 import map_host
 import route_corridor
 import mood
@@ -2847,6 +2848,7 @@ class AISearchWorker(QThread):
 
 
 REVEAL_FALLBACK_MS = 900      # direct launch: the window appears by then even if tiles are still decoding
+PHOTO_PRECACHE_DELAY_MS = 90000   # Sprint 3 item 3: photo places offline, once start-up has settled
 DEFERRED_SERVICES_MS = 500     # pillar 5: daemons / side pages start this long after the first grid frame
 DEFERRED_FALLBACK_MS = 2500    # … or after this, when the window opened somewhere without a grid frame
 MAP_PREBUILD_DELAY_MS = 1500   # map host (WebView2) built in the background after the deferred tick
@@ -4446,6 +4448,33 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(VIEWER_PREWARM_DELAY_MS, self._prewarm_viewer)
         QTimer.singleShot(SMART_IMPORT_DELAY_MS, self._smart_import_check)
         QTimer.singleShot(MAP_PREBUILD_DELAY_MS, self._ensure_map_view)     # map instant on first visit
+        QTimer.singleShot(PHOTO_PRECACHE_DELAY_MS, self._start_photo_precache)
+
+    def precache_options(self):
+        """Arguments for map_precache.MapJobs.start_precache from this window (GUI thread)."""
+        try:
+            dpr = float(self.devicePixelRatioF()) or 1.0
+        except RuntimeError:
+            dpr = 1.0
+        layer = self.config.get("map_layer", DEFAULT_MAP_LAYER)
+        try:
+            hidpi = bool(self.perf.for_map().get("map_hidpi_raster"))
+        except Exception:
+            hidpi = False
+        return {"layer": LEGACY_MAP_LAYERS.get(layer, layer), "dpr": dpr, "hidpi_raster": hidpi,
+                "budget_mb": int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)),
+                "policy": self.config.get("battery_policy", power.DEFAULT_POLICY)}
+
+    def _start_photo_precache(self, manual=False):
+        """Sprint 3 item 3: the library's photo places into the tile store (map_precache).
+        Automatic runs only with "map_prefetch" on; the job itself waits while the user
+        interacts, on a metered connection and (automatic runs) on battery. Nothing here
+        touches the DB or the network: both happen in the job's threads."""
+        if getattr(self, "_shutting_down", False):
+            return False
+        if not manual and not self.config.get("map_prefetch", True):
+            return False
+        return map_precache.jobs().start_precache(manual=manual, **self.precache_options())
 
     def _nav_back(self):
         if self.nav.current() is self._viewer and self._viewer is not None:
@@ -6095,8 +6124,6 @@ class MainWindow(QMainWindow):
         self._sync_accent()
         self._sync_map_active()
         self._refresh_map()
-        if self._map_warm_allowed():         # the library's photo places, z10-15, in the background
-            page.runJavaScript("window.warmPhotoHotspots && window.warmPhotoHotspots();")
         place, self._pending_place = getattr(self, "_pending_place", None), None
         if place is not None:               # mini-map click before the map page had loaded
             page.runJavaScript(f"window.focusPlace && window.focusPlace({place[0]!r}, {place[1]!r});")
@@ -6478,6 +6505,7 @@ class MainWindow(QMainWindow):
             save_config(self.config)
         except Exception as e:
             print(f"[Map] Volbu podkladu se nepodařilo uložit: {e}")
+        self._start_photo_precache()          # photo places for the new base layer (map_precache)
 
     def _refresh_shown_map(self):
         """Deferred refresh of a tab switch: only while the map is still what the user sees."""
@@ -7813,6 +7841,7 @@ class MainWindow(QMainWindow):
         old_precise = self._precise_wanted()
         old_color = self.config.get("color_output", "system")
         old_language = self.config.get("language", i18n.SYSTEM)
+        old_prefetch = bool(self.config.get("map_prefetch", True))
         dlg = SettingsDialog(self, as_sheet=True)     # Founder audit: list v okně, ne okno Win32
         accepted = dlg.exec()
         if dlg.trash_emptied:                  # proběhlo i při Zrušit – knihovna musí sedět s DB
@@ -7861,6 +7890,11 @@ class MainWindow(QMainWindow):
             self._ai_daemon.stop()
         # snížený limit kopií videí platí hned (jen mazání nejdéle nepoužitých souborů)
         video_proxy.enforce_budget(int(self.config.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB)))
+        srv = tile_store.service()            # Sprint 3 item 3: map cache budget applies now
+        if srv is not None:
+            srv.store.set_budget(int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
+        if self.config.get("map_prefetch", True) and not old_prefetch:
+            self._start_photo_precache()      # switched on: keep photo places offline now
         self._apply_precise_setting(old_precise)     # Sprint 4.0: přesné hledání zapnuto / vypnuto
         self._start_ai_daemon()
 
@@ -7949,6 +7983,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._shutting_down = True           # démon se už znovu nespustí (_start_ai_daemon)
+        map_precache.jobs().cancel()         # offline map job: workers stop before the store does
         self.locked.shutdown()               # klíč Skrytých pryč z paměti, štít dolů
         self.drop_router.detach()            # filtr tažení je na celé aplikaci
         self.folder_watcher.set_roots([])

@@ -32,6 +32,7 @@ paths.VAULT_DIR = os.path.join(_preview_tmp, "vault")                # složka S
 # importu, proto se nastavují tady, před importem testů (a pro jistotu i v už načtených).
 paths.CACHE_ROOT = paths.DEFAULT_CACHE_ROOT = os.path.join(_preview_tmp, "cache")
 paths.THUMB_DIR = os.path.join(paths.CACHE_ROOT, "thumbnails")
+paths.MAP_PACKS_DIR = os.path.join(paths.CACHE_ROOT, "map_packs")   # offline region packs
 paths.FACE_DIR = os.path.join(_preview_tmp, "faces")
 for _d in (paths.THUMB_DIR, paths.FACE_DIR):
     os.makedirs(_d, exist_ok=True)

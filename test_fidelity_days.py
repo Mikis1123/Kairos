@@ -465,13 +465,5 @@ class TestFidelityPage(unittest.TestCase):
         self.assertEqual(self.js("MAX_IMAGE_REQUESTS"), 16)
         self.assertEqual(self.js("map._maxTileCacheZoomLevels || TILE_CACHE_ZOOM_LEVELS"), 7)
 
-    def test_hotspots_wait_for_markers(self):
-        self.js("setMarkers([]); 0")
-        self.assertEqual(self.js("hotspotKeys().length"), 0)
-        self.js("setMarkers([{id: 1, lat: 49.25, lon: 13.40, thumb: ''}, {id: 2, lat: 49.251, lon: 13.401, thumb: ''}]); 0")
-        self.assertGreater(self.js("hotspotKeys().length"), 0)
-        self.js("setMarkers([]); clearTimeout(hotspotTimer); hotspotsWanted = false; 0")
-
-
 if __name__ == "__main__":
     unittest.main()

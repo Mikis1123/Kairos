@@ -42,6 +42,8 @@ DEFAULT_CONFIG = {
     "proxy_cache_mb": 4096,
     # Cesta 3.0 (C7e) – místní úložiště mapových dlaždic (tile_store.py), limit na disku v MB
     "tile_store_mb": 1024,
+    # Sprint 3 item 3: photo places kept offline in the background (map_precache)
+    "map_prefetch": True,
     # Cesta 3.0 (C6) – hudební podkres Cesty (ambient_music.py); volitelný, výchozí vypnutý
     "cesta_music": False,
     # Sprint 4.0 – přesné hledání: SigLIP 2 (stáhne se ~1,5 GB, přeindexuje na pozadí); výchozí CLIP

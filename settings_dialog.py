@@ -17,9 +17,9 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QFileDialog, QSlider, QMessageBox,
     QFrame, QTabWidget, QWidget, QListWidget, QListWidgetItem,
-    QCheckBox, QComboBox, QScrollArea
+    QCheckBox, QComboBox, QScrollArea, QProgressBar
 )
-from PyQt6.QtCore import QEventLoop, Qt
+from PyQt6.QtCore import QEventLoop, Qt, QTimer
 from ui_controls import AccentPicker, InfoDot, KButton, SegmentedControl, ToggleSwitch, guard_wheel
 from config import load_config, save_config, DEFAULT_CONFIG
 from paths import THUMB_DIR, FACE_DIR
@@ -34,12 +34,19 @@ import tokens
 import ambient_music
 import brand
 import i18n
+import map_precache
+import tile_store
 
 THEME_CHOICES = (("dark", N_("theme-dark")), ("light", N_("theme-light")), ("system", N_("theme-system")))
 PREVIEW_MB_RANGE = (512, 8192)
 PREVIEW_MB_STEP = 256
 PROXY_MB_RANGE = (1024, 32768)
 PROXY_MB_STEP = 512
+# Sprint 3 item 3: offline map (map tile store budget, config "tile_store_mb")
+MAP_MB_RANGE = (256, 8192)
+MAP_MB_STEP = 256
+MAP_JOB_POLL_MS = 400
+MAP_REGIONS = ("cz", "sk", "at", "de", "pl", "ch", "hu", "si", "hr")
 # Gate 0: AI na pozadí při napájení z baterie (power.py)
 BATTERY_CHOICES = [(N_("battery-throttle"), "throttle"), (N_("battery-pause"), "pause"), (N_("battery-full"), "full")]
 PERF_CHOICES = [(N_("perf-auto"), "auto"), (N_("perf-high"), "high"), (N_("perf-standard"), "standard"),
@@ -161,6 +168,7 @@ class SettingsDialog(QDialog):
         self.trash_emptied = False
         self.recluster_requested = False
         self.factory_reset_done = False
+        self.map_cache_cleared = False      # Předvolby › Mapa offline › Vymazat
         self.guide_requested = False
         self.hidden_requested = False       # Předvolby › Skryté › Otevřít
         self._stats = self._read_library_stats()
@@ -187,6 +195,8 @@ class SettingsDialog(QDialog):
     def done(self, r):
         """V listu se karta nesmí schovat hned (prázdná karta při odjezdu): výsledek a signály
         hned, odjezd listu animovaně; list pak smaže i tento widget."""
+        if getattr(self, "_map_timer", None) is not None:
+            self._map_timer.stop()          # the offline-map job keeps running; only polling stops
         if self._sheet is None:
             return super().done(r)
         if self._sheet_done:
@@ -576,6 +586,8 @@ class SettingsDialog(QDialog):
         self._row(g, stacked=self.lbl_cache_dir)
         self._update_cache_dir_label()
 
+        self._build_map_offline_group(layout)
+
         # Fáze 1: adaptivní škálování a proxy videí (rozhodnutí C: limit úložiště v Předvolbách)
         g = self._group(layout, tr("settings-perf-video"))
         tier = self.config.get("performance_tier", "auto")
@@ -637,6 +649,241 @@ class SettingsDialog(QDialog):
         self._update_factory_label()
         layout.addStretch()
         return tab
+
+    # ── Mapa offline (Sprint 3 item 3) ──
+    def _build_map_offline_group(self, layout):
+        """Map cache usage, its limit, photo places offline, region packs, clearing. Everything
+        slow (SQLite, network, file copies) runs in map_precache's job thread; this page only
+        reads counters (map_precache.usage, MapJobs.state) from a timer."""
+        g = self._group(layout, tr("settings-map-offline"), info=tr("settings-map-offline-hint"))
+        self.lbl_map_usage = QLabel()
+        self.bar_map_usage = QProgressBar()
+        self.bar_map_usage.setObjectName("usageBar")
+        self.bar_map_usage.setRange(0, 1000)
+        self.bar_map_usage.setTextVisible(False)
+        self.bar_map_usage.setFixedHeight(6)
+        self._row(g, tr("settings-map-cache"), value=self.lbl_map_usage, stacked=self.bar_map_usage)
+
+        self.lbl_map_mb = QLabel()
+        self.slider_map_mb = QSlider(Qt.Orientation.Horizontal)
+        self.slider_map_mb.setRange(*MAP_MB_RANGE)
+        self.slider_map_mb.setSingleStep(MAP_MB_STEP)
+        self.slider_map_mb.setPageStep(MAP_MB_STEP * 4)
+        self.slider_map_mb.setValue(int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
+        self.slider_map_mb.valueChanged.connect(self._update_map_usage)
+        self._row(g, tr("settings-map-limit"), value=self.lbl_map_mb, stacked=self.slider_map_mb)
+
+        self.chk_map_prefetch = ToggleSwitch(tr("settings-map-auto"))
+        self.chk_map_prefetch.setChecked(bool(self.config.get("map_prefetch", True)))
+        self.chk_map_prefetch.set_info(tr("settings-map-auto-hint"))
+        self._row(g, stacked=self.chk_map_prefetch)
+
+        self.btn_map_precache = KButton(tr("settings-map-precache"), compact=True)
+        self.btn_map_precache.clicked.connect(self.toggle_map_precache)
+        self._row(g, tr("settings-map-precache-row"), self.btn_map_precache)
+        self.lbl_map_job = _hint("")
+        self._row(g, stacked=self.lbl_map_job)
+
+        self.combo_map_region = QComboBox()
+        for rid in MAP_REGIONS:
+            self.combo_map_region.addItem(tr(f"offline-region-{rid}"), rid)
+        self.combo_map_region.currentIndexChanged.connect(self._update_region_estimate)
+        self.btn_map_region = KButton(tr("settings-map-region-download"), compact=True)
+        self.btn_map_region.clicked.connect(self.download_region_pack)
+        line = QHBoxLayout()
+        line.addWidget(self.combo_map_region, 1)
+        line.addWidget(self.btn_map_region)
+        self._row(g, tr("settings-map-regions"), info=tr("settings-map-regions-hint"), stacked=line)
+        self.lbl_map_region = _hint("")
+        self._row(g, stacked=self.lbl_map_region)
+
+        self.list_map_packs = QListWidget()
+        self.list_map_packs.setMaximumHeight(84)
+        self.btn_map_import = KButton(tr("settings-map-import"), compact=True)
+        self.btn_map_import.clicked.connect(self.import_map_pack)
+        self.btn_map_remove = KButton(tr("settings-map-remove"), compact=True)
+        self.btn_map_remove.clicked.connect(self.remove_map_pack)
+        packs_row = QHBoxLayout()
+        packs_row.addWidget(self.btn_map_import)
+        packs_row.addWidget(self.btn_map_remove)
+        packs_row.addStretch()
+        self._row(g, tr("settings-map-packs"), stacked=self.list_map_packs)
+        self._row(g, stacked=packs_row)
+
+        self.btn_map_clear = KButton(tr("settings-map-clear"), compact=True)
+        self.btn_map_clear.setObjectName("btnCleanCache")
+        self.btn_map_clear.clicked.connect(self.clear_map_cache)
+        self._row(g, tr("settings-map-clear-row"), self.btn_map_clear)
+
+        self._map_packs_shown = None
+        self._map_job_seen = None           # job "started" stamp whose finish was handled
+        self._map_timer = QTimer(self)
+        self._map_timer.setInterval(MAP_JOB_POLL_MS)
+        self._map_timer.timeout.connect(self.refresh_map_offline)
+        self._map_timer.start()
+        self._update_region_estimate()
+        self.refresh_map_offline()
+
+    def _map_budget_mb(self):
+        return int(round(self.slider_map_mb.value() / MAP_MB_STEP) * MAP_MB_STEP)
+
+    def _update_map_usage(self, *_):
+        u = map_precache.usage()
+        budget = self._map_budget_mb() * 1024 * 1024
+        self.lbl_map_mb.setText(tr("unit-size", value=fmt_number(budget / 2 ** 30, 2), unit="GB"))
+        self.lbl_map_usage.setText(tr("settings-map-usage", used=fmt_number(u["bytes"] / 2 ** 20, 0),
+                                      limit=fmt_number(budget / 2 ** 30, 1)))
+        self.bar_map_usage.setValue(int(min(1.0, u["bytes"] / max(1, budget)) * 1000))
+        return u
+
+    def _installed_packs(self, u):
+        """Pack list from the running store (metadata read off-thread), else names and sizes
+        from the folder (a directory listing, no SQLite)."""
+        if u.get("live"):
+            return [(p["name"], p["title"], p["bytes"]) for p in u["packs"]]
+        out = []
+        try:
+            for n in sorted(os.listdir(tile_store.packs_dir())):
+                if n.lower().endswith(tile_store.PACK_SUFFIX):
+                    name = os.path.splitext(n)[0]
+                    out.append((name, name, os.path.getsize(os.path.join(tile_store.packs_dir(), n))))
+        except OSError:
+            pass
+        return out
+
+    def refresh_map_offline(self):
+        u = self._update_map_usage()
+        packs = self._installed_packs(u)
+        if packs != self._map_packs_shown:
+            self._map_packs_shown = packs
+            self.list_map_packs.clear()
+            for name, title, size in packs:
+                item = QListWidgetItem(tr("settings-map-pack-item", name=title,
+                                          mb=fmt_number(size / 2 ** 20, 0)))
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                self.list_map_packs.addItem(item)
+            if not packs:
+                item = QListWidgetItem(tr("settings-map-packs-none"))
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.list_map_packs.addItem(item)
+        st = map_precache.jobs().state()
+        busy = map_precache.jobs().running()
+        self.lbl_map_job.setText(self._map_job_text(st))
+        self.lbl_map_job.setVisible(bool(self.lbl_map_job.text()))
+        precaching = busy and st.get("kind") == "precache"
+        self.btn_map_precache.setText(tr("settings-map-stop") if precaching else tr("settings-map-precache"))
+        self.btn_map_precache.setEnabled(precaching or not busy)
+        regioning = busy and st.get("kind") == "region"
+        self.btn_map_region.setText(tr("settings-map-stop") if regioning else tr("settings-map-region-download"))
+        self.btn_map_region.setEnabled(regioning or not busy)
+        for b in (self.btn_map_import, self.btn_map_clear):
+            b.setEnabled(not busy)
+        self.btn_map_remove.setEnabled(not busy and bool(packs))
+        stamp = st.get("started")
+        if not busy and stamp and stamp != self._map_job_seen and st.get("phase") in map_precache.FINAL:
+            self._map_job_seen = stamp
+            if st.get("kind") == "clear" and st.get("phase") == map_precache.DONE:
+                self.map_cache_cleared = True
+
+    @staticmethod
+    def _map_job_text(st):
+        kind, phase = st.get("kind"), st.get("phase")
+        if not kind or phase == map_precache.IDLE:
+            return ""
+        mb = fmt_number((st.get("bytes") or 0) / 2 ** 20, 0)
+        if kind == "clear":
+            return tr("settings-map-clearing") if phase not in map_precache.FINAL else (
+                tr("settings-map-cleared") if phase == map_precache.DONE else tr("settings-map-job-failed", reason=st.get("reason", "")))
+        if kind == "import":
+            if phase == map_precache.DONE:
+                return tr("settings-map-imported", name=st.get("pack", ""))
+            if phase == map_precache.FAILED:
+                return tr("settings-map-import-failed", reason=st.get("reason", ""))
+            return tr("settings-map-importing")
+        if phase == map_precache.PREPARING:
+            return tr("settings-map-preparing")
+        if phase == map_precache.WAITING:
+            return tr({"busy": "settings-map-wait-busy", "metered": "settings-map-wait-metered",
+                       "battery": "settings-map-wait-battery"}.get(st.get("reason"), "settings-map-wait-busy"))
+        done = (st.get("done") or 0) + (st.get("skipped") or 0) + (st.get("failed") or 0)
+        if phase == map_precache.RUNNING:
+            return tr("settings-map-progress", done=fmt_number(done, 0), total=fmt_number(st.get("total") or 0, 0), mb=mb)
+        if phase == map_precache.DONE:
+            if kind == "region":
+                return tr("settings-map-region-done", mb=mb)
+            return tr("settings-map-done", count=st.get("done") or 0, mb=mb, skipped=st.get("skipped") or 0)
+        return tr({map_precache.OFFLINE: "settings-map-offline-now", map_precache.BUDGET: "settings-map-budget-full",
+                   map_precache.CANCELLED: "settings-map-stopped"}.get(phase, "settings-map-job-failed"),
+                  reason=st.get("reason", ""))
+
+    def _precache_options(self):
+        owner = self.parentWidget()
+        opts = owner.precache_options() if owner is not None and hasattr(owner, "precache_options") else {
+            "layer": self.config.get("map_layer", "standard"), "dpr": float(self.devicePixelRatioF() or 1.0),
+            "hidpi_raster": False, "policy": self.config.get("battery_policy", power.DEFAULT_POLICY)}
+        opts["budget_mb"] = self._map_budget_mb()
+        return opts
+
+    def toggle_map_precache(self):
+        mj = map_precache.jobs()
+        if mj.running():
+            mj.cancel()
+        else:
+            mj.start_precache(manual=True, **self._precache_options())
+        self.refresh_map_offline()
+
+    def _update_region_estimate(self, *_):
+        rid = self.combo_map_region.currentData()
+        tiles, size = tile_store.estimate_region(tile_store.REGIONS[rid]) if rid in tile_store.REGIONS else (0, 0)
+        self.lbl_map_region.setText(tr("settings-map-region-estimate", tiles=fmt_number(tiles, 0),
+                                       mb=fmt_number(size / 2 ** 20, 0)))
+
+    def download_region_pack(self):
+        mj = map_precache.jobs()
+        if mj.running():
+            mj.cancel()
+        else:
+            rid = self.combo_map_region.currentData()
+            mj.start_region(rid, title=self.combo_map_region.currentText(), budget_mb=self._map_budget_mb())
+        self.refresh_map_offline()
+
+    def import_map_pack(self, path=None):
+        if not path or isinstance(path, bool):          # clicked(bool) is not a path
+            path, _ = QFileDialog.getOpenFileName(self, tr("settings-map-import"), "", tr("settings-map-import-filter"))
+        if not path:
+            return False
+        ok = map_precache.jobs().start_import(path, budget_mb=self._map_budget_mb())
+        self.refresh_map_offline()
+        return ok
+
+    def remove_map_pack(self):
+        item = self.list_map_packs.currentItem()
+        name = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if not name:
+            return False
+        ok, _ = self._confirm(tr("settings-map-remove-q"), tr("settings-map-remove-body", name=item.text()),
+                              action_text=tr("settings-map-remove"))
+        if not ok:
+            return False
+        try:
+            map_precache.jobs().remove_pack(name)
+        except OSError as e:
+            self._notify(str(e), ok=False)
+            return False
+        self._map_packs_shown = None
+        self.refresh_map_offline()
+        return True
+
+    def clear_map_cache(self):
+        u = map_precache.usage()
+        ok, _ = self._confirm(tr("settings-map-clear-q"),
+                              tr("settings-map-clear-body", mb=fmt_number(u["bytes"] / 2 ** 20, 0)),
+                              action_text=tr("settings-map-clear"))
+        if not ok:
+            return False
+        started = map_precache.jobs().start_clear(budget_mb=self._map_budget_mb())
+        self.refresh_map_offline()
+        return started
 
     def create_about_tab(self):
         tab = QWidget()
@@ -916,6 +1163,8 @@ class SettingsDialog(QDialog):
         self.slider_lru.setValue(int(DEFAULT_CONFIG.get("thumbnail_lru_capacity", 1200)))
         self.slider_preview_mb.setValue(int(DEFAULT_CONFIG.get("preview_cache_mb", preview_cache.DEFAULT_BUDGET_MB)))
         self.slider_proxy_mb.setValue(int(DEFAULT_CONFIG.get("proxy_cache_mb", video_proxy.DEFAULT_BUDGET_MB)))
+        self.slider_map_mb.setValue(int(DEFAULT_CONFIG.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
+        self.chk_map_prefetch.setChecked(DEFAULT_CONFIG.get("map_prefetch", True))
         self.perf_switch.set_current(DEFAULT_CONFIG.get("performance_tier", "auto"))
         self.battery_switch.set_current(DEFAULT_CONFIG.get("battery_policy", power.DEFAULT_POLICY))
         self.theme_switch.set_current(DEFAULT_CONFIG.get("theme", "dark"))
@@ -963,6 +1212,8 @@ class SettingsDialog(QDialog):
         self.config["thumbnail_lru_capacity"] = self.slider_lru.value()
         self.config["preview_cache_mb"] = int(round(self.slider_preview_mb.value() / PREVIEW_MB_STEP) * PREVIEW_MB_STEP)
         self.config["proxy_cache_mb"] = int(round(self.slider_proxy_mb.value() / PROXY_MB_STEP) * PROXY_MB_STEP)
+        self.config["tile_store_mb"] = self._map_budget_mb()
+        self.config["map_prefetch"] = self.chk_map_prefetch.isChecked()
         self.config["performance_tier"] = self.perf_switch.current_key() or "auto"
         self.config["battery_policy"] = self.battery_switch.current_key() or power.DEFAULT_POLICY
         if self._pending_cache_dir is not None:

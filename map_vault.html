@@ -1099,7 +1099,6 @@
       } catch (e) { /* styl se právě vyměnil */ }
       swap.timer = setTimeout(function () { if (baseSwap === swap) finishBaseSwap(); }, ms + 40);
     })();
-    rewarmHotspots();
     map.triggerRepaint();
   }
   window.getBaseSwapState = function () {
@@ -1299,7 +1298,6 @@
     syncTerrain();
     addPinLayers();
     render();
-    rewarmHotspots();
     if (journey.active) { addRouteLayers(); journey.hidden = []; journey.faded = {}; reliefSpec = null; filmLook(true); }
   }
 
@@ -3572,7 +3570,6 @@
     document.getElementById('empty').style.display = markers.length ? 'none' : 'flex';
     initialView();
     render();
-    rewarmHotspots();
     return markers.length;
   };
   window.getMarkerCount = function () { return markers.length; };
@@ -5173,34 +5170,6 @@
   }
   function warmView(opts) { return warmPost(warmViewKeys(opts), 'urgent'); }
   window.warmViewKeys = warmViewKeys;
-  // The library's photo places: the busiest z12 cells, z10-15, background queue. The app asks
-  // for it once the markers are in, and again after a base-layer change (new sources).
-  var HOTSPOT_CELLS = 120, HOTSPOT_KEYS = 5000, hotspotsWanted = false, hotspotTimer = 0;
-  function hotspotKeys(limit) {
-    if (!markers.length) return [];
-    var cells = {};
-    markers.forEach(function (m) {
-      var k = lon2tile(m.lon, 12) + '/' + lat2tile(m.lat, 12);
-      var c = cells[k] || (cells[k] = { n: 0, lon: 0, lat: 0 });
-      c.n++; c.lon += m.lon; c.lat += m.lat;
-    });
-    var pts = Object.keys(cells).map(function (k) { return cells[k]; })
-      .sort(function (a, b) { return b.n - a.n; }).slice(0, HOTSPOT_CELLS)
-      .map(function (c) { return [c.lon / c.n, c.lat / c.n]; });
-    return regionTileKeys({ bbox: null, points: pts, zmin: 10, zmax: 15, max: limit || HOTSPOT_KEYS });
-  }
-  window.hotspotKeys = hotspotKeys;
-  window.warmPhotoHotspots = function (limit) {
-    hotspotsWanted = true;
-    clearTimeout(hotspotTimer);
-    if (!styleReady || !markers.length) return 0;          // style.load / setMarkers ask again
-    return warmPost(hotspotKeys(limit), 'background');
-  };
-  function rewarmHotspots() {          // new style or markers: queue again after the first paint
-    if (!hotspotsWanted) return;
-    clearTimeout(hotspotTimer);
-    hotspotTimer = setTimeout(function () { window.warmPhotoHotspots(); }, 4000);
-  }
   window.getWarmState = function () {
     return TILE_STORE ? fetch(TILE_STORE.bases[0] + '_state').then(function (r) { return r.json(); }) : null;
   };
