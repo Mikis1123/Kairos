@@ -427,7 +427,8 @@ class EventCard(QWidget):
             self._fade_anim.stop()
         if animate and not old[0].isNull():
             self._prev, self._fade = old, 0.0
-            anim = QVariantAnimation(self)
+            from frame_clock import VsyncAnimation
+            anim = VsyncAnimation(self)
             anim.setDuration(AMBIENT_FADE_MS)
             anim.setStartValue(0.0)
             anim.setEndValue(1.0)

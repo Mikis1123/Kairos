@@ -548,6 +548,8 @@ def hide_items(media_ids, vault=None):
         if thumb and os.path.exists(thumb):
             shred_file(thumb)
     purge_caches(sources)
+    import micro_previews                       # Sprint 2: the grid's micro previews too
+    micro_previews.purge_ids([r[0] for r in rows])
     for crop in res["crops"]:
         if crop and os.path.exists(crop):
             shred_file(crop)
@@ -615,6 +617,8 @@ def startup_sweep(vault=None):
         if os.path.exists(plain):
             removed += bool(shred_file(plain))
     removed += purge_caches([p for r in hidden for p in (r[1], r[2]) if p])
+    import micro_previews                       # Sprint 2: no micro preview of a hidden item
+    micro_previews.purge_ids(sorted(hidden_ids))
     for path in glob.glob(os.path.join(vault.thumb_dir, "*.kvt")):
         try:
             mid = int(os.path.splitext(os.path.basename(path))[0])

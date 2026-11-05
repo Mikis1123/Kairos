@@ -1093,7 +1093,8 @@ class ActivityStatus(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        from PyQt6.QtCore import QTimer, QVariantAnimation
+        from PyQt6.QtCore import QTimer
+        from frame_clock import VsyncAnimation
         self.setObjectName("activityStatus")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
@@ -1102,7 +1103,7 @@ class ActivityStatus(QWidget):
         self._alpha.finished.connect(self._after_fade)
         self._progress = motion.Tween(0.0, lambda v: self.update(), self)
         self._angle = 0.0
-        self._spin = QVariantAnimation(self)
+        self._spin = VsyncAnimation(self)
         self._spin.setStartValue(0.0)
         self._spin.setEndValue(360.0)
         self._spin.setDuration(1100)

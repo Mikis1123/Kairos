@@ -7,7 +7,7 @@ může plynule animovat (najetí, výběr) bez nového vykreslování SVG.
 import atexit
 from collections import OrderedDict
 
-from PyQt6.QtCore import QByteArray, QRectF, Qt
+from PyQt6.QtCore import QPointF, QByteArray, QRectF, Qt
 from PyQt6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPixmap
 
 try:
@@ -150,15 +150,38 @@ def pixmap(name, color, size=18, dpr=None):
 
 
 def paint(painter, name, rect, color):
-    """Nakreslí ikonu do obdélníku (logické souřadnice) v dané barvě."""
+    """Nakreslí ikonu do obdélníku (logické souřadnice) v dané barvě.
+
+    The icon is rasterised at device resolution; its top-left is snapped to the device pixel
+    grid, so it is copied 1:1. At 125 % / 150 % a fractional offset made the (smooth) painter
+    resample every icon, and stroke edges went soft."""
     rect = QRectF(rect)
     size = round(min(rect.width(), rect.height()))
-    painter.drawPixmap(rect.topLeft(), pixmap(name, color, size, painter.device().devicePixelRatioF()))
+    dpr = painter.device().devicePixelRatioF() if painter.device() is not None else 1.0
+    pm = pixmap(name, color, size, dpr)
+    t = painter.transform()
+    if t.isAffine() and t.m11() == 1.0 and t.m22() == 1.0 and t.m12() == 0.0 and t.m21() == 0.0:
+        # plain translation: snap the device position (translation + rect) to whole pixels
+        x = (round((rect.x() + t.dx()) * dpr) / dpr) - t.dx()
+        y = (round((rect.y() + t.dy()) * dpr) / dpr) - t.dy()
+        painter.drawPixmap(QPointF(x, y), pm)
+    else:
+        painter.drawPixmap(rect.topLeft(), pm)
 
 
 def qicon(name, color, size=18):
     """QIcon pro widgety, které ikonu kreslí samy (QLineEdit akce, QLabel …)."""
     icon = QIcon()
-    for dpr in (1.0, 2.0):
+    for dpr in _icon_dprs():
         icon.addPixmap(pixmap(name, color, size, dpr))
     return icon
+
+
+def _icon_dprs():
+    """1x, 2x and every connected screen's own scale (125 % / 150 % / 175 %): QIcon then has an
+    exact rasterisation instead of downsampling the 2x one (soft strokes)."""
+    out = {1.0, 2.0}
+    if QGuiApplication.instance() is not None:
+        for scr in QGuiApplication.screens():
+            out.add(round(float(scr.devicePixelRatio()), 3))
+    return sorted(out)

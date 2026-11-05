@@ -1007,6 +1007,10 @@ map-years-ago = { $years ->
    *[other] Hace { $years } años
 }
 map-multiple-places = Varios lugares
+map-show-photos = { $count ->
+    [one] Ver { $count } foto
+   *[other] Ver { $count } fotos
+}
 map-play-journey = Reproducir un viaje
 map-stop-n = Parada { $n }
 map-journey-end = Fin del viaje

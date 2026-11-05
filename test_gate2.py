@@ -240,11 +240,12 @@ class TestGridKineticScroll(WindowEnv):
         with mock.patch.object(model.thread_pool, "start", lambda w: started.append(w.tier)):
             model.data(model.index(150, 0), model.ThumbRole)
         self.assertEqual(started, [min(model.tier, main.THUMB_TIERS[0])])
-        with mock.patch.object(model.thread_pool, "clear") as clear:
-            self.g._on_scroll_speed(0.0)
+        item = int(model.records[150][0])
+        self.assertIn(item, model.decode_queue, "queued (Sprint 2: in the viewport queue)")
+        self.g._on_scroll_speed(0.0)
         self.assertFalse(model.fast)
-        clear.assert_called_once()
-        self.assertNotIn(int(model.records[150][0]), model.loading_ids,
+        self.assertNotIn(item, model.decode_queue, "dropped from the queue when the fling settles")
+        self.assertNotIn(item, model.loading_ids,
                          "queued decode for a row that flew past is cancelled")
 
     def test_fast_mode_skips_upgrades(self):

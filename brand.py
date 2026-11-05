@@ -361,7 +361,8 @@ class SparkPulse(QWidget):
 
     def __init__(self, host, mark, parent=None):
         super().__init__(parent or host)
-        from PyQt6.QtCore import QVariantAnimation, QEasingCurve
+        from PyQt6.QtCore import QEasingCurve
+        from frame_clock import VsyncAnimation as QVariantAnimation
         self._host, self._mark = host, mark
         self._a = self._b = QPointF()
         self._t = 0.0

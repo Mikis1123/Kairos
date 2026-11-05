@@ -62,3 +62,9 @@ power.get().override = power.PowerState()
 import i18n  # noqa: E402
 
 i18n.set_language("cs", retranslate=False)
+
+# 120 Hz pass: background library reads (bg_jobs) run inline in tests – deterministic, and a
+# read can never outlive the test's temporary database (the real-DB guard caught exactly that)
+import bg_jobs  # noqa: E402
+
+bg_jobs.SYNC = True

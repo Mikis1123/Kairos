@@ -462,7 +462,7 @@ class TestCanvasZoom(unittest.TestCase):
         self.zoom.zoom_to(self.zoom.one_to_one_w(), animate=False)
         self.assertAlmostEqual(self.zoom.percent(self.zoom.w), 100.0, delta=0.5)
         self.zoom.zoom_to(1e9, animate=False)
-        self.assertAlmostEqual(self.zoom.w, 8000 * 2.0 / dpr, delta=1)
+        self.assertAlmostEqual(self.zoom.w, 8000 * 4.0 / dpr, delta=1)       # 120 Hz pass: cap 400 %
 
     def test_pan_clamps_to_edges(self):
         self.zoom.zoom_to(self.zoom.one_to_one_w(), animate=False)

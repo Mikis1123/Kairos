@@ -1337,6 +1337,9 @@ class MediaViewerWidget(QWidget):
     def _on_edit_finished(self, adj, saved):
         self._crop_overlay.setVisible(False)
         self._edit_panel.setVisible(False)
+        # the keys come back to the viewer whatever held focus during the session (E, Space,
+        # arrows, Esc must keep working photo after photo)
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
         # only the panels this item wants (a photo must not get the video scrubber back)
         for panel in self._wanted_panels():
             panel.fade_in()

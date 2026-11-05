@@ -97,13 +97,19 @@
 
   /* Spring split / merge: moving pins as composited sprites over the canvas (runSpring) */
   #pinSprites { position: absolute; inset: 0; pointer-events: none; z-index: 4; overflow: hidden; contain: strict; }
-  .pin-sprite { position: absolute; left: 0; top: 0; transform-origin: 50% 50%; will-change: transform, opacity; }
+  .pin-sprite { position: absolute; left: 0; top: 0; transform-origin: 50% 100%; will-change: transform, opacity; }
 
   /* Náhledová karta při najetí na pin */
   #card { position: absolute; z-index: 12; pointer-events: none; width: 216px; padding: 8px; border-radius: 12px;
           background: rgba(36,36,38,0.92); opacity: 0; transform: translate(-50%, calc(-100% + 6px));
           transition: opacity .14s ease, transform .14s ease; }
-  #card.show { opacity: 1; transform: translate(-50%, -100%); }
+  #card.show { opacity: 1; transform: translate(-50%, -100%); pointer-events: auto; }
+  #card.below.show { transform: translate(-50%, 0); }
+  #card .t[data-open] { cursor: pointer; transition: filter .12s ease; }
+  #card .t[data-open]:hover { filter: brightness(1.15); }
+  .card-open { display: block; width: 100%; margin-top: 8px; padding: 6px 10px; border: none; border-radius: 8px;
+               background: var(--accent, #8B7CF6); color: #FFF; font: 600 12px "Segoe UI", sans-serif; cursor: pointer; }
+  .card-open:hover { filter: brightness(1.1); }
   .card-thumbs { display: grid; gap: 3px; border-radius: 8px; overflow: hidden; margin-bottom: 7px; }
   .card-thumbs.n1 { grid-template-columns: 1fr; height: 132px; }
   .card-thumbs.n2 { grid-template-columns: 1fr 1fr; height: 104px; }
@@ -326,7 +332,7 @@
 </div>
 <script>
   // ── Gate 1: texty stránky z katalogu aplikace (i18n.page_strings("map-")); angličtina = zdroj ──
-  var DEFAULT_STRINGS = /*I18N-DEFAULTS*/{"controls-a11y": "Journey playback", "count-photos": {"$plural": "count", "forms": {"*": "{count} photos", "one": "{count} photo", "other": "{count} photos"}, "lang": "en"}, "count-stops": {"$plural": "count", "forms": {"*": "{count} stops", "one": "{count} stop", "other": "{count} stops"}, "lang": "en"}, "day-n": "Day {n}", "day-one-place": "one place, plays within the whole trip", "days-a11y": "Days of the trip", "done": "Done", "empty-body": "Photos with GPS coordinates appear here after import.", "empty-title": "No Photos with a Location", "end-journey": "End Journey (Esc)", "globe": "Globe", "globe-tip": "Back to the globe (Esc)", "journey": "Journey", "journey-end": "End of the Journey", "journeys": "Journeys", "journeys-tip": "Play an event’s Journey", "layer-outdoor": "Outdoor", "layer-outdoor-tip": "Contours, hillshading, and marked trails", "layer-satellite": "Satellite", "layer-satellite-tip": "Aerial imagery (Esri) with vector roads and labels", "layer-standard": "Standard", "layer-standard-tip": "Light vector map with local place names (OpenFreeMap)", "layers-a11y": "Map style", "multiple-places": "Multiple places", "music-off": "Turn music off", "music-on": "Turn music on", "next-day": "Next day", "next-day-tip": "Next day (Page Down)", "next-stop": "Next stop", "nogl-body": "The globe is drawn with WebGL, which isn’t available here. Your photos and their locations are unaffected.", "nogl-title": "The Map Needs Graphics Acceleration", "pause": "Pause", "phase-dawn": "Dawn", "phase-day": "Day", "phase-dusk": "Dusk", "phase-golden": "Golden hour", "phase-night": "Night", "photos-on-map": {"$plural": "count", "forms": {"*": "{count} photos on the map", "one": "{count} photo on the map", "other": "{count} photos on the map"}, "lang": "en"}, "play": "Play", "play-journey": "Play a Journey", "prev-stop": "Previous stop", "replay": "Play Again", "seek-a11y": "Position in the Journey", "stop-n": "Stop {n}", "stops-a11y": "Journey stops", "tilt-off": "Top-down view (2D)", "tilt-on": "Tilt (3D)", "unavailable-body": "The map view couldn’t start ({e}). Your photos and their locations are unaffected.", "unavailable-title": "Map Unavailable", "whole-trip": "Whole trip", "years-ago": {"$plural": "years", "forms": {"*": "{years} years ago", "one": "A year ago", "other": "{years} years ago"}, "lang": "en"}}/*END*/;
+  var DEFAULT_STRINGS = /*I18N-DEFAULTS*/{"controls-a11y": "Journey playback", "count-photos": {"$plural": "count", "forms": {"*": "{count} photos", "one": "{count} photo", "other": "{count} photos"}, "lang": "en"}, "count-stops": {"$plural": "count", "forms": {"*": "{count} stops", "one": "{count} stop", "other": "{count} stops"}, "lang": "en"}, "day-n": "Day {n}", "day-one-place": "one place, plays within the whole trip", "days-a11y": "Days of the trip", "done": "Done", "empty-body": "Photos with GPS coordinates appear here after import.", "empty-title": "No Photos with a Location", "end-journey": "End Journey (Esc)", "globe": "Globe", "globe-tip": "Back to the globe (Esc)", "journey": "Journey", "journey-end": "End of the Journey", "journeys": "Journeys", "journeys-tip": "Play an event’s Journey", "layer-outdoor": "Outdoor", "layer-outdoor-tip": "Contours, hillshading, and marked trails", "layer-satellite": "Satellite", "layer-satellite-tip": "Aerial imagery (Esri) with vector roads and labels", "layer-standard": "Standard", "layer-standard-tip": "Light vector map with local place names (OpenFreeMap)", "layers-a11y": "Map style", "multiple-places": "Multiple places", "music-off": "Turn music off", "music-on": "Turn music on", "next-day": "Next day", "next-day-tip": "Next day (Page Down)", "next-stop": "Next stop", "nogl-body": "The globe is drawn with WebGL, which isn’t available here. Your photos and their locations are unaffected.", "nogl-title": "The Map Needs Graphics Acceleration", "pause": "Pause", "phase-dawn": "Dawn", "phase-day": "Day", "phase-dusk": "Dusk", "phase-golden": "Golden hour", "phase-night": "Night", "photos-on-map": {"$plural": "count", "forms": {"*": "{count} photos on the map", "one": "{count} photo on the map", "other": "{count} photos on the map"}, "lang": "en"}, "play": "Play", "play-journey": "Play a Journey", "prev-stop": "Previous stop", "replay": "Play Again", "seek-a11y": "Position in the Journey", "show-photos": {"$plural": "count", "forms": {"*": "Show {count} photos", "one": "Show {count} photo", "other": "Show {count} photos"}, "lang": "en"}, "stop-n": "Stop {n}", "stops-a11y": "Journey stops", "tilt-off": "Top-down view (2D)", "tilt-on": "Tilt (3D)", "unavailable-body": "The map view couldn’t start ({e}). Your photos and their locations are unaffected.", "unavailable-title": "Map Unavailable", "whole-trip": "Whole trip", "years-ago": {"$plural": "years", "forms": {"*": "{years} years ago", "one": "A year ago", "other": "{years} years ago"}, "lang": "en"}}/*END*/;
   var I18N = {};
   var LANG = 'en';
   function T(key, args) {
@@ -2464,7 +2470,8 @@
     var withThumb = items.filter(function (m) { return m.thumb; }).slice(0, MAX_CARD_THUMBS);
     var thumbs = withThumb.length
       ? '<div class="card-thumbs n' + withThumb.length + '">'
-        + withThumb.map(function (m) { return '<div class="t"' + bg(m.thumb) + '></div>'; }).join('')
+        + withThumb.map(function (m) {
+            return '<div class="t" data-open="' + (+m.id) + '"' + bg(m.thumb) + '></div>'; }).join('')
         + '</div>'
       : '';
     var cities = items.map(function (m) { return m.city; }).filter(Boolean);
@@ -2477,7 +2484,10 @@
       title = esc(items[0].name);
       sub = [items[0].city, fmtDate(items[0].date)].filter(Boolean).join(' · ');
     }
-    return thumbs + '<div class="card-title">' + title + '</div><div class="card-sub">' + esc(sub) + '</div>';
+    var open = items.length > 1
+      ? '<button type="button" class="card-open" data-open="all">' + esc(T('show-photos', { count: items.length })) + '</button>'
+      : '';
+    return thumbs + '<div class="card-title">' + title + '</div><div class="card-sub">' + esc(sub) + '</div>' + open;
   }
 
   // ── Shlukování: mřížka v pixelech Web Mercatoru aktuálního přiblížení ─────────
@@ -2501,9 +2511,9 @@
     };
   }
 
-  function computeClusters(zoom) {
-    var keep = viewFilter(), cells = {};
-    markers.forEach(function (m) {
+  function computeClusters(zoom, list) {
+    var keep = list ? null : viewFilter(), cells = {};
+    (list || markers).forEach(function (m) {
       if (keep && !keep(m)) return;
       var p = mercPx(m.lat, m.lon, zoom);
       var key = Math.floor(p.x / CELL_PX) + ':' + Math.floor(p.y / CELL_PX);
@@ -2544,6 +2554,13 @@
   // Piny se tak kreslí ve stejném snímku jako mapa – přesně na souřadnicích, na zadní straně
   // zeměkoule je MapLibre sám skryje.
   var PIN_D = 52, PIN_PAD = 14, PIN_BOX = PIN_D + 2 * PIN_PAD;
+  // Teardrop pin (2026-11-05): the photo disc sits on a tapered tail whose sharp tip IS the
+  // coordinate. The image is anchored at its bottom edge ('icon-anchor': 'bottom'), and the
+  // tip is drawn exactly on that edge, so on a tilted 3D camera the pin stands on the ground
+  // point instead of hovering around it like the old centred disc did.
+  var PIN_TAIL = 13;                                  // disc bottom -> tip (CSS px)
+  var PIN_LIFT = PIN_D / 2 + PIN_TAIL;               // tip -> disc centre
+  var PIN_H = PIN_PAD + PIN_D + PIN_TAIL;            // image height: the tip is the bottom row
   var PIN_DPR = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
   var PIN_IMAGE_BUDGET = 500;          // obrázků pinů v paměti GPU nejvýš tolik (nejstarší pryč)
   var pinImages = {};                  // klíč -> {data, used}; přežije setStyle (znovu addImage)
@@ -2558,45 +2575,58 @@
   }
   function disc(g, x, y, r) { g.beginPath(); g.arc(x, y, r, 0, 2 * Math.PI); g.fill(); }
 
+  // Disc + two tangents meeting at the tip (cx, tipY): one closed outline, so the white rim and
+  // its shadow run around the tail without a seam.
+  function teardropPath(g, cx, cy, r, tipY) {
+    var d = tipY - cy, th = Math.acos(Math.min(1, r / d));
+    var a1 = Math.PI / 2 - th, a2 = Math.PI / 2 + th;   // tangent points (canvas y grows down)
+    g.beginPath();
+    g.moveTo(cx, tipY);
+    g.lineTo(cx + r * Math.cos(a1), cy + r * Math.sin(a1));
+    g.arc(cx, cy, r, a1, a2, true);                     // the long way, over the top
+    g.closePath();
+  }
+
   function drawPin(img, count, hex) {
-    var s = PIN_DPR, box = Math.round(PIN_BOX * s);
+    var s = PIN_DPR;
     var cv = document.createElement('canvas');
-    cv.width = cv.height = box;
+    cv.width = Math.round(PIN_BOX * s);
+    cv.height = Math.round(PIN_H * s);
     var g = cv.getContext('2d');
     g.scale(s, s);
-    var c = PIN_BOX / 2, r = PIN_D / 2;
+    var x0 = PIN_BOX / 2, r = PIN_D / 2, c = PIN_PAD + r, tipY = PIN_H;
     if (count > 1) {                                   // balíček fotek za pinem
-      g.fillStyle = 'rgba(255,255,255,0.28)'; disc(g, c + 7, c + 7, r - 2);
-      g.fillStyle = 'rgba(255,255,255,0.55)'; disc(g, c + 3.5, c + 3.5, r - 1);
+      g.fillStyle = 'rgba(255,255,255,0.28)'; disc(g, x0 + 7, c + 4, r - 2);
+      g.fillStyle = 'rgba(255,255,255,0.55)'; disc(g, x0 + 3.5, c + 2, r - 1);
     }
     g.save();
-    g.shadowColor = 'rgba(0,0,0,0.55)'; g.shadowBlur = 10; g.shadowOffsetY = 3;
-    g.fillStyle = '#FFFFFF'; disc(g, c, c, r);
+    g.shadowColor = 'rgba(0,0,0,0.55)'; g.shadowBlur = 9; g.shadowOffsetY = 1.5;
+    g.fillStyle = '#FFFFFF'; teardropPath(g, x0, c, r, tipY); g.fill();
     g.restore();
     var ir = r - 2.5;
     g.save();
-    g.beginPath(); g.arc(c, c, ir, 0, 2 * Math.PI); g.clip();
-    g.fillStyle = '#3A3A3C'; g.fillRect(c - ir, c - ir, 2 * ir, 2 * ir);
+    g.beginPath(); g.arc(x0, c, ir, 0, 2 * Math.PI); g.clip();
+    g.fillStyle = '#3A3A3C'; g.fillRect(x0 - ir, c - ir, 2 * ir, 2 * ir);
     if (img) {                                         // výřez na střed (object-fit: cover)
       var iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
       var k = Math.max(2 * ir / iw, 2 * ir / ih);
-      g.drawImage(img, c - iw * k / 2, c - ih * k / 2, iw * k, ih * k);
+      g.drawImage(img, x0 - iw * k / 2, c - ih * k / 2, iw * k, ih * k);
     } else {
-      g.fillStyle = '#8E8E93'; disc(g, c, c, ir - 11.5);
+      g.fillStyle = '#8E8E93'; disc(g, x0, c, ir - 11.5);
     }
     g.restore();
     if (count > 1) {                                   // odznak počtu vpravo nahoře
       var label = String(count);
       g.font = '600 12px "Segoe UI", sans-serif';
       var w = Math.max(22, Math.ceil(g.measureText(label).width) + 12), h = 22;
-      var x = c + r + 8 - w, y = c - r - 6;
+      var x = x0 + r + 8 - w, y = c - r - 6;
       roundRect(g, x, y, w, h, h / 2);
       g.fillStyle = hex; g.fill();
       g.lineWidth = 2; g.strokeStyle = '#1C1C1E'; g.stroke();
       g.fillStyle = '#FFFFFF'; g.textAlign = 'center'; g.textBaseline = 'middle';
       g.fillText(label, x + w / 2, y + h / 2 + 0.5);
     }
-    return g.getImageData(0, 0, box, box);           // náhled z cizího původu = SecurityError
+    return g.getImageData(0, 0, cv.width, cv.height);   // náhled z cizího původu = SecurityError
   }
 
   function loadThumb(url) {
@@ -2658,10 +2688,13 @@
                    paint: { 'circle-radius': PIN_D / 2 + 7, 'circle-color': accent(), 'circle-blur': 0.55,
                             'circle-opacity': ['case', ['boolean', ['feature-state', 'hover'], false], 0.6, 0],
                             'circle-opacity-transition': { duration: 140, delay: 0 },
-                            'circle-pitch-alignment': 'viewport' } });
+                            'circle-pitch-alignment': 'viewport',
+                            // around the disc, which stands PIN_LIFT above the tip (= the point)
+                            'circle-translate': [0, -PIN_LIFT], 'circle-translate-anchor': 'viewport' } });
     map.addLayer({ id: 'pins', type: 'symbol', source: 'pins',
                    layout: { 'icon-image': ['get', 'img'], 'icon-allow-overlap': true, 'icon-ignore-placement': true,
                              'icon-pitch-alignment': 'viewport', 'icon-rotation-alignment': 'viewport',
+                             'icon-anchor': 'bottom',          // the teardrop tip on the coordinate
                              'symbol-sort-key': ['get', 'count'], visibility: journey.active ? 'none' : 'visible' },
                    paint: { 'icon-opacity': PIN_OPACITY, 'icon-opacity-transition': { duration: 0, delay: 0 } } });
     pinOps.ids = {};
@@ -2724,16 +2757,29 @@
     if (!map || journey.active || !map.getLayer('pins')) return false;
     return map.getLayoutProperty('pins', 'visibility') !== 'none';
   }
+  // Teardrop hit shape for a pin whose tip is at screen point p: the disc (PIN_LIFT above the
+  // tip, a few px of slack) or the tail. Returns the distance to the disc centre, Infinity = miss.
+  function pinHitDistance(p, pt) {
+    var cy = p.y - PIN_LIFT, d = Math.hypot(p.x - pt.x, cy - pt.y);
+    if (d <= PIN_D / 2 + 3) return d;
+    var below = pt.y - cy;                                   // 0 at the disc centre, PIN_LIFT at the tip
+    if (below > 0 && below <= PIN_LIFT + 2) {
+      var half = (PIN_D / 2) * Math.max(0, 1 - below / PIN_LIFT) + 3;
+      if (Math.abs(pt.x - p.x) <= half) return d;
+    }
+    return Infinity;
+  }
+  window.pinHitDistance = pinHitDistance;
   function pinAtPoint(pt) {
     if (!pinsHittable()) return null;
-    var best = null, bestD = PIN_D / 2 + 3, tr = map.transform;
+    var best = null, bestD = Infinity, tr = map.transform;
     for (var i = 0; i < clusters.length; i++) {
       var c = clusters[i];
       if (!c) continue;
       var ll = [c.lon, c.lat];
       try { if (tr && tr.isLocationOccluded && tr.isLocationOccluded(maplibregl.LngLat.convert(ll))) continue; } catch (e) { /* mercator */ }
-      var p = map.project(ll), d = Math.hypot(p.x - pt.x, p.y - pt.y);
-      if (d <= bestD) { best = i; bestD = d; }
+      var d = pinHitDistance(map.project(ll), pt);
+      if (d < bestD) { best = i; bestD = d; }
     }
     return best;
   }
@@ -2800,7 +2846,7 @@
     hoverPin = id;
     if (id !== null && map.getSource('pins')) map.setFeatureState({ source: 'pins', id: id }, { hover: true });
     map.getCanvas().style.cursor = id === null ? '' : 'pointer';
-    if (id === null) hidePinCard(); else showPinCard(id);
+    if (id === null) scheduleCardHide(); else showPinCard(id);
   }
   function onPinMove(e) { setPinHover(pinAt(e)); }
   function onPinClick(e) {
@@ -2810,21 +2856,60 @@
     openCluster(clusters[id]);
   }
 
-  var card = document.getElementById('card'), cardFor = null;
+  // Hover card (2026-11-05): interactive. A thumbnail opens that photo, "Show N photos" opens
+  // the whole cluster without flying there. The card stays while the cursor travels from the
+  // pin into it (CARD_HIDE_MS grace) and while the cursor is over it.
+  var CARD_HIDE_MS = 260;
+  var card = document.getElementById('card'), cardFor = null, cardOver = false, cardHideT = 0;
   function showPinCard(i) {
     var c = clusters[i];
     if (!c || !map) return;
+    clearTimeout(cardHideT); cardHideT = 0;
+    if (cardFor === c && card.classList.contains('show')) return;
     cardFor = c;
     card.innerHTML = tipHtml(c);
     var p = map.project([c.lon, c.lat]);
+    var top = p.y - PIN_LIFT - PIN_D / 2 - 8;                     // above the disc, not the tip
+    var below = top - card.offsetHeight < 8;                       // no room above: under the tip
+    card.classList.toggle('below', below);
     card.style.left = Math.max(116, Math.min(window.innerWidth - 116, p.x)) + 'px';
-    card.style.top = (p.y - PIN_D / 2 - 8) + 'px';
+    card.style.top = (below ? p.y + 10 : top) + 'px';
     card.classList.add('show');
   }
   function hidePinCard() {
+    clearTimeout(cardHideT); cardHideT = 0;
     cardFor = null;
+    cardOver = false;
     card.classList.remove('show');
   }
+  function scheduleCardHide() {
+    if (!cardFor) { hidePinCard(); return; }
+    if (cardOver) return;
+    clearTimeout(cardHideT);
+    cardHideT = setTimeout(function () { cardHideT = 0; if (!cardOver) hidePinCard(); }, CARD_HIDE_MS);
+  }
+  card.addEventListener('mouseenter', function () { cardOver = true; clearTimeout(cardHideT); cardHideT = 0; });
+  card.addEventListener('mouseleave', function () { cardOver = false; if (hoverPin === null) scheduleCardHide(); });
+  card.addEventListener('wheel', function () { hidePinCard(); }, { passive: true });
+  card.addEventListener('click', function (e) {
+    var el = e.target && e.target.closest ? e.target.closest('[data-open]') : null;
+    var c = cardFor;
+    if (!el || !c) return;
+    e.stopPropagation();
+    openFromCard(c, el.getAttribute('data-open'));
+  });
+  function openFromCard(c, what) {
+    hidePinCard();
+    if (!bridge) return;
+    if (what === 'all') bridge.openPhotosFromMap(JSON.stringify(c.items.map(function (m) { return m.id; })));
+    else bridge.openPhotoFromMap(+what);
+  }
+  window.cardAction = function (i, what) {               // tests: the card's buttons
+    var c = clusters[i];
+    if (!c) return false;
+    openFromCard(c, String(what));
+    return true;
+  };
   function hideCard() { hidePinCard(); }
   window.hoverCluster = function (i) { if (!clusters[i]) return false; showPinCard(i); return true; };
 
@@ -2960,7 +3045,7 @@
       spriteHost.appendChild(el);
       var delay = m.kind === 'fade' ? 0 : Math.min(n++, 6) * SPRING_STAGGER_MS * (0.5 + 0.5 * Math.random());
       return { m: m, el: el, u: 0, v: 0, delay: delay, done: false,
-               w: src_half(el.style.width), h: src_half(el.style.height) };
+               w: src_half(el.style.width), h: parseFloat(el.style.height) };   // tip = bottom centre
     }).filter(Boolean);
     function src_half(px) { return parseFloat(px) / 2; }
     map.setPaintProperty('pins', 'icon-opacity-transition', { duration: 0, delay: 0 });
@@ -3068,7 +3153,7 @@
       map.addLayer({ id: 'pins-out', type: 'symbol', source: 'pins-out',
                      layout: { 'icon-image': ['get', 'img'], 'icon-allow-overlap': true, 'icon-ignore-placement': true,
                                'icon-pitch-alignment': 'viewport', 'icon-rotation-alignment': 'viewport',
-                               'symbol-sort-key': ['get', 'count'] },
+                               'icon-anchor': 'bottom', 'symbol-sort-key': ['get', 'count'] },
                      paint: { 'icon-opacity': PIN_OUT_OPACITY, 'icon-opacity-transition': { duration: 0 } } }, 'pins-halo');
     } else {
       clearPinOps('pins-out', pinOps.outIds);
@@ -3115,6 +3200,59 @@
     map.flyTo(Object.assign(opts, { duration: Math.min(4200, 1400 + hops * 260), curve: 1.5, essential: true }));
   }
 
+  // ── Cluster click (2026-11-05) ──
+  // The click used to fly to the bounding box of every photo in the cluster: from the globe that
+  // was a dive of 10+ zoom levels lasting up to 4.2 s, straight past every intermediate grouping.
+  // Now the camera goes only as far as the cluster needs to SPLIT (the first zoom at which its
+  // photos stop forming one pin), plus a margin so the children visibly separate, never further
+  // than the zoom that fits them all, in a flight of at most CLUSTER_FLY_MAX_MS.
+  var SPLIT_STEP = 0.5, SPLIT_MARGIN = 0.75;
+  var CLUSTER_FLY_MIN_MS = 650, CLUSTER_FLY_MAX_MS = 1500, CLUSTER_FLY_MS_PER_ZOOM = 110;
+  function splitZoom(items, from, maxZ) {
+    for (var z = Math.floor(from / SPLIT_STEP) * SPLIT_STEP + SPLIT_STEP; z <= maxZ + 1e-9; z += SPLIT_STEP) {
+      if (computeClusters(z, items).length > 1) return z;
+    }
+    return null;
+  }
+  window.splitZoomFor = function (ids) {                   // tests / bench (global script: no name clash)
+    var want = {};
+    ids.forEach(function (id) { want[id] = true; });
+    return splitZoom(markers.filter(function (m) { return want[m.id]; }), currentZoom(), map ? map.getMaxZoom() : 19);
+  };
+  function clusterView(items) {
+    var maxZ = map.getMaxZoom(), cur = map.getZoom();
+    var lats = items.map(function (m) { return m.lat; }), lons = items.map(function (m) { return m.lon; });
+    var b = new maplibregl.LngLatBounds([Math.min.apply(null, lons), Math.min.apply(null, lats)],
+                                        [Math.max.apply(null, lons), Math.max.apply(null, lats)]);
+    var fit = map.cameraForBounds(b, { padding: 90, maxZoom: maxZ - 1 }) || {};
+    var split = splitZoom(items, cur, maxZ);
+    if (split === null) return null;                        // never splits: one place
+    var zoom = Math.min(split + SPLIT_MARGIN, fit.zoom === undefined ? maxZ - 1 : fit.zoom, maxZ - 1);
+    zoom = Math.max(zoom, Math.min(cur + 1, maxZ - 1));     // a click always moves in visibly
+    return { center: b.getCenter(), zoom: zoom };
+  }
+  window.clusterViewOf = function (i) {                    // tests
+    var c = clusters[i], v = c && map ? clusterView(c.items) : null;
+    return v ? { lon: v.center.lng, lat: v.center.lat, zoom: v.zoom } : null;
+  };
+  function flyToCluster(items) {
+    var v = clusterView(items);
+    if (!v) return false;
+    var zoom = v.zoom;
+    var opts = { center: v.center, zoom: zoom,
+                 pitch: zoom >= TERRAIN_MIN_ZOOM ? FLY_PITCH : (zoom >= 5 ? 25 : 0),
+                 bearing: zoom >= TERRAIN_MIN_ZOOM ? map.getBearing() : 0 };
+    stopSpin();
+    warmView(opts);                                         // the arrival view, into the tile store now
+    if (reduceMotion || !hasSize()) { map.jumpTo(opts); return true; }
+    descent.on = zoom >= TERRAIN_MIN_ZOOM;                  // terrain during the descent (descentTerrain)
+    descent.at = Math.max(TERRAIN_MIN_ZOOM, zoom - DESCENT_TERRAIN_LEAD);
+    var hops = Math.abs(zoom - map.getZoom());
+    var ms = Math.max(CLUSTER_FLY_MIN_MS, Math.min(CLUSTER_FLY_MAX_MS, CLUSTER_FLY_MIN_MS + hops * CLUSTER_FLY_MS_PER_ZOOM));
+    map.flyTo(Object.assign(opts, { duration: ms, curve: 1.3, essential: true }));
+    return true;
+  }
+
   function openCluster(c) {
     var items = c.items;
     if (items.length === 1) {
@@ -3126,11 +3264,8 @@
     var xs = px.map(function (p) { return p.x; }), ys = px.map(function (p) { return p.y; });
     var samePlace = pxDist({ x: Math.min.apply(null, xs), y: Math.min.apply(null, ys) },
                            { x: Math.max.apply(null, xs), y: Math.max.apply(null, ys) }) < CELL_PX;
-    if (map && map.getZoom() < maxZ - 0.5 && !samePlace) {
-      flyIn(items);                                         // plynulý přelet do shluku
-    } else if (bridge) {
-      bridge.openPhotosFromMap(JSON.stringify(items.map(function (m) { return m.id; })));
-    }
+    if (map && map.getZoom() < maxZ - 0.5 && !samePlace && flyToCluster(items)) return;
+    if (bridge) bridge.openPhotosFromMap(JSON.stringify(items.map(function (m) { return m.id; })));
   }
   window.getClusters = function () {
     return clusters.map(function (c) { return { count: c.items.length, ids: c.items.map(function (m) { return m.id; }),

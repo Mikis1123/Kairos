@@ -1008,6 +1008,10 @@ map-years-ago = { $years ->
    *[other] { $years } years ago
 }
 map-multiple-places = Multiple places
+map-show-photos = { $count ->
+    [one] Show { $count } photo
+   *[other] Show { $count } photos
+}
 map-play-journey = Play a Journey
 map-stop-n = Stop { $n }
 map-journey-end = End of the Journey

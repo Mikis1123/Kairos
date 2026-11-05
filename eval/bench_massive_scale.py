@@ -293,7 +293,30 @@ def stage_db(out):
 
 # ── stage: grid ───────────────────────────────────────────────────────────────
 
-def stage_grid(out, passes=3):
+def warm_micro(res):
+    """A returning user: every item already has its micro preview (Sprint 2 LQIP) on disk."""
+    import micro_previews
+    import main
+    import power
+    saved = power.get().override
+    power.get().override = power.PowerState()        # build at full speed (no battery throttle)
+    st = micro_previews.store()
+    st.loaded.wait(30)
+    t = time.perf_counter()
+    recs = main.fetch_media_records()
+    st.request([(int(r[0]), r[5]) for r in recs])
+    while not st.backfill_idle():
+        time.sleep(0.05)
+    st.flush()
+    power.get().override = saved
+    res["micro_warm_s"] = round(time.perf_counter() - t, 1)
+    res["micro_count"] = len(st)
+    res["micro_ram_mb"] = round(st.nbytes() / 2**20, 1)
+    res["micro_disk_mb"] = round(os.path.getsize(st.path) / 2**20, 1)
+    micro_previews.reset_for_tests()                  # the app reloads it from disk like a restart
+
+
+def stage_grid(out, passes=3, micro="cold"):
     from unittest import mock
     from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, QTimer, QElapsedTimer
     from PyQt6.QtGui import QWheelEvent
@@ -313,6 +336,9 @@ def stage_grid(out, passes=3):
             app.processEvents()
             time.sleep(0.001)
 
+    pre = {}
+    if micro == "warm":
+        warm_micro(pre)
     m0 = mem_mb()
     patches = [mock.patch.object(main.MainWindow, "_start_ai_daemon", lambda self: None)]
     for p in patches:
@@ -328,20 +354,49 @@ def stage_grid(out, passes=3):
         time.sleep(0.001)
     grid = w.grid_view
     res = {"records": grid.model().rowCount(), "first_frame_ms": round((first["t"] or now_ms()) - t_open),
-           "mem_after_open": mem_mb(), "mem_before": m0}
+           "mem_after_open": mem_mb(), "mem_before": m0, "micro": micro, **pre}
     pump(1500)
 
     # instrumentation: viewport paints (interval + CPU), blank visible tiles (sampled every 4th
     # frame, outside the timed paint), heartbeat. No tracemalloc while scrolling: it taxes every
     # allocation; the Python heap is read as allocated blocks between passes.
     frames = []
+    tiles = []          # per sampled frame: (visible, empty, low-res placeholder, sharp)
     orig_paint = type(grid).paintEvent
+
+    def tile_census(view):
+        """What the eye sees per visible tile: EMPTY (a flat placeholder), a LOW-RES micro
+        preview (Sprint 2 LQIP), or the real thumbnail. Reads caches only (no decode requests)."""
+        model = view.model()
+        vp = view.viewport().rect()
+        first = view.indexAt(QPoint(vp.left() + 6, vp.top() + 6))
+        row = first.row() if first.isValid() else 0
+        has_micro = getattr(model, "has_micro", None)
+        n = empty = low = sharp = 0
+        while row < model.rowCount():
+            idx = model.index(row, 0)
+            r = view.visualRect(idx)
+            if r.top() > vp.bottom():
+                break
+            if r.intersects(vp):
+                n += 1
+                item_id = int(model.records[row][0])
+                if model.ram_cache.get(item_id) is not None:
+                    sharp += 1
+                elif has_micro is not None and has_micro(item_id):
+                    low += 1
+                else:
+                    empty += 1
+            row += 1
+        return n, empty, low, sharp
 
     def paint(self, ev):
         a = now_ms()
         orig_paint(self, ev)
         b = now_ms()
         blank = (not self.visible_tiles_ready()) if len(frames) % 4 == 0 else None
+        if blank is not None:
+            tiles.append(tile_census(self))
         frames.append((a, b - a, blank))
     type(grid).paintEvent = paint
     beats = []
@@ -387,6 +442,7 @@ def stage_grid(out, passes=3):
     blocks0 = sys.getallocatedblocks()
     for k in range(passes):
         frames.clear()
+        tiles.clear()
         beats.clear()
         direction = 1 if k % 2 == 0 else -1
         t0 = now_ms()
@@ -405,6 +461,10 @@ def stage_grid(out, passes=3):
             "paint_p50": pct([f[1] for f in moving], 50), "paint_p95": pct([f[1] for f in moving], 95),
             "paint_max": round(max([f[1] for f in moving] or [0]), 1),
             "blank_frames_pct": round(100 * sum(1 for f in sampled if f[2]) / max(1, len(sampled)), 1),
+            "frames_with_empty_tile_pct": round(100 * sum(1 for t in tiles if t[1]) / max(1, len(tiles)), 1),
+            "empty_tiles_pct": round(100 * sum(t[1] for t in tiles) / max(1, sum(t[0] for t in tiles)), 1),
+            "lowres_tiles_pct": round(100 * sum(t[2] for t in tiles) / max(1, sum(t[0] for t in tiles)), 1),
+            "sharp_tiles_pct": round(100 * sum(t[3] for t in tiles) / max(1, sum(t[0] for t in tiles)), 1),
             "stall_max_ms": round(max(gaps or [0]), 1), "stalls_over_50ms": sum(1 for g in gaps if g > 50),
             "mem": mem_mb(), "py_blocks_growth": sys.getallocatedblocks() - blocks0})
     hb.stop()
@@ -522,6 +582,8 @@ def main_():
     ap.add_argument("--passes", type=int, default=3)
     ap.add_argument("--orbit-seconds", type=float, default=10.0)
     ap.add_argument("--json", default="")
+    ap.add_argument("--micro", choices=("cold", "warm"), default="cold",
+                    help="warm: micro previews built before the grid opens (returning user)")
     ap.add_argument("--_map", nargs=2, help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args._map:                                    # child process: the map stage
@@ -546,7 +608,7 @@ def main_():
         markers = stage_db(out)
         print("db", json.dumps(out["db"], ensure_ascii=False, default=str), flush=True)
         if "grid" in stages:
-            stage_grid(out, args.passes)
+            stage_grid(out, args.passes, args.micro)
             print("grid", json.dumps(out["grid"]), flush=True)
         if "map" in stages:
             mk = os.path.join(sandbox, "markers.json")

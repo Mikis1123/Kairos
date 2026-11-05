@@ -9,10 +9,10 @@ Prohlížeč dřív fotku jen vešel do plochy (24 Mpx HEIC nikdy víc než ~4 M
   pozadí dekóduje originál (~0,9 s u 24 Mpx HEIC) do pyramidy plné / ½ / ¼ velikosti. Kreslí
   se úroveň, která má aspoň tolik pixelů, kolik jich pohled potřebuje (žádné zvětšování ani
   aliasing velkého zmenšení), bilineárně – naměřeno ~1,5–2 ms na snímek 2880×1800.
-* 100 % = 1 pixel originálu na 1 fyzický pixel displeje; strop 200 %.
-* Kolečko myši = plynulý zoom ke kurzoru (animace 180 ms), sevření prstů na touchpadu (Ctrl +
-  kolečko po malých krocích) přímo; dvouprstý posun touchpadu a tažení myší posouvají,
-  po puštění se setrvačností (τ 325 ms jako iOS).
+* 100 % = 1 pixel originálu na 1 fyzický pixel displeje; strop 400 %, od 200 % ostré pixely.
+* Kolečko myši = plynulý zoom ke kurzoru (kriticky tlumená pružina, vsync), sevření prstů na
+  touchpadu (Ctrl + kolečko po malých krocích) přímo; dvouprstý posun touchpadu a tažení myší
+  posouvají, po puštění se setrvačností (τ 325 ms jako iOS); okraje pruží jako guma.
 
 Čistá geometrie (fit_width, clamp_center, zoom_about, pick_level) je bez Qt widgetů a testovaná.
 """
@@ -24,8 +24,17 @@ from PyQt6.QtCore import QObject, QPointF, QRectF, QRunnable, Qt, QTimer, pyqtSi
 from PyQt6.QtGui import QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import QGraphicsItem
 
-MAX_DEVICE_SCALE = 2.0          # 200 % = 2 fyzické px na pixel originálu
-ZOOM_ANIM_MS = 180
+MAX_DEVICE_SCALE = 4.0          # 400 % = 4 fyzické px na pixel originálu (dřív strop 200 %)
+PIXEL_GRID_SCALE = 2.0          # od 2 fyzických px na pixel zdroje: ostré pixely (nearest), ne bilineární kaše
+ZOOM_OMEGA = 30.0               # pružina zoomu (log šířky): 5 % zbytku za ~0,16 s, 1 % za ~0,22 s
+ZOOM_SETTLE_S = 0.6             # pojistka: od posledního cíle je pružina vždy hotová
+ZOOM_DONE_LOG = 1e-3            # |log(W/cíl)| pod tím = cíl (0,1 % šířky)
+ZOOM_DONE_VEL = 0.05
+BOUNCE_OMEGA = 13.0             # guma okraje: návrat ~0,5 s, přetočení při nárazu v0/(ω·e)
+MAX_BOUNCE_SPEED = 3000.0       # px/s – nejvýš ~85 px přetočení za okraj
+RUBBER_C = 0.55                 # odpor gumy (iOS UIScrollView)
+PAD_RELEASE_MS = 90             # touchpad: tak dlouhé ticho = prsty zvednuté
+MAX_STEP_S = 0.05               # po zaseknutí GUI se pohyb zpomalí, neteleportuje
 NOTCH_FACTOR = 1.25             # jeden zub kolečka myši
 INERTIA_TAU_S = 0.325
 INERTIA_MIN_SPEED = 25.0        # logické px/s – pod tím setrvačnost končí
@@ -78,6 +87,60 @@ def zoom_about(u, v, w, new_w, ax, ay, vw, vh, aspect):
     nu = pu - (ax - vw / 2.0) / new_w
     nv = pv - (ay - vh / 2.0) / new_h
     return clamp_center(nu, nv, new_w, aspect, vw, vh)
+
+
+def pan_axis(c, d, size, view, raw=0.0):
+    """Jedna osa posunu: střed c (0–1), posun obrazu d px (+ = doprava / dolů), rozměr obrazu
+    size a plochy view (px). raw = přesah za okrajem (před gumou). Vrací (c, raw): pohyb zpět
+    nejdřív odmotá přesah, co se za okraj nevejde, přičte se k přesahu."""
+    if not (_finite_pos(size) and view > 0):
+        return c, raw
+    if raw != 0.0 and d != 0.0 and (d > 0) != (raw > 0):
+        if abs(d) <= abs(raw):
+            return c, raw + d
+        d += raw
+        raw = 0.0
+    if size <= view:
+        return 0.5, 0.0                      # obraz se na ose vejde: střed, žádná guma
+    half = view / (2.0 * size)
+    want = c - d / size
+    got = min(max(want, half), 1.0 - half)
+    return got, raw - (want - got) * size
+
+
+def rubber_band(x, d):
+    """Odpor gumy (iOS): přesah prstu x -> zobrazený přesah, nikdy přes rozměr plochy d."""
+    if x == 0.0 or d <= 0:
+        return 0.0
+    y = (1.0 - 1.0 / (abs(x) * RUBBER_C / d + 1.0)) * d
+    return math.copysign(y, x)
+
+
+def rubber_inverse(y, d):
+    """Inverze rubber_band: zobrazený přesah -> přesah prstu (převzetí prstem bez skoku)."""
+    if y == 0.0 or d <= 0:
+        return 0.0
+    k = min(abs(y) / d, 0.999)
+    return math.copysign((d / RUBBER_C) * (1.0 / (1.0 - k) - 1.0), y)
+
+
+def spring_step(x, v, omega, dt):
+    """Přesný krok kriticky tlumené pružiny k 0 (stabilní pro jakékoli dt)."""
+    if dt <= 0.0:
+        return x, v
+    e = math.exp(-omega * dt)
+    k = v + omega * x
+    return (x + k * dt) * e, (v - omega * dt * k) * e
+
+
+def _clock():
+    import frame_clock
+    return frame_clock.clock()
+
+
+def _release_clock(key):
+    import frame_clock
+    frame_clock.release(key)
 
 
 def pick_level(widths, need_px):
@@ -198,7 +261,16 @@ class ZoomImageItem(QGraphicsItem):
 
 class ZoomController(QObject):
     """Stav přiblížení plátna. Plátno volá wheel/press/move/release/double_click a resize;
-    prohlížeč volá set_photo (nová položka), set_enabled a set_full_levels (přes full_res_wanted)."""
+    prohlížeč volá set_photo (nová položka), set_enabled a set_full_levels (přes full_res_wanted).
+
+    Motion (120 Hz unified fluidity):
+    * Every step runs on frame_clock's vblank pulse (it was a 6 ms QTimer that drifted against
+      the panel). Time is the vblank timestamp.
+    * Zoom = a critically damped spring on log(width). New wheel notches retarget it without a
+      velocity jump. The image point under the cursor stays glued to it on every frame, not
+      only at the end.
+    * Pan inertia decays exponentially (τ 325 ms). Edges rubber-band: a drag past an edge meets
+      iOS resistance, and a glide that hits an edge overshoots and springs back."""
     changed = pyqtSignal(float)         # procenta (100 = 1:1 originálu)
     full_res_wanted = pyqtSignal()
     zoomed_changed = pyqtSignal(bool)
@@ -215,24 +287,33 @@ class ZoomController(QObject):
         self.orig = None                # (w, h) originálu
         self.w = 0.0                    # šířka obrazu na ploše (logické px); 0 = vešlé
         self.u = self.v = 0.5
+        self.path = None
         self._levels = []               # pyramida originálu
         self._base = None               # dosavadní obraz prohlížeče (rozlišení displeje)
         self._wanted = False
         self._zoomed = False
         self.token = 0
-        # animace (W, u, v) -> cíl
+        # zoom spring: cíl (W, u, v), kotva (bod obrazu pod kurzorem) a rychlost log(W)
         self._anim_from = self._anim_to = None
         self._anim_t0 = 0.0
-        self._anim_ms = ZOOM_ANIM_MS
-        # setrvačnost
+        self._anchor = None             # (ax, ay, pu, pv)
+        self._s_vel = 0.0
+        # setrvačnost a gumové okraje (px obrazu; + = obraz doprava / dolů)
         self._vel = (0.0, 0.0)
+        self._over = [0.0, 0.0]         # zobrazený přesah za okraj
+        self._over_vel = [0.0, 0.0]
+        self._raw_over = [0.0, 0.0]     # přesah prstu při tažení (před odporem gumy)
         self._last = 0.0
         self._drag = None
         self._samples = []
-        self._ticker = QTimer(self)
-        self._ticker.setTimerType(Qt.TimerType.PreciseTimer)
-        self._ticker.setInterval(6)     # o něco rychleji než 120 Hz: jitter časovače Windows (~1 ms) nesmí shodit snímek
-        self._ticker.timeout.connect(self._tick)
+        self._running = False
+        self._clock_key = object()
+        # no destroyed() hook (PyQt teardown crash): a deleted controller's tick raises
+        # RuntimeError and frame_clock drops the subscription
+        self._pad_end = QTimer(self)    # dvouprstý posun touchpadu nemá „puštění“: konec = ticho
+        self._pad_end.setSingleShot(True)
+        self._pad_end.setInterval(PAD_RELEASE_MS)
+        self._pad_end.timeout.connect(self._release_overscroll)
 
     # ── vstup od prohlížeče ──
     def set_photo(self, path=None, size=None):
@@ -276,6 +357,12 @@ class ZoomController(QObject):
     def is_zoomed(self):
         return self.w > 0.0
 
+    def is_moving(self):
+        return self._running
+
+    def overscroll(self):
+        return tuple(self._over)
+
     def fit_w(self):
         vp = self.canvas.viewport()
         return fit_width(self.aspect, vp.width(), vp.height())
@@ -311,23 +398,27 @@ class ZoomController(QObject):
         cur_w = self.w or fit
         new_w = min(max(new_w, fit), self.max_w())
         ax, ay = (anchor.x(), anchor.y()) if anchor is not None else (vw / 2.0, vh / 2.0)
-        # z cíle běžící animace (rychlé zuby kolečka se sčítají), jinak z aktuálního stavu
-        base = self._anim_to if self._anim_to is not None else (cur_w, self.u, self.v)
-        bw, bu, bv = base
-        bw = bw or fit                                      # 0.0 = cíl „vešlé“ (zoom ven během animace)
-        nu, nv = zoom_about(bu, bv, bw, new_w, ax, ay, vw, vh, self.aspect)
+        # bod obrazu pod kotvou z AKTUÁLNÍHO stavu: zůstane pod kurzorem v každém snímku
+        h = cur_w * self.aspect
+        pu = self.u + (ax - vw / 2.0) / cur_w
+        pv = self.v + (ay - vh / 2.0) / h
+        nu, nv = zoom_about(self.u, self.v, cur_w, new_w, ax, ay, vw, vh, self.aspect)
         target = (0.0 if abs(new_w - fit) <= fit * FIT_EPS else new_w, nu, nv)
         if new_w > fit * (1 + FIT_EPS) and not self._wanted:
             self._wanted = True
             self.full_res_wanted.emit()
         self._vel = (0.0, 0.0)
         if animate and not _reduce_motion():
+            if self._anim_to is None:
+                self._s_vel = 0.0                           # nový pohyb z klidu
             self._anim_from = (cur_w, self.u, self.v)
             self._anim_to = target
+            self._anchor = (ax, ay, pu, pv)
             self._anim_t0 = time.perf_counter()
-            self._ticker.start()
+            self._start_clock()
         else:
-            self._anim_from = self._anim_to = None
+            self._anim_from = self._anim_to = self._anchor = None
+            self._s_vel = 0.0
             self.w, self.u, self.v = target
             self._apply()
 
@@ -348,6 +439,10 @@ class ZoomController(QObject):
     def reset(self, animate=True):
         if self.is_zoomed() or self._anim_to is not None:
             self.zoom_to(self.fit_w(), None, animate)
+        if not animate:
+            self._over = [0.0, 0.0]
+            self._over_vel = [0.0, 0.0]
+            self._raw_over = [0.0, 0.0]
 
     def toggle_one_to_one(self, anchor=None):
         if self.is_zoomed():
@@ -355,12 +450,25 @@ class ZoomController(QObject):
         else:
             self.zoom_to(max(self.one_to_one_w(), self.fit_w() * 1.6), anchor)
 
-    def pan_by(self, dx, dy, apply=True):
+    def pan_by(self, dx, dy, apply=True, rubber=False):
+        """Posun obrazu o (dx, dy) logických px. rubber=True (tažení, touchpad): za okrajem
+        se obraz posouvá dál s odporem gumy místo zastavení."""
         if not self.is_zoomed() or not _finite_pos(self.aspect):
             return
         vp = self.canvas.viewport()
-        self.u, self.v = clamp_center(self.u - dx / self.w, self.v - dy / (self.w * self.aspect),
-                                      self.w, self.aspect, vp.width(), vp.height())
+        if vp.width() <= 0 or vp.height() <= 0:
+            return
+        sizes = (self.w, self.w * self.aspect)
+        views = (vp.width(), vp.height())
+        c = [self.u, self.v]
+        for i, d in enumerate((dx, dy)):
+            raw = self._raw_over[i] if rubber else 0.0
+            c[i], raw = pan_axis(c[i], d, sizes[i], views[i], raw)
+            if rubber:
+                self._raw_over[i] = raw
+                self._over[i] = rubber_band(raw, views[i])
+                self._over_vel[i] = 0.0
+        self.u, self.v = c
         if apply:
             self._apply()
 
@@ -382,10 +490,16 @@ class ZoomController(QObject):
             return True
         if self.is_zoomed():                              # dvouprstý posun touchpadu
             pd = event.pixelDelta()
+            rubber = not _reduce_motion()
+            if rubber and self._raw_over == [0.0, 0.0] and self._over != [0.0, 0.0]:
+                self._raw_over = [rubber_inverse(o, d) for o, d in
+                                  zip(self._over, (self.canvas.viewport().width(), self.canvas.viewport().height()))]
             if not pd.isNull():
-                self.pan_by(pd.x(), pd.y())
+                self.pan_by(pd.x(), pd.y(), rubber=rubber)
             else:
-                self.pan_by(dx / 2.0, dy / 2.0)
+                self.pan_by(dx / 2.0, dy / 2.0, rubber=rubber)
+            if rubber:
+                self._pad_end.start()
             return True
         return False
 
@@ -397,7 +511,13 @@ class ZoomController(QObject):
     def press(self, pos):
         if not self.is_zoomed():
             return False
-        self._stop_motion()
+        # chycení uprostřed pohybu: zastavit, přesah gumy převzít pod prst (žádný skok)
+        vp = self.canvas.viewport()
+        self._raw_over = [rubber_inverse(o, d) for o, d in zip(self._over, (vp.width(), vp.height()))]
+        self._over_vel = [0.0, 0.0]
+        self._anim_from = self._anim_to = self._anchor = None
+        self._vel = (0.0, 0.0)
+        self._stop_clock()
         self._drag = pos
         self._samples = [(time.perf_counter(), pos)]
         self.canvas.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -406,7 +526,7 @@ class ZoomController(QObject):
     def move(self, pos):
         if self._drag is None:
             return False
-        self.pan_by(pos.x() - self._drag.x(), pos.y() - self._drag.y())
+        self.pan_by(pos.x() - self._drag.x(), pos.y() - self._drag.y(), rubber=not _reduce_motion())
         self._drag = pos
         now = time.perf_counter()
         self._samples.append((now, pos))
@@ -421,14 +541,37 @@ class ZoomController(QObject):
                                          else Qt.CursorShape.ArrowCursor)
         now = time.perf_counter()
         samples = [s for s in self._samples if now - s[0] <= 0.1]
-        if len(samples) >= 2 and not _reduce_motion():
+        self._raw_over = [0.0, 0.0]
+        if _reduce_motion():
+            self._over = [0.0, 0.0]
+            self._apply()
+            return True
+        vel = [0.0, 0.0]
+        if len(samples) >= 2:
             (t0, p0), (t1, p1) = samples[0], samples[-1]
             dt = max(1e-3, t1 - t0)
-            self._vel = ((p1.x() - p0.x()) / dt, (p1.y() - p0.y()) / dt)
-            if math.hypot(*self._vel) > INERTIA_MIN_SPEED:
-                self._last = now
-                self._ticker.start()
+            vel = [(p1.x() - p0.x()) / dt, (p1.y() - p0.y()) / dt]
+            if math.hypot(*vel) <= INERTIA_MIN_SPEED:
+                vel = [0.0, 0.0]
+        for i in (0, 1):
+            if self._over[i] != 0.0:
+                # puštěno za okrajem: guma táhne zpět; rychlost směrem dovnitř se zachová
+                inward = vel[i] if vel[i] * self._over[i] < 0 else 0.0
+                self._over_vel[i] = max(-MAX_BOUNCE_SPEED, min(MAX_BOUNCE_SPEED, inward))
+                vel[i] = 0.0
+        self._vel = tuple(vel)
+        if self._vel != (0.0, 0.0) or self._over != [0.0, 0.0]:
+            self._last = now
+            self._start_clock()
         return True
+
+    def _release_overscroll(self):
+        """Konec gesta touchpadu (ticho): přesah za okrajem se vrátí pružinou."""
+        self._raw_over = [0.0, 0.0]
+        if self._over != [0.0, 0.0] and self._drag is None:
+            self._over_vel = [0.0, 0.0]
+            self._last = time.perf_counter()
+            self._start_clock()
 
     def resized(self):
         if self.is_zoomed():
@@ -439,51 +582,101 @@ class ZoomController(QObject):
             self.u, self.v = clamp_center(self.u, self.v, self.w, self.aspect, vp.width(), vp.height())
             self._apply()
 
-    # ── animace ──
-    def _stop_motion(self):
-        self._anim_from = self._anim_to = None
-        self._vel = (0.0, 0.0)
-        self._ticker.stop()
+    # ── animace (vsync) ──
+    def _start_clock(self):
+        if not self._running:
+            self._running = True
+            self._last = time.perf_counter()
+            _clock().subscribe(self._clock_key, self._tick)
 
-    def _tick(self):
-        now = time.perf_counter()
+    def _stop_clock(self):
+        self._running = False
+        _clock().unsubscribe(self._clock_key)
+
+    def _stop_motion(self):
+        self._anim_from = self._anim_to = self._anchor = None
+        self._s_vel = 0.0
+        self._vel = (0.0, 0.0)
+        self._over = [0.0, 0.0]
+        self._over_vel = [0.0, 0.0]
+        self._raw_over = [0.0, 0.0]
+        self._pad_end.stop()
+        self._stop_clock()
+
+    def _tick(self, now=None):
+        now = time.perf_counter() if now is None else now
+        dt = min(MAX_STEP_S, max(0.0, now - self._last))
+        self._last = now
         busy = False
+        vp = self.canvas.viewport()
+        vw, vh = vp.width(), vp.height()
         if self._anim_to is not None:
-            t = min(1.0, (now - self._anim_t0) * 1000.0 / max(1, self._anim_ms))
-            e = 1.0 - (1.0 - t) ** 3                       # ease-out cubic
-            (w0, u0, v0), (w1, u1, v1) = self._anim_from, self._anim_to
-            fit = self.fit_w()
-            a, b = (w0 or fit), (w1 or fit)
-            if _finite_pos(a) and _finite_pos(b):
-                w = math.exp(math.log(a) + (math.log(b) - math.log(a)) * e)   # zoom v log měřítku
-            else:                                          # plocha zmizela uprostřed animace
-                w, t = (b if _finite_pos(b) else 0.0), 1.0
-            self.w = 0.0 if (t >= 1.0 and w1 == 0.0) else w
-            self.u, self.v = u0 + (u1 - u0) * e, v0 + (v1 - v0) * e
-            if self.w:
-                vp = self.canvas.viewport()
-                self.u, self.v = clamp_center(self.u, self.v, self.w, self.aspect, vp.width(), vp.height())
-            if t >= 1.0:
-                self._anim_from = self._anim_to = None
-            else:
-                busy = True
+            busy = self._step_zoom(now, dt, vw, vh)
         elif self._vel != (0.0, 0.0):
-            dt = max(0.0, now - self._last)
-            self._last = now
             vx, vy = self._vel
             before = (self.u, self.v)
             self.pan_by(vx * dt, vy * dt, apply=False)
             k = math.exp(-dt / INERTIA_TAU_S)
-            vx, vy = vx * k, vy * k
-            if self.u == before[0]:
-                vx = 0.0                                   # narazil na okraj
-            if self.v == before[1]:
-                vy = 0.0
-            self._vel = (vx, vy) if math.hypot(vx, vy) > INERTIA_MIN_SPEED else (0.0, 0.0)
+            moved = (self.u != before[0], self.v != before[1])
+            vel = [vx * k, vy * k]
+            for i in (0, 1):
+                if not moved[i] and vel[i] != 0.0 and self.is_zoomed():
+                    # narazil na okraj: setrvačnost přejde do pružiny gumy (přetočí a vrátí se)
+                    size = self.w if i == 0 else self.w * self.aspect
+                    view = vw if i == 0 else vh
+                    if size > view + 0.5 and not _reduce_motion():
+                        self._over_vel[i] = max(-MAX_BOUNCE_SPEED, min(MAX_BOUNCE_SPEED, vel[i]))
+                    vel[i] = 0.0
+            self._vel = tuple(vel) if math.hypot(*vel) > INERTIA_MIN_SPEED else (0.0, 0.0)
             busy = self._vel != (0.0, 0.0)
+        for i in (0, 1):
+            if self._over[i] != 0.0 or self._over_vel[i] != 0.0:
+                if self._drag is not None or self._pad_end.isActive():
+                    busy = True                             # prst ještě drží přesah
+                    continue
+                x, v = spring_step(self._over[i], self._over_vel[i], BOUNCE_OMEGA, dt)
+                if abs(x) < 0.15 and abs(v) < 12.0:
+                    x, v = 0.0, 0.0
+                self._over[i], self._over_vel[i] = x, v
+                busy = busy or x != 0.0 or v != 0.0
         self._apply()
         if not busy:
-            self._ticker.stop()
+            self._stop_clock()
+
+    def _step_zoom(self, now, dt, vw, vh):
+        """Jeden krok pružiny zoomu. True = ještě běží."""
+        w1, u1, v1 = self._anim_to
+        fit = self.fit_w()
+        b = w1 or fit
+        a = self.w or fit
+        if not (_finite_pos(a) and _finite_pos(b)) or now - self._anim_t0 >= ZOOM_SETTLE_S:
+            # plocha zmizela uprostřed animace, nebo pojistka: pružina je vždy hotová včas
+            self.w = 0.0 if w1 == 0.0 or not _finite_pos(b) else b
+            if self.w and vw > 0 and vh > 0:
+                self.u, self.v = clamp_center(u1, v1, self.w, self.aspect, vw, vh)
+            else:
+                self.u = self.v = 0.5
+            self._anim_from = self._anim_to = self._anchor = None
+            self._s_vel = 0.0
+            return False
+        x = math.log(a) - math.log(b)
+        x, self._s_vel = spring_step(x, self._s_vel, ZOOM_OMEGA, dt)
+        if abs(x) < ZOOM_DONE_LOG and abs(self._s_vel) < ZOOM_DONE_VEL:
+            x, self._s_vel = 0.0, 0.0
+        w = b * math.exp(x)
+        done = x == 0.0
+        self.w = 0.0 if (done and w1 == 0.0) else w
+        if self.w and self._anchor is not None and vw > 0 and vh > 0:
+            ax, ay, pu, pv = self._anchor
+            u = pu - (ax - vw / 2.0) / self.w
+            v = pv - (ay - vh / 2.0) / (self.w * self.aspect)
+            self.u, self.v = clamp_center(u, v, self.w, self.aspect, vw, vh)
+        elif not self.w:
+            self.u = self.v = 0.5
+        if done:
+            self._anim_from = self._anim_to = self._anchor = None
+            return False
+        return True
 
     # ── vykreslení ──
     def _apply(self):
@@ -506,8 +699,16 @@ class ZoomController(QObject):
                 vp = canvas.viewport()
                 scale = self.w / float(src.width())
                 h = self.w * self.aspect
+                x = vp.width() / 2.0 - self.u * self.w + self._over[0]
+                y = vp.height() / 2.0 - self.v * h + self._over[1]
+                device_scale = scale * dpr                  # fyzické px na pixel zdroje
+                if abs(device_scale - 1.0) < 1e-3:
+                    # přesně 1:1: posun na mřížku fyzických pixelů – žádné bilineární
+                    # rozmazání o půl pixelu a kreslí se rychlým blitem
+                    x, y = round(x * dpr) / dpr, round(y * dpr) / dpr
+                self.item.smooth = device_scale < PIXEL_GRID_SCALE
                 self.item.setScale(scale)
-                self.item.setPos(vp.width() / 2.0 - self.u * self.w, vp.height() / 2.0 - self.v * h)
+                self.item.setPos(x, y)
         self.item.setVisible(zoomed)
         canvas.photo_item.setVisible(not zoomed and not canvas.is_video_shown())
         if zoomed != self._zoomed:

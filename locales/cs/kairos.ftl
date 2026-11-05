@@ -1054,6 +1054,12 @@ map-years-ago = { $years ->
    *[other] Před { $years } lety
 }
 map-multiple-places = Více míst
+map-show-photos = { $count ->
+    [one] Zobrazit { $count } fotografii
+    [few] Zobrazit { $count } fotografie
+    [many] Zobrazit { $count } fotografie
+   *[other] Zobrazit { $count } fotografií
+}
 map-play-journey = Přehrát cestu
 map-stop-n = Zastávka { $n }
 map-journey-end = Konec cesty

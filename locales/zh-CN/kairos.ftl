@@ -902,6 +902,7 @@ map-count-stops = { $count } 站
 map-photos-on-map = 地图上有 { $count } 张照片
 map-years-ago = { $years } 年前
 map-multiple-places = 多个地点
+map-show-photos = 显示 { $count } 张照片
 map-play-journey = 播放旅程
 map-stop-n = 第 { $n } 站
 map-journey-end = 旅程结束

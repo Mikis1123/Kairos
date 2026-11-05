@@ -902,6 +902,7 @@ map-count-stops = 立ち寄り先 { $count } か所
 map-photos-on-map = マップ上の写真 { $count } 枚
 map-years-ago = { $years }年前
 map-multiple-places = 複数の場所
+map-show-photos = { $count } 枚の写真を表示
 map-play-journey = 旅を再生
 map-stop-n = 立ち寄り先 { $n }
 map-journey-end = 旅の終わり

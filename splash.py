@@ -12,6 +12,8 @@ import sys
 import threading
 
 from PyQt6.QtCore import QEasingCurve, QEventLoop, QPointF, QRectF, Qt, QTimer, QVariantAnimation
+
+from frame_clock import VsyncAnimation
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QRadialGradient
 from PyQt6.QtWidgets import QApplication, QWidget
 
@@ -69,7 +71,7 @@ class KairosSplash(QWidget):
         screen = QApplication.primaryScreen()
         if screen is not None:
             self.move(screen.availableGeometry().center() - self.rect().center())
-        self._anim = QVariantAnimation(self)
+        self._anim = VsyncAnimation(self)
         self._anim.setStartValue(0.0)
         self._anim.setEndValue(1.0)
         self._anim.valueChanged.connect(self._set_t)
@@ -165,7 +167,7 @@ class KairosSplash(QWidget):
             self.close()
             self.deleteLater()
 
-        self._fade = QVariantAnimation(self)
+        self._fade = VsyncAnimation(self)
         self._fade.setStartValue(0.0)
         self._fade.setEndValue(1.0)
         self._fade.setDuration(ms)

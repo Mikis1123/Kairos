@@ -76,7 +76,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QIcon, QPixmap, QImage, QFont, QPainter, QColor, QKeyEvent,
     QPainterPath, QLinearGradient, QRadialGradient, QPen, QKeySequence, QShortcut, QCursor, QImageReader,
-    QImageIOHandler, QPolygonF,
+    QImageIOHandler, QPolygonF, QPaintEvent,
 )
 # QtWebEngine (Qt6WebEngineCore.dll, ~200 MB) is imported at first use only – see web_engine.py
 import web_engine
@@ -117,6 +117,8 @@ import tokens
 import motion
 import ui_controls
 import kinetic_scroll
+import decode_queue
+import micro_previews
 from ui_controls import (ActivityStatus, EmptyState, HintPill, KButton, MenuSelect, NavItem, NavSection,
                          SegmentedControl, SidebarNav, pin_overlay,
                          smooth_rect_path)
@@ -215,6 +217,70 @@ def fetch_media_records(where="", params=(), order_by="m.date_taken DESC, m.id D
         return conn.execute(sql, params).fetchall()
     finally:
         conn.close()
+
+
+def query_people():
+    """Rows (id, name, cover, face count) of the People page. Opens its own connection, so it
+    runs on any thread (bg_jobs)."""
+    conn = get_connection()
+    try:
+        # i18n-ok: SQL
+        return conn.execute("""
+            SELECT p.id, p.name, p.cover_face_path,
+                   COUNT(f.id) as face_count
+            FROM people p
+            LEFT JOIN face_instances f ON f.person_id = p.id AND COALESCE(f.is_valid, 1) = 1
+                 AND f.media_id IN (SELECT id FROM media_items WHERE COALESCE(is_trashed, 0) = 0
+                                    AND COALESCE(is_hidden, 0) = 0)
+            GROUP BY p.id
+            HAVING COUNT(f.id) > 0             -- osoba jen ze Skrytých / z koše se neukáže
+            ORDER BY p.name COLLATE NOCASE
+        """).fetchall()
+    finally:
+        conn.close()
+
+
+def query_events():
+    """(cards, trip ids, covers without a stored tint) of the Events page; any thread."""
+    conn = get_connection()
+    try:
+        cards = fetch_event_cards(conn)
+        trips = {t["id"] for t in journey.list_journeys(conn)}
+        tint_todo = tint.stale_items(conn, cards)      # odstíny obálek (uložené se jen načtou)
+        return cards, trips, tint_todo
+    finally:
+        conn.close()
+
+
+def query_library(unlocked):
+    """(edits, library, trash, hidden) for the grids; any thread."""
+    import quick_edit
+    conn = get_connection()
+    try:
+        edits = quick_edit.load_many(conn)
+    finally:
+        conn.close()
+    return (edits, fetch_media_records(), fetch_media_records(trashed=True),
+            fetch_media_records(hidden=True) if unlocked else [])
+
+
+def siglip_ready_state(wanted):
+    """Sprint 4.0: is the SigLIP 2 index complete enough to answer searches? Any thread."""
+    import ai_engine
+    if not (wanted and ai_engine.siglip_available()):
+        return False
+    have, need = siglip_coverage()
+    return need > 0 and have >= SIGLIP_READY_SHARE * need
+
+
+def load_search_state(wanted):
+    """(siglip ready, {id: vectors}) – the search index the app should use; any thread."""
+    try:
+        ready = siglip_ready_state(wanted)
+    except Exception as e:
+        print(f"[SigLIP] {e}")
+        ready = False
+    return ready, (get_siglip_vectors() if ready else get_search_vectors())
 
 
 def preview_build_order():
@@ -539,6 +605,10 @@ class LRUCache:
         self.cache.move_to_end(key)
         return self.cache[key]
 
+    def peek(self, key):
+        """Like get() without refreshing the entry (prefetch checks must not reorder the LRU)."""
+        return self.cache.get(key)
+
     def put(self, key, value):
         if key in self.cache:
             self.bytes -= self._sizes.pop(key, 0)
@@ -673,6 +743,8 @@ class ThumbnailWorker(QRunnable):
         self.started_ids = None     # Gate 2 A: model's set of dequeued ids (stale-queue cancel)
         self._source_short = None   # true short edge of the decoded source (before scaled decode)
         self.adjustments = None     # pillar 2: quick_edit.Adjustments applied before the tier shrink
+        self.queue = None           # Sprint 2: decode_queue.DecodeQueue – run() decodes its best job
+        self.micro_store = None     # Sprint 2: micro_previews.MicroStore fed as a by-product
         self.setAutoDelete(True)
 
     def _apply_edit(self, img):
@@ -689,6 +761,18 @@ class ThumbnailWorker(QRunnable):
             return img
 
     def run(self):
+        """Sprint 2: a pool slot. With a decode queue the worker decodes whichever queued job is
+        best NOW (nearest the viewport centre, then ahead of the scroll), which may be another
+        item's; jobs for rows that scrolled away were already dropped from the queue."""
+        q = self.queue
+        if q is None:
+            self._decode()
+            return
+        job = q.pop()
+        if job is not None:
+            job._decode()
+
+    def _decode(self):
         if self.started_ids is not None:
             self.started_ids.add(self.item_id)
         img = QImage()
@@ -707,6 +791,9 @@ class ThumbnailWorker(QRunnable):
         img = self._apply_edit(img)
         self.signals.source_short.emit(self.item_id, self._source_short or min(img.width(), img.height()))
         thumb = _shrink_short_edge(img, self.tier)
+        st = self.micro_store
+        if st is not None and not st.has(self.item_id):
+            st.put_image(self.item_id, thumb)          # Sprint 2: the micro preview for free
         self.signals.loaded.emit(self.item_id, thumb, self._tile(thumb))
 
     def _tile(self, thumb):
@@ -773,7 +860,7 @@ class VaultThumbnailWorker(ThumbnailWorker):
         self.media_type, self.paired = rec[3], rec[4]
         self.vault = vault
 
-    def run(self):
+    def _decode(self):
         if self.started_ids is not None:
             self.started_ids.add(self.item_id)
         try:
@@ -831,6 +918,18 @@ class ApplePhotoModel(QAbstractListModel):
         self.fast = False
         self._queued = set()      # ids handed to the pool
         self._started = set()     # ids the pool has dequeued (written from worker threads)
+        # Sprint 2: decodes wait in a viewport-prioritised queue (decode_queue); the view reports
+        # the visible rows and scroll direction on every scroll step (set_viewport)
+        self.decode_queue = decode_queue.DecodeQueue()
+        self._viewport = None     # (first, last, direction) last reported by the view
+        # Sprint 2: micro previews (LQIP) – a soft preview instead of an empty tile
+        self.micro = micro_previews.store()
+        self._micro_requested = False
+        self._micro_poll = QTimer(self)
+        self._micro_poll.setInterval(120)
+        self._micro_poll.timeout.connect(self._check_micro_loaded)
+        if not self.micro.loaded.is_set():
+            self._micro_poll.start()
 
     def set_fast(self, fast: bool):
         fast = bool(fast)
@@ -841,19 +940,84 @@ class ApplePhotoModel(QAbstractListModel):
         # thread's paint took 6.4 ms (CPU + GIL contention), with 2 threads 4.3 ms. Glide with 2,
         # settle with 4.
         self.thread_pool.setMaxThreadCount(DECODE_THREADS_FLING if fast else DECODE_THREADS_REST)
-        if not fast:
+        if fast:
+            self.micro.pause_until = time.monotonic() + 0.6
+        else:
             self.cancel_stale()
         return True
 
     def cancel_stale(self):
-        """Drops decodes that have not started yet (rows that scrolled away); visible rows
-        re-request on the next paint."""
-        self.thread_pool.clear()
-        stale = self._queued - self._started
-        self.loading_ids.difference_update(stale)
-        self._queued.clear()
-        self._started.clear()
-        return len(stale)
+        """Drops decodes that have not started yet for rows outside the keep window (they scrolled
+        away); visible rows re-request on the next paint. With no viewport reported yet: all."""
+        if self._viewport is None:
+            self.thread_pool.clear()
+            dropped = set(self.decode_queue.clear())
+            stale = (self._queued - self._started) | dropped
+            self.loading_ids.difference_update(stale)
+            self._queued.clear()
+            self._started.clear()
+            return len(stale)
+        first, last, direction = self._viewport
+        return len(self.set_viewport(first, last, direction))
+
+    # ── Sprint 2: viewport-prioritised decoding ──
+    def set_viewport(self, first, last, direction=0):
+        """The view's visible rows and scroll direction (+1 down / -1 up / 0). Queued decodes
+        outside the keep window are dropped at once (their ids stop counting as loading, so a
+        row that comes back re-requests). Returns the dropped ids."""
+        self._viewport = (int(first), int(last), int(direction))
+        dropped = self.decode_queue.set_viewport(first, last, direction, fast=self.fast)
+        if dropped:
+            self.loading_ids.difference_update(dropped)
+            self._queued.difference_update(dropped)
+        return dropped
+
+    def prefetch_ahead(self, budget=None):
+        """Predictive prefetch: queue decodes for rows ahead of the scroll (decode_queue's keep
+        window), nearest to the leading edge first. Returns how many were queued."""
+        n = 0
+        rows = self.decode_queue.prefetch_rows()
+        count = len(self.records)
+        for row in rows:
+            if budget is not None and n >= budget:
+                break
+            if not 0 <= row < count:
+                continue
+            rec = self.records[row]
+            item_id = int(rec[0])
+            if item_id in self.loading_ids or item_id in self.failed or self.ram_cache.peek(item_id) is not None:
+                continue
+            self._start_worker(item_id, rec)
+            n += 1
+        return n
+
+    # ── Sprint 2: micro previews ──
+    def has_micro(self, item_id):
+        return self.vault is None and self.micro.has(int(item_id))
+
+    def micro_pixmap(self, item_id):
+        """The soft micro preview of an item still decoding (GUI thread), or None."""
+        if self.vault is not None:
+            return None                 # hidden items never have one
+        return self.micro.pixmap(int(item_id))
+
+    def _check_micro_loaded(self):
+        if not self.micro.loaded.is_set():
+            return
+        self._micro_poll.stop()
+        self.request_micro_backfill()
+        if self.records:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self.records) - 1, 0), [self.ThumbRole])
+
+    def request_micro_backfill(self):
+        """Missing micro previews are built on a low-priority thread from the on-disk thumbnails,
+        starting at the current viewport. Never for the Hidden folder."""
+        if self.vault is not None or not self.records or not self.micro.loaded.is_set():
+            return 0
+        start = self._viewport[0] if self._viewport else 0
+        recs = self.records[start:] + self.records[:start]
+        jobs = [(int(r[0]), r[5]) for r in recs if r[3] != "video" or r[5]]
+        return self.micro.request(jobs, edit_lookup=edit_for)
 
     def set_tier(self, tier: int):
         """Velikost dlaždic se změnila: větší úroveň se dotáhne líně (data() vrací dosavadní
@@ -877,7 +1041,13 @@ class ApplePhotoModel(QAbstractListModel):
             w.adjustments = edit_for(item_id)
         if self.tile_geom is not None and self.vault is None:
             w.tile_geom = self.tile_geom + (tile_shade({"type": rec[3], "is_fav": rec[7]}),)
+        if self.vault is None:
+            w.micro_store = self.micro                  # hidden items never get a micro preview
         self._queued.add(item_id)
+        # Sprint 2: the job waits in the viewport-prioritised queue; the pool slot started here
+        # decodes whichever job is best when a thread picks it up (ThumbnailWorker.run)
+        w.queue = self.decode_queue
+        self.decode_queue.submit(item_id, self.id_to_row.get(item_id, 0), w)
         self.thread_pool.start(w)
 
     def set_tile_geom(self, w_px, h_px, radius, dpr):
@@ -929,13 +1099,19 @@ class ApplePhotoModel(QAbstractListModel):
         self.id_to_row = {int(r[0]): i for i, r in enumerate(self.records)}
         self.loading_ids.clear()
         self.failed.clear()       # soubor se mohl mezitím objevit (připojený disk, opravený náhled)
+        self.decode_queue.clear()             # rows changed meaning: queued jobs are stale
+        self._queued.clear()
+        self._viewport = None
         self.endResetModel()
+        self.request_micro_backfill()          # new items (an import) get their micro previews
 
     def refresh_items(self, ids):
         """Pillar 2: these items' pixels changed (Quick Edit saved): drop their thumbnails and
         pre-rendered tiles and repaint – the next paint decodes them with the new edit."""
         ids = {int(i) for i in ids}
         self.ram_cache.discard(ids)
+        self.micro.invalidate(ids)             # Sprint 2: the micro preview shows the edit too
+        QTimer.singleShot(0, self.request_micro_backfill)
         for item_id in ids:
             old = self._pretiles.pop(item_id, None)
             if old is not None:
@@ -1101,6 +1277,7 @@ TILE_CACHE_BYTES = 64 * 1024 * 1024       # hotové dlaždice mřížky (~500 dl
 class ApplePhotoDelegate(QStyledItemDelegate):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._view = parent                   # plain Python ref: no parent() round trip per tile
         self.cell_size = 180
         self.corner_radius = 10.0
         # Hladké zmenšení + kreslení přes vyhlazenou ořezovou cestu (zaoblené rohy) stálo při
@@ -1246,7 +1423,11 @@ class ApplePhotoDelegate(QStyledItemDelegate):
         """Místo černé díry: načítání = tichá šedá plocha, chyba = ikona + důvod + název."""
         state = index.data(ApplePhotoModel.StateRole) or THUMB_LOADING
         if state == THUMB_LOADING:
-            painter.fillRect(rect, self.placeholder_color)
+            micro = self._micro_pixmap_for(index) if index is not None else None
+            if micro is not None:
+                self._draw_micro(painter, QRectF(rect), micro)     # clipped by the caller's path
+            else:
+                painter.fillRect(rect, self.placeholder_color)
             return
         painter.fillRect(rect, theme.qcolor("surface"))
         meta = index.data(ApplePhotoModel.MetaRole) or {}
@@ -1290,12 +1471,21 @@ class ApplePhotoDelegate(QStyledItemDelegate):
                 return False                            # failure card (icon + text): full paint
             rect = option.rect.adjusted(4, 4, -4, -4)
             if rect.width() > 0 and rect.height() > 0:
-                # a loading tile during a fling: one blit of a cached rounded placeholder
                 dev = painter.device()
                 dpr = dev.devicePixelRatioF() if dev is not None else 1.0
+                radius = max(6.0, min(14.0, rect.width() * 0.07))
+                micro = self._micro_pixmap_for(index)
+                if micro is not None:
+                    # Sprint 2: the soft micro preview until the sharp thumbnail lands: one
+                    # bilinear draw, then only the four corner squares of the mask (blending the
+                    # whole, mostly transparent mask cost about as much as the photo)
+                    self._draw_micro(painter, QRectF(rect), micro)
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+                    self._blit_corners(painter, rect, radius, dpr)
+                    return True
+                # a loading tile during a fling: one blit of a cached rounded placeholder
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-                painter.drawPixmap(rect.topLeft(), self._placeholder_tile(rect.size(),
-                                                                          max(6.0, min(14.0, rect.width() * 0.07)), dpr))
+                painter.drawPixmap(rect.topLeft(), self._placeholder_tile(rect.size(), radius, dpr))
             return True
         rect = option.rect.adjusted(4, 4, -4, -4)
         if rect.width() <= 0 or rect.height() <= 0:
@@ -1308,6 +1498,79 @@ class ApplePhotoDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         painter.drawPixmap(rect.topLeft(), self._tile(pixmap, rect.size(), radius, meta, dpr))
         return True
+
+    # ── Sprint 2: micro previews (LQIP) ──
+    @staticmethod
+    def _draw_micro(painter, rect, micro):
+        """The micro preview cover-scaled into rect (bilinear: the softness is the point). Measured
+        ~0.1-0.25 ms per tile at 4x CPU throttle, and the opaque viewport only repaints the strip
+        a scroll exposes, so each tile is drawn about once."""
+        sw, sh = micro.width(), micro.height()
+        if sw <= 0 or sh <= 0 or rect.width() <= 0 or rect.height() <= 0:
+            return
+        k = max(rect.width() / sw, rect.height() / sh)
+        cw, ch = rect.width() / k, rect.height() / k
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawPixmap(rect, micro, QRectF((sw - cw) / 2, (sh - ch) / 2, cw, ch))
+
+    def _blit_corners(self, painter, rect, radius, dpr):
+        """The page background outside the rounded rect, corner squares only."""
+        mask = self._corner_mask(rect.size(), radius, dpr)
+        c = int(math.ceil(radius)) + 1
+        w, h = rect.width(), rect.height()
+        if c * 2 > min(w, h):
+            painter.drawPixmap(rect.topLeft(), mask)
+            return
+        for x, y in ((0, 0), (w - c, 0), (0, h - c), (w - c, h - c)):
+            painter.drawPixmap(QRectF(rect.left() + x, rect.top() + y, c, c), mask,
+                               QRectF(x * dpr, y * dpr, c * dpr, c * dpr))
+
+    def _micro_pixmap_for(self, index):
+        """The decoded micro preview of a loading item, or None (no preview / Hidden grid).
+
+        Measured (probe: 4 000 items, throttled CPU, wheel flings, interleaved A/B). The grid
+        repaints ~13 tiles per frame, most still loading. Composing a rounded tile pixmap per
+        item (alloc + fill + painter + mask) cost ~0.5 ms each and raised the grid paint p50
+        from 3.4 to 7.7 ms. Drawing the micro preview straight into the viewport plus one cached
+        corner-mask blit costs ~0.12 ms. Lookup is ONE Qt call (index.row()) and pure-Python
+        dict reads: while decoders run, every Python <-> Qt round trip on the GUI thread waits
+        for the GIL."""
+        view = self.parent()
+        model = getattr(view, "photo_model", None) if view is not None else None
+        if model is None:
+            model = view.model() if view is not None else None
+        micro_store = getattr(model, "micro", None)
+        if micro_store is None or getattr(model, "vault", None) is not None:
+            return None
+        try:
+            item_id = int(model.records[index.row()][0])
+        except (AttributeError, IndexError, TypeError):
+            return None
+        return micro_store.pixmap(item_id)
+
+    def _corner_mask(self, size, radius, dpr):
+        """The page background outside the tile's rounded rect: blitted over a square micro
+        preview, it gives the same corners as a finished tile without an antialiased clip path
+        per tile (the grid viewport is opaque, painted in theme "bg")."""
+        key = ("corner-mask", size.width(), size.height(), round(radius, 2), dpr, theme.current())
+        mask = self._tiles.get(key)
+        if mask is None:
+            mask = QPixmap(max(1, round(size.width() * dpr)), max(1, round(size.height() * dpr)))
+            mask.setDevicePixelRatio(dpr)
+            mask.fill(Qt.GlobalColor.transparent)
+            frame = QRectF(0, 0, size.width(), size.height())
+            outer = QPainterPath()
+            outer.addRect(frame.adjusted(-1, -1, 1, 1))
+            outer = outer.subtracted(smooth_rect_path(frame, radius))
+            p = QPainter(mask)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.fillPath(outer, theme.qcolor("bg"))
+            p.end()
+            self._tiles[key] = mask
+            self._tiles_bytes += mask.width() * mask.height() * 4
+        else:
+            self._tiles.move_to_end(key)
+        return mask
 
     def _placeholder_tile(self, size, radius, dpr):
         key = ("placeholder", size.width(), size.height(), round(radius, 2), dpr, theme.current())
@@ -1334,6 +1597,9 @@ class ApplePhotoDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex):
         """Kairos dávka 4: plynulé rohy, při najetí dlaždice „povyskočí“ do mezery (a fotka se
         jemně přiblíží), výběr = prstenec zvýraznění s vnořenou fotkou a fajfkou."""
+        region = getattr(self._view, "_paint_region", None)
+        if region is not None and not region.intersects(option.rect):
+            return                                      # Sprint 2: inside a span, but not dirty
         hover = self._hover(index)
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if hover <= 0.01 and not is_selected and self._blit_resting(painter, option, index):
@@ -1562,6 +1828,10 @@ class AppleGridView(QListView):
         self._scroll_idle.setInterval(SCROLL_IDLE_MS)
         self._scroll_idle.timeout.connect(self._on_scroll_idle)
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        # Sprint 2: the model learns the visible rows + scroll direction (decode priority, drop of
+        # rows scrolled away, predictive prefetch)
+        self._last_scroll_value = None
+        self.photo_model.modelReset.connect(lambda: QTimer.singleShot(0, lambda: self._report_viewport(0)))
         # Gate 2 A: pixel-smooth kinetic scrolling (spring glide per notch, touchpad momentum)
         self._kinetic = kinetic_scroll.KineticScroller(self, reduced=motion.reduced)
         self._kinetic.velocity_changed.connect(self._on_scroll_speed)
@@ -1632,6 +1902,7 @@ class AppleGridView(QListView):
         cell = self._cell_for_columns(self._cols)
         if cell != self.cell_size:
             self._apply_zoom_step(cell)
+        QTimer.singleShot(0, lambda: self._report_viewport(0))
 
     def zoom_by(self, steps, anchor_pos=None):
         """steps > 0 = přiblížit (méně sloupců). Plynule a s fotkou pod kurzorem na místě."""
@@ -1745,6 +2016,7 @@ class AppleGridView(QListView):
         if was_frozen:
             governor.get().release("gesture")
         self.viewport().update()
+        self._report_viewport(0)
 
     def paintEvent(self, event):
         bg = QPainter(self.viewport())        # opaque viewport: the gaps between tiles are ours to paint
@@ -1752,12 +2024,45 @@ class AppleGridView(QListView):
         bg.end()
         if self._frozen is not None:
             self._paint_frozen()
-        else:
+        elif not self._paint_dirty_rows(event):
             super().paintEvent(event)
         frame_meter.tick("grid")            # Fáze 0: doba snímku mřížky (Ctrl+Shift+F)
         if self._first_frame_pending and self.visible_tiles_ready():
             self._first_frame_pending = False
             QTimer.singleShot(0, self.firstFrameRendered.emit)     # až po dokončení tohoto snímku
+
+    def _paint_dirty_rows(self, event):
+        """Sprint 2: QListView repaints every item inside the BOUNDING rect of the dirty region.
+        While flinging, the region is the strip a scroll exposed plus the tiles whose thumbnails
+        just landed, anywhere on screen, so nearly every frame repainted every visible tile (probe:
+        ~24 per frame). Only the tiles the region really touches are repainted, one span per grid
+        row (PyQt6 cannot list a region's rects, but it can test whether a rect intersects).
+        False = a plain region, so QListView paints it."""
+        region = event.region()
+        if region.rectCount() <= 1 or self.photo_model.rowCount() == 0:
+            return False
+        layout = self._current_grid()
+        vp = self.viewport().rect()
+        first, last = layout.index_range(QRectF(vp))
+        if last < first:
+            return False
+        cols = layout.cols
+        spans = []
+        for r0 in range(first - first % cols, last + 1, cols):
+            hit = [i for i in range(max(r0, first), min(r0 + cols, last + 1))
+                   if region.intersects(layout.rect(i).toAlignedRect())]
+            if hit:
+                span = layout.rect(hit[0]).united(layout.rect(hit[-1])).toAlignedRect() & vp
+                if not span.isEmpty():
+                    spans.append(span)
+        self._paint_region = region     # the delegate skips span tiles the region misses
+        try:
+            for span in spans:          # the painter's system clip is still the real region
+                super().paintEvent(QPaintEvent(span))
+        finally:
+            self._paint_region = None
+        self.dirty_spans = len(spans)
+        return True
 
     def visible_tiles_ready(self, cap=240):
         """True, když žádná viditelná dlaždice už nečeká na náhled (prázdná mřížka = hotovo)."""
@@ -1799,7 +2104,11 @@ class AppleGridView(QListView):
             idx = model.index(i, 0)
             pix = model.data(idx, ApplePhotoModel.ThumbRole)
             if pix is None or pix.isNull():
-                p.fillRect(r, placeholder)
+                micro = model.micro_pixmap(int(model.records[i][0]))
+                if micro is not None:
+                    delegate._draw_micro(p, r, micro)
+                else:
+                    p.fillRect(r, placeholder)
                 continue
             tile = delegate._tile(pix, rest, radius, model.data(idx, ApplePhotoModel.MetaRole) or {}, dpr)
             p.drawPixmap(r, tile, QRectF(tile.rect()))
@@ -1900,6 +2209,25 @@ class AppleGridView(QListView):
             self.live_preview.stop()
             self._drop_hover()
         self._scroll_idle.start()
+        self._report_viewport()
+
+    def _report_viewport(self, direction=None):
+        """Sprint 2: visible rows + scroll direction to the model: queued decodes for rows that
+        scrolled away are dropped, the rest are served centre-first, and rows ahead of the
+        scroll are queued (predictive prefetch)."""
+        model = self.photo_model
+        if self._frozen is not None or model.rowCount() == 0 or self.viewport().height() <= 0:
+            return
+        value = self.verticalScrollBar().value()
+        prev = self._last_scroll_value
+        if direction is None:
+            direction = 0 if prev is None or value == prev else (1 if value > prev else -1)
+        self._last_scroll_value = value
+        first, last = self._current_grid().index_range(QRectF(self.viewport().rect()))
+        if last < first:
+            return
+        model.set_viewport(first, last, direction)
+        model.prefetch_ahead()
 
     def _drop_hover(self):
         """Zvednutá dlaždice okamžitě dolů (bez animace) – při posunu by jinak animovala
@@ -1913,6 +2241,7 @@ class AppleGridView(QListView):
 
     def _on_scroll_idle(self):
         self._scrolling = False
+        self._report_viewport(0)            # at rest: warm a screen above and below
         pos = self.viewport().mapFromGlobal(QCursor.pos())
         if self.viewport().rect().contains(pos) and self.isVisible():
             idx = self.indexAt(pos)
@@ -4104,11 +4433,14 @@ class MainWindow(QMainWindow):
         if getattr(self, "_shutting_down", False):
             return
         boot_trace.mark("deferred_services")
-        self._load_people()
-        self._load_events()
-        self._check_siglip_ready()          # Sprint 4.0: přesné hledání, je-li zapnuté a index hotový
+        # 120 Hz pass: zero-stall GUI thread. The reads run on bg_jobs' pool and arrive as
+        # finished results (the vector tables are tens of MB; they used to stall the first frames).
+        self._load_people_async()
+        self._load_events_async()
         if not getattr(self, "_embeddings_loaded", False):
-            self._load_embeddings()
+            self._load_embeddings_async()   # + Sprint 4.0 SigLIP readiness, in the same worker
+        else:
+            self._check_siglip_ready_async()
         self._start_ai_daemon()
         QTimer.singleShot(VIEWER_PREWARM_DELAY_MS, self._prewarm_viewer)
         QTimer.singleShot(SMART_IMPORT_DELAY_MS, self._smart_import_check)
@@ -4841,7 +5173,22 @@ class MainWindow(QMainWindow):
         for model in list(_LIVE_MODELS):
             model.refresh_items([int(media_id)])
 
+    def _load_photos_async(self, *_):
+        """Daemon-triggered library refresh: the three grid queries (~46 ms at 20k items) and
+        the edits map are read on bg_jobs' pool; the grid re-filters when they land."""
+        unlocked = bool(self.locked.is_unlocked)
+
+        def done(state):
+            edits, records, trash, hidden = state
+            EDITS.clear()
+            EDITS.update(edits)
+            self._all_records, self._trash_records = records, trash
+            self._hidden_records = hidden if self.locked.is_unlocked else []
+            self._apply_filter_and_sort()
+        self._bg_loads().run("photos", lambda: query_library(unlocked), done, lambda e: print(f"[Load] {e}"))
+
     def _load_photos(self):
+        self._cancel_bg("photos")
         self._load_edits()
         try:
             self._all_records = fetch_media_records()
@@ -4854,27 +5201,33 @@ class MainWindow(QMainWindow):
             self._hidden_records = []
         self._apply_filter_and_sort()
 
+    def _bg_loads(self):
+        """bg_jobs.BackgroundLoads of this window (created on first use)."""
+        bg = getattr(self, "_bg", None)
+        if bg is None:
+            import bg_jobs
+            bg = self._bg = bg_jobs.BackgroundLoads(self)
+        return bg
+
+    def _cancel_bg(self, key):
+        bg = getattr(self, "_bg", None)
+        if bg is not None:
+            bg.cancel(key)
+
     def _load_people(self):
+        """Synchronous (an explicit edit the user is waiting for); background refreshes use
+        _load_people_async."""
+        self._cancel_bg("people")               # a slower background read must not overwrite this
         try:
-            conn = get_connection()
-            c = conn.cursor()
-            # i18n-ok: SQL
-            c.execute("""
-                SELECT p.id, p.name, p.cover_face_path,
-                       COUNT(f.id) as face_count
-                FROM people p
-                LEFT JOIN face_instances f ON f.person_id = p.id AND COALESCE(f.is_valid, 1) = 1
-                     AND f.media_id IN (SELECT id FROM media_items WHERE COALESCE(is_trashed, 0) = 0
-                                        AND COALESCE(is_hidden, 0) = 0)
-                GROUP BY p.id
-                HAVING COUNT(f.id) > 0             -- osoba jen ze Skrytých / z koše se neukáže
-                ORDER BY p.name COLLATE NOCASE
-            """)
-            people = c.fetchall()
+            people = query_people()
         except Exception as e:
             print(f"[People] {e}")
             people = []
         self._render_people_cards(people)
+
+    def _load_people_async(self, *_):
+        self._bg_loads().run("people", query_people, self._render_people_cards,
+                             lambda e: print(f"[People] {e}"))
 
     def _render_people_cards(self, people):
         while self._people_flow.count():
@@ -5063,17 +5416,19 @@ class MainWindow(QMainWindow):
         self._update_people_empty(visible)
 
     def _load_events(self):
+        self._cancel_bg("events")
         try:
-            conn = get_connection()
-            try:
-                cards = fetch_event_cards(conn)
-                trips = {t["id"] for t in journey.list_journeys(conn)}
-                tint_todo = tint.stale_items(conn, cards)      # odstíny obálek (uložené se jen načtou)
-            finally:
-                conn.close()
+            cards, trips, tint_todo = query_events()
         except Exception as e:
             print(f"[Events] {e}")
             cards, trips, tint_todo = [], set(), []
+        self._apply_events(cards, trips, tint_todo)
+
+    def _load_events_async(self, *_):
+        self._bg_loads().run("events", query_events, lambda d: self._apply_events(*d),
+                             lambda e: print(f"[Events] {e}"))
+
+    def _apply_events(self, cards, trips, tint_todo):
         for ev in cards:
             ev["journey"] = int(ev["id"]) in trips
         self._event_cards = cards
@@ -5161,7 +5516,7 @@ class MainWindow(QMainWindow):
             return
         if need > 0 and have >= SIGLIP_READY_SHARE * need:
             self._siglip_ready = True
-            self._load_embeddings()
+            self._load_embeddings_async()
             show_toast(self, tr("search-precise-ready"), "success")
 
     def _merge_siglip(self, ids):
@@ -5179,8 +5534,7 @@ class MainWindow(QMainWindow):
             if dl is not None and dl.isRunning():
                 dl.stop()
             ai_engine.release_siglip()
-        if self._check_siglip_ready() or was_on != now_on:
-            self._load_embeddings()
+        self._load_embeddings_async()          # readiness + vectors off the GUI thread
 
     def _start_siglip_download(self):
         import siglip_engine
@@ -5211,12 +5565,42 @@ class MainWindow(QMainWindow):
         return get_siglip_vectors(ids) if self._precise_active() else get_search_vectors(ids)
 
     def _load_embeddings(self):
+        self._cancel_bg("embeddings")
         try:
             self._embeddings_cache = self._search_vectors()     # videa: plakát + snímky celého klipu
         except Exception as e:
             print(f"[Embeddings] {e}")
             self._embeddings_cache = {}
         self._embeddings_loaded = True
+        self._after_embeddings_loaded()
+
+    def _load_embeddings_async(self, *_):
+        """Vectors (and SigLIP readiness) off the GUI thread; the search reruns when they land."""
+        wanted = self._precise_wanted()
+        self._bg_loads().run("embeddings", lambda: load_search_state(wanted), self._on_embeddings_loaded,
+                             lambda e: self._on_embeddings_loaded((getattr(self, "_siglip_ready", False), {})))
+
+    def _on_embeddings_loaded(self, state):
+        ready, vectors = state
+        self._siglip_ready = ready
+        self._embeddings_cache = vectors
+        self._embeddings_loaded = True
+        self._after_embeddings_loaded()
+
+    def _check_siglip_ready_async(self):
+        wanted = self._precise_wanted()
+
+        def done(ready):
+            if ready != getattr(self, "_siglip_ready", False):
+                self._siglip_ready = ready
+                self._load_embeddings_async()          # the other index now answers searches
+        self._bg_loads().run("siglip_ready", lambda: siglip_ready_state(wanted), done)
+
+    def _after_embeddings_loaded(self):
+        if getattr(self, "_search_after_embeddings", False):
+            self._search_after_embeddings = False
+            self._run_ai_search()                      # typed before the vectors arrived
+            return
         # démon opravil / doplnil embeddingy -> běžící hledání se zpřesní samo
         if self._search_query.strip() and self._search_result is not None:
             self._search_debounce.start()
@@ -5224,11 +5608,17 @@ class MainWindow(QMainWindow):
     def _merge_embeddings(self, ids):
         """Démon doplnil vektory těchto položek: jen je přidat do cache. Dřív se každých 25
         položek načítala celá knihovna v GUI vlákně (desítky MB, sekundové záseky)."""
-        try:
-            fresh = self._search_vectors(ids)
-        except Exception as e:
-            print(f"[Embeddings] {e}")
-            return
+        ids = [int(i) for i in ids]
+        precise = self._precise_active()
+        self._merge_seq = getattr(self, "_merge_seq", 0) + 1       # every batch lands (no latest-wins)
+        self._bg_loads().run(f"merge-{self._merge_seq}",
+                             lambda: get_siglip_vectors(ids) if precise else get_search_vectors(ids),
+                             lambda fresh: self._apply_merged_vectors(fresh, precise),
+                             lambda e: print(f"[Embeddings] {e}"))
+
+    def _apply_merged_vectors(self, fresh, precise):
+        if precise != self._precise_active():
+            return                                     # the index switched meanwhile: a full load follows
         cache = getattr(self, "_embeddings_cache", None)
         if cache is None:
             self._embeddings_cache = cache = {}
@@ -5256,10 +5646,10 @@ class MainWindow(QMainWindow):
         self._ai_daemon.siglip_enabled = self._precise_wanted()
         self._ai_daemon.siglip_added.connect(self._merge_siglip)
         self._ai_daemon.siglip_progress.connect(self._on_siglip_progress)
-        self._ai_daemon.people_updated.connect(self._load_people)
-        self._ai_daemon.embeddings_updated.connect(self._load_embeddings)
+        self._ai_daemon.people_updated.connect(self._load_people_async)
+        self._ai_daemon.embeddings_updated.connect(self._load_embeddings_async)
         self._ai_daemon.embeddings_added.connect(self._merge_embeddings)
-        self._ai_daemon.thumbs_repaired.connect(self._load_photos)
+        self._ai_daemon.thumbs_repaired.connect(self._load_photos_async)
         self._ai_daemon.face_crops_repaired.connect(self._on_face_crops_repaired)
         self._ai_daemon.status_changed.connect(self._on_daemon_status)
         self._ai_daemon.identity_checked.connect(self._on_identity_checked)
@@ -5626,7 +6016,19 @@ class MainWindow(QMainWindow):
         # běžící QThread (pád). Starší hledání doběhnou samy, jejich výsledky se zahodí.
         # Hledá se v aktuální kolekci (i v koši); fazety (místo, čas, typ) fungují i bez modelu.
         if not getattr(self, "_embeddings_loaded", False):
-            self._load_embeddings()           # search typed before the deferred start-up tick
+            # typed before the deferred start-up tick: the vectors are read in the background
+            # (tens of MB – never on the GUI thread). With nothing cached yet the search waits
+            # for them; otherwise it runs now and refines itself when they land.
+            # Decide BEFORE starting the load: it may deliver at once (cached / SYNC) and its
+            # _after_embeddings_loaded must already see the flag, else the search never runs
+            # and the "search" activity indicator sticks.
+            if not self._embeddings_cache:
+                self._search_after_embeddings = True
+                if not self._bg_loads().pending("embeddings"):
+                    self._load_embeddings_async()          # may rerun this search inline
+                return
+            if not self._bg_loads().pending("embeddings"):
+                self._load_embeddings_async()
         universe = [int(r[0]) for r in self._collection_records()]
         worker = AISearchWorker(self._search_query, self._embeddings_cache, universe)
         worker.search_finished.connect(self._on_search_results)
@@ -5662,9 +6064,9 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(idx)
         self._sync_sidebar()
         if idx == 1:
-            self._load_people()
+            self._load_people_async()           # the tab shows at once; fresh cards follow
         elif idx == 2:
-            self._load_events()
+            self._load_events_async()
         elif idx == 3:
             self._ensure_map_view()
             # after the tab has painted: the marker query + JSON grows with the library and would
@@ -7568,6 +7970,10 @@ class MainWindow(QMainWindow):
         if self._search_warmup is not None:
             self._search_warmup.wait()          # načítání modelu nejde přerušit; zničení běžícího QThread = pád
         self._person_card_pool.waitForDone(2000)
+        bg = getattr(self, "_bg", None)              # 120 Hz pass: background library reads
+        if bg is not None:
+            bg.pool.clear()
+            bg.pool.waitForDone(3000)
         if isinstance(getattr(self, "map_view", None), map_host.WebView2Host):
             self.map_view.close_webview()       # WebView2 browser process ends with its controller
         super().closeEvent(event)

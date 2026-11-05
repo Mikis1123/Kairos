@@ -13,9 +13,11 @@ postup ≥ DISMISS_PROGRESS nebo rychlost dolů ≥ DISMISS_VELOCITY = doletět 
 import time
 from collections import deque
 
-from PyQt6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, Qt, QVariantAnimation, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter
+from PyQt6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRect, QRectF, Qt, QVariantAnimation, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QRegion
 from PyQt6.QtWidgets import QWidget
+
+from frame_clock import VsyncAnimation
 
 import motion
 import tokens
@@ -97,6 +99,9 @@ def cover_source(size, rect):
     return QRectF(0, (h - ch) / 2, w, ch)
 
 
+BACKDROP_FLOOR = 0.04            # grid fade: below this the backdrop is painted as black
+
+
 # ── překryv ───────────────────────────────────────────────────────────────────
 
 class HeroOverlay(QWidget):
@@ -112,7 +117,7 @@ class HeroOverlay(QWidget):
         self.radius = 0.0
         self.backdrop_op = 0.0
         self.crop = 0.0                  # 1 = výřez jako v dlaždici, 0 = celá fotka
-        self._anim = QVariantAnimation(self)
+        self._anim = VsyncAnimation(self)        # hero open/close on the vblank clock
         self._anim.setStartValue(0.0)
         self._anim.setEndValue(1.0)
         self._anim.valueChanged.connect(self._step)
@@ -127,9 +132,22 @@ class HeroOverlay(QWidget):
         self.show()
         self.raise_()
 
+    def _backdrop_level(self, b):
+        """What the backdrop paints for opacity b: the (remapped) level, or the flat colour."""
+        if self.backdrop is None:
+            return ("flat", round(b, 4))
+        return ("grid", 1.0 if b >= 1.0 else round(max(0.0, (b - BACKDROP_FLOOR) / (1.0 - BACKDROP_FLOOR)), 4))
+
     def set_state(self, rect, radius, backdrop_op, crop=0.0):
+        old_rect, old_level = self.rect_now, self._backdrop_level(self.backdrop_op)
         self.rect_now, self.radius, self.backdrop_op, self.crop = QRectF(rect), radius, backdrop_op, crop
-        self.update()
+        if old_level == self._backdrop_level(backdrop_op) and not old_rect.isEmpty() and self.isVisible():
+            # Unchanged background (e.g. black once the grid has faded): only the photo's old and
+            # new bounds change. Under the RHI backing store a smaller dirty region is also a
+            # smaller texture upload per frame.
+            self.update(old_rect.united(self.rect_now).toAlignedRect().adjusted(-2, -2, 2, 2))
+        else:
+            self.update()
 
     def state(self):
         return (QRectF(self.rect_now), self.radius, self.backdrop_op, self.crop)
@@ -168,21 +186,49 @@ class HeroOverlay(QWidget):
         self.image = self.backdrop = None
         self.hide()
 
+    def _opaque_hole(self):
+        """Integer rect fully covered by the opaque photo (inside the rounded corners)."""
+        import math
+        r = self.rect_now
+        inset = min(self.radius * 1.6, r.width() / 2.0, r.height() / 2.0) * 0.3 + 1.0
+        x0, y0 = math.ceil(r.left() + inset), math.ceil(r.top() + inset)
+        x1, y1 = math.floor(r.right() - inset), math.floor(r.bottom() - inset)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return QRect()
+        return QRect(x0, y0, x1 - x0, y1 - y0)
+
     def paintEvent(self, _):
+        # 120 Hz budget at 3K (5.2 Mpx per frame, software raster; a full-screen pass costs
+        # 2-4 ms in the real backing store): nothing under the opaque photo is painted. A
+        # black fill + backdrop at opacity b measured slower than blit + translucent fill.
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         b = self.backdrop_op
+        has_image = self.image is not None and not self.image.isNull() and not self.rect_now.isEmpty()
+        hole = self._opaque_hole() if has_image else QRect()
+        if not hole.isEmpty():
+            p.setClipRegion(QRegion(self.rect()).subtracted(QRegion(hole)))
+        if self.backdrop is not None:
+            # The last few % of the grid's fade are below what an OLED shows against the photo.
+            # Remapped so it reaches black a little early (continuous, no pop). The second
+            # half of an open then costs a black fill, not a full-screen blit + blend.
+            b = max(0.0, (b - BACKDROP_FLOOR) / (1.0 - BACKDROP_FLOOR)) if b < 1.0 else 1.0
         if self.backdrop is not None and b > 0.0:
             p.drawPixmap(self.rect(), self.backdrop)
-            p.fillRect(self.rect(), QColor(0, 0, 0, round(255 * (1.0 - b))))
+            if b < 1.0:
+                p.fillRect(self.rect(), QColor(0, 0, 0, round(255 * (1.0 - b))))
+        elif self.backdrop is not None:
+            p.fillRect(self.rect(), QColor(0, 0, 0))
         else:                                 # bez snímku mřížky: neprůhledně k barvě pozadí aplikace
             p.fillRect(self.rect(), tokens.mix(QColor("#000000"), tokens.qcolor(tokens.palette()["bg"]), b))
-        if self.image is not None and not self.image.isNull() and not self.rect_now.isEmpty():
+        p.setClipping(False)
+        if has_image:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
             src_full = QRectF(0, 0, self.image.width(), self.image.height())
             src_crop = cover_source(self.image.size(), self.rect_now)
             src = lerp_rect(src_full, src_crop, self.crop)
-            p.setClipPath(smooth_rect_path(self.rect_now, self.radius))
+            if self.radius >= 0.3:            # sub-pixel corners: the AA clip mask isn't worth its cost
+                p.setClipPath(smooth_rect_path(self.rect_now, self.radius))
             p.drawPixmap(self.rect_now, self.image, src)
         p.end()
 
@@ -281,7 +327,7 @@ class DismissController(QObject):
             self.overlay.animate_to(target, settle_ms(dist, vy), motion.easing("emphasized"), "dismissed")
         else:
             self.overlay.animate_to((QRectF(self._fit), 0.0, 0.0, 0.0), motion.duration("spring"),
-                                    motion.easing("spring"), "restored")
+                                    motion.curve("spring"), "restored")
 
     def cancel(self):
         self.active = False

@@ -1007,6 +1007,10 @@ map-years-ago = { $years ->
    *[other] Vor { $years } Jahren
 }
 map-multiple-places = Mehrere Orte
+map-show-photos = { $count ->
+    [one] { $count } Foto anzeigen
+   *[other] { $count } Fotos anzeigen
+}
 map-play-journey = Reise abspielen
 map-stop-n = Station { $n }
 map-journey-end = Ende der Reise

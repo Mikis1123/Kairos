@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 
 import frame_meter
+from frame_clock import VsyncAnimation, VsyncPropertyAnimation
 import viewer_zoom
 
 HUD_HIDE_DELAY_MS = 2000
@@ -151,7 +152,7 @@ class MediaCanvas(QGraphicsView):
         self._pixmap = QPixmap()            # zdrojový (plný) snímek aktuální fotky
         self._sources = {self.photo_item: QPixmap(), self.back_item: QPixmap()}
         self._content_rev = 0
-        self._fade = QVariantAnimation(self)
+        self._fade = VsyncAnimation(self)
         self._fade.setStartValue(0.0)
         self._fade.setEndValue(1.0)
         self._fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
@@ -406,11 +407,15 @@ class MediaCanvas(QGraphicsView):
         if src is None or src.isNull() or vw <= 0 or vh <= 0:
             return
         dpr = self.devicePixelRatioF()
+        # 3K sharpness: fit in DEVICE pixels and put the top-left on a whole device pixel. The
+        # pixmap is then copied 1:1. Before, at 125 % / 150 % the logical centring (x.5) landed
+        # on a fractional device pixel, and the smooth item resampled the whole photo once more
+        # (a second resample, a soft image).
+        dw, dh = max(1, round(vw * dpr)), max(1, round(vh * dpr))
         size = src.deviceIndependentSize()
         pw, ph = max(1.0, size.width()), max(1.0, size.height())
-        scale = min(vw / pw, vh / ph)
-        tw, th = max(1, round(pw * scale)), max(1, round(ph * scale))
-        target = QSize(round(tw * dpr), round(th * dpr))
+        scale = min(dw / pw, dh / ph)
+        target = QSize(max(1, round(pw * scale)), max(1, round(ph * scale)))
         if src.size() == target:
             shown = QPixmap(src)
         else:
@@ -418,7 +423,7 @@ class MediaCanvas(QGraphicsView):
         shown.setDevicePixelRatio(dpr)
         item.setScale(1.0)
         item.setPixmap(shown)
-        item.setPos((vw - tw) / 2, (vh - th) / 2)
+        item.setPos(((dw - target.width()) // 2) / dpr, ((dh - target.height()) // 2) / dpr)
 
     def _refit_smooth(self):
         self._fit(self.photo_item)
@@ -687,7 +692,7 @@ class GlassPanel(QWidget):
         self._opacity = QGraphicsOpacityEffect(self)
         self._opacity.setOpacity(1.0)
         self.setGraphicsEffect(self._opacity)
-        self._anim = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._anim = VsyncPropertyAnimation(self._opacity, b"opacity", self)
         self._anim.setDuration(HUD_FADE_MS)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.finished.connect(self._on_anim_done)

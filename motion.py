@@ -6,9 +6,10 @@ Vizuální efekty › Animační efekty vypnuté, nebo volba v Předvolbách) se
 """
 import sys
 
-from PyQt6.QtCore import QAbstractAnimation, QEasingCurve, QObject, QVariantAnimation, pyqtSignal
+from PyQt6.QtCore import QAbstractAnimation, QEasingCurve, QObject, pyqtSignal
 
 import tokens
+from frame_clock import VsyncAnimation, spring_curve
 
 _user_reduce = False        # Předvolby › Omezit animace
 _system_cache = None        # stav Windows (zjišťuje se jednou, obnoví refresh_system())
@@ -56,6 +57,15 @@ def duration(kind="standard"):
     return 0 if reduced() else tokens.MOTION[kind][0]
 
 
+_SPRING = spring_curve()
+
+
+def curve(kind="standard"):
+    """Easing for vsync animations: the "spring" kind is a real damped spring (closed form),
+    the others the token's cubic curve."""
+    return _SPRING if kind == "spring" else easing(kind)
+
+
 def easing(kind="standard"):
     curve = QEasingCurve(getattr(QEasingCurve.Type, tokens.MOTION[kind][1]))
     if kind == "spring":
@@ -77,7 +87,7 @@ class Tween(QObject):
         self.target = value
         self._owner = owner
         self._on_change = on_change
-        self._anim = QVariantAnimation(self)
+        self._anim = VsyncAnimation(self)        # 120 Hz: paced by the display's vblank
         self._anim.valueChanged.connect(self._step)
         self._anim.finished.connect(self._done)
 
@@ -120,5 +130,5 @@ class Tween(QObject):
         self._anim.setStartValue(self.value)
         self._anim.setEndValue(value)
         self._anim.setDuration(ms)
-        self._anim.setEasingCurve(easing(kind))
+        self._anim.setEasingCurve(curve(kind))
         self._anim.start()

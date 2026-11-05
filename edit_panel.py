@@ -87,6 +87,11 @@ class EditPanel(QWidget):
         self.btn_done = QPushButton(tr("common-done"))
         self.btn_done.setObjectName("EditDone")
         self.btn_done.clicked.connect(self.done.emit)
+        # Field bug: a clicked Done kept the keyboard focus, and when the panel hid Qt passed it on
+        # to the next widget in the chain – the sidebar – so E / Esc / arrows no longer reached
+        # the viewer. The panel is mouse-only; the viewer keeps the keys (Enter / Esc commit).
+        for b in (self.btn_cancel, self.btn_done):
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         head.addWidget(self.btn_cancel)
         head.addWidget(self.btn_done)
         lay.addLayout(head)
@@ -119,6 +124,7 @@ class EditPanel(QWidget):
             self.tone_values[key] = v
         lay.addStretch(1)
         self.btn_revert = QPushButton(tr("edit-revert"))
+        self.btn_revert.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_revert.clicked.connect(self.revert.emit)
         lay.addWidget(self.btn_revert)
         self.set_adjustments(self._adj)

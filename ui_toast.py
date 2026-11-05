@@ -5,7 +5,7 @@ překryvné děti dole uprostřed. Potvrzení zmizí samo po 3 s (pozastaví se 
 chyby zůstávají, dokud je uživatel nezavře – neúspěšné uložení nesmí tiše zmizet.
 """
 from i18n import tr
-from PyQt6.QtCore import Qt, QObject, QTimer, QEvent, QPropertyAnimation, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, QTimer, QEvent, pyqtSignal
 from PyQt6.QtGui import QPainter, QPixmap
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QGraphicsOpacityEffect
 
@@ -101,7 +101,8 @@ class Toast(QFrame):
         self._opacity = QGraphicsOpacityEffect(self)
         self._opacity.setOpacity(0.0)
         self.setGraphicsEffect(self._opacity)
-        self._fade = QPropertyAnimation(self._opacity, b"opacity", self)
+        from frame_clock import VsyncPropertyAnimation
+        self._fade = VsyncPropertyAnimation(self._opacity, b"opacity", self)
 
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
