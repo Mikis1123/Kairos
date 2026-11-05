@@ -401,18 +401,19 @@ def test_main_presents_settings_as_sheet():
 # ── 5. Viewer mini-map + people ──────────────────────────────────────────────────────────────
 
 def test_mini_map_uses_the_main_map_style_and_tile_store():
-    mini = _read("mini_map.html")
-    assert "styles/dark" not in mini and "map_style.js" in mini
-    assert "MS.standard(" in mini and "transformRequest" in mini and "TILE_STORE_CONFIG" in mini
+    # Sprint 3: the mini-map is native (mini_map.py) – Standard's light raster from the tile store,
+    # an accent "here" dot instead of a red drop
+    mini = _read("mini_map.py")
+    assert "World_Street_Map" in mini and "tile_store" in mini and "#E4E8EC" in mini
     assert "#FF3B30" not in mini, "žádná červená kapka"
-    assert "here-pulse" in mini and "prefers-reduced-motion" in mini
+    assert "_paint_pin" in mini and "self.accent" in mini
     main_page = _read("map_vault.html")
     assert '<script src="map_style.js"></script>' in main_page
     assert "MS.localize(" in main_page and "var pastelize = MS.pastelize" in main_page
     assert "map_style.js" in _read("app.spec")
     viewer_src = _read("viewer.py")
-    assert "self.page_setup(m.page())" in viewer_src and "setAccent" in viewer_src
-    assert "viewer.page_setup = attach_tile_store" in _read("main.py")
+    assert "m.service_provider = self.tile_service" in viewer_src and 'tokens.accent("dark")' in viewer_src
+    assert "viewer.tile_service = mini_map_tile_service" in _read("main.py")
 
 
 @qt

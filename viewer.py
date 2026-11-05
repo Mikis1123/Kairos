@@ -36,7 +36,6 @@ SCRUB_REVEAL_TIMEOUT_MS = 600  # po puštění: přesný snímek nepřišel -> o
 from database import get_connection, toggle_favorite
 from paths import RESOURCE_DIR, resolve_face_path
 
-MINI_MAP_PAGE = "mini_map.html"          # vedle map_vault.html v RESOURCE_DIR
 
 def _iso_date(dt):
     """EXIF '2025:06:14 10:22:01' i ISO '2025-06-14 10:22' -> '2025-06-14'."""
@@ -268,8 +267,8 @@ class FaceChip(QAbstractButton):
 class MediaViewerWidget(QWidget):
     edits_changed = pyqtSignal(int)
     export_requested = pyqtSignal(int)       # pillar 3: Export Sheet for the current item          # pillar 2: media id whose Quick Edit was saved / reverted
-    web_profile_factory = None                     # instance: () -> trvalý profil mapy (main.create_media_viewer)
-    page_setup = None                              # (QWebEnginePage) -> None: úložiště dlaždic (main.attach_tile_store)
+    tile_service = None                            # () -> TileServer or None (main.create_media_viewer)
+    show_on_map_requested = pyqtSignal(float, float)   # mini-map click: open the Map tab at (lat, lon)
     close_requested = pyqtSignal()
     favorite_changed_signal = pyqtSignal(int, int)
     fullscreen_toggled = pyqtSignal(bool)          # hlavní okno přepne celou obrazovku
@@ -394,11 +393,9 @@ class MediaViewerWidget(QWidget):
         self.lbl_map_hdr = _caption(tr("viewer-place-taken"))
         self.info_layout.addWidget(self.lbl_map_hdr)
 
-        # Minimapa se vytvoří až při prvním zobrazení polohy v panelu Info (_ensure_mini_map):
-        # stránka QWebEngine stojí ~1 s v GUI vlákně a většina prohlížení panel Info neotevře.
+        # Sprint 3: native mini-map (mini_map.py) – tiles from the tile store composited by Qt,
+        # no second Chromium page. Created at the first place shown, costs nothing before.
         self.mini_map = None
-        self._mini_map_ready = False
-        self._mini_place = None              # (lat, lon) čekající na načtení stránky minimapy
         self._mini_map_index = self.info_layout.count()
 
         self.btn_gmap = QPushButton(tr("viewer-open-google-maps"))
@@ -1013,7 +1010,7 @@ class MediaViewerWidget(QWidget):
             self.lbl_map_hdr.setVisible(True)
             self._ensure_mini_map().setVisible(True)
             self.btn_gmap.setVisible(True)
-            self._show_mini_place(float(lat), float(lon))
+            self.mini_map.show_place(float(lat), float(lon))
         else:
             self.lbl_map_hdr.setVisible(False)
             if self.mini_map is not None:
@@ -1028,55 +1025,20 @@ class MediaViewerWidget(QWidget):
         return chip
 
     def _ensure_mini_map(self):
-        """Minimapa = mini_map.html (přibalený MapLibre GL, jako hlavní mapa). Načte se jednou;
-        další fotky jen posunou pin přes window.showPlace."""
+        """Native mini-map (mini_map.MiniMapWidget): one widget for the viewer's lifetime, every
+        photo just moves the place. A click asks the main window for the Map tab there."""
         if self.mini_map is None:
-            from PyQt6.QtWebEngineCore import QWebEngineSettings   # lazy QtWebEngine (web_engine.py)
-            from PyQt6.QtWebEngineWidgets import QWebEngineView
-            m = QWebEngineView()
-            profile = self.web_profile_factory() if self.web_profile_factory else None
-            from web_console import QuietWebPage   # konzole WebGL bez opakovaných hlášení
-            # trvalý profil hlavní mapy: sdílená disková cache dlaždic
-            m.setPage(QuietWebPage(profile, m, tag="Minimapa") if profile is not None
-                      else QuietWebPage(m, tag="Minimapa"))
-            m.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-            m.setFixedHeight(180)
-            # Stránka z file:// (přibalený MapLibre) smí načíst styl a dlaždice povolených serverů
-            m.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-            m.setStyleSheet("border-radius: 10px; border: 1px solid #2C2C2E; background-color: #E4E8EC;")
-            m.page().setBackgroundColor(QColor("#E4E8EC"))      # pozadí Základní – žádný černý záblesk
-            if self.page_setup is not None:
-                try:
-                    self.page_setup(m.page())       # dlaždice přes místní úložiště (jako hlavní mapa)
-                except Exception as e:
-                    print(f"[Minimapa] úložiště dlaždic: {e}")
-            m.loadFinished.connect(self._on_mini_map_loaded)
-            m.load(QUrl.fromLocalFile(os.path.join(RESOURCE_DIR, MINI_MAP_PAGE)))
+            import mini_map
+            import tokens
+            m = mini_map.MiniMapWidget(accent=tokens.accent("dark")["accent"])
+            if self.tile_service is not None:
+                m.service_provider = self.tile_service
+            m.setToolTip(tr("viewer-mini-map-open"))
+            m.setAccessibleName(tr("viewer-mini-map-open"))
+            m.clicked.connect(self.show_on_map_requested)
             self.info_layout.insertWidget(self._mini_map_index, m)
             self.mini_map = m
         return self.mini_map
-
-    def _show_mini_place(self, lat, lon):
-        self._mini_place = (lat, lon)
-        if self._mini_map_ready:
-            self.mini_map.page().runJavaScript(f"window.showPlace && window.showPlace({lat!r}, {lon!r});")
-
-    def _on_mini_map_loaded(self, ok):
-        self._mini_map_ready = bool(ok)
-        if ok and getattr(self, "mini_map", None) is not None:
-            import json
-            import i18n
-            self.mini_map.page().runJavaScript(
-                f"window.setStrings && window.setStrings({json.dumps(i18n.page_strings('minimap-'), ensure_ascii=False)},"
-                f" {json.dumps(i18n.current())});")
-            import motion
-            import tokens
-            accent = tokens.accent("dark")["accent"]
-            self.mini_map.page().runJavaScript(
-                f"window.setAccent && window.setAccent({json.dumps(accent)});"
-                f" window.setStill && window.setStill({json.dumps(motion.reduced())});")
-        if ok and self._mini_place is not None:
-            self._show_mini_place(*self._mini_place)
 
     def on_face_badge_clicked(self, face_id, person_id, current_name, item_id):
         new_name, ok = InWindowDialog.getText(

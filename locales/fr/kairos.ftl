@@ -645,6 +645,7 @@ viewer-location-unknown = Lieu inconnu
 viewer-next = Suivante (→)
 viewer-no-camera = Aucune information sur l’appareil
 viewer-open-google-maps = Ouvrir dans Google Maps
+viewer-mini-map-open = Afficher sur la carte
 viewer-place = Lieu
 viewer-place-taken = Lieu de prise de vue
 viewer-play-live-tooltip = Lire la Live Photo (Espace)
@@ -1014,7 +1015,6 @@ map-show-photos = { $count ->
 map-play-journey = Lire un voyage
 map-stop-n = Étape { $n }
 map-journey-end = Fin du voyage
-minimap-unavailable = Carte indisponible
 # Gate 2 B: trip kinds
 event-kind-day-trip = Excursion d’une journée
 event-kind-journey = { $days ->

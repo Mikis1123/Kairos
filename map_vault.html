@@ -756,12 +756,12 @@
   }
   // Pozadí pod dlaždicemi: póly za hranicí Web Mercatoru (±85°) a chybějící dlaždice (oceány
   // Turistické, výpadek sítě) byly černé díry do vesmíru
-  function addBaseBackground(style, name) {
-    if (style.layers.length && style.layers[0].type === 'background') return;
-    var color = name === 'satellite' ? '#0B0F17'
+  // Sprint 3: one shared 'base-bg' at the bottom of the composite style (styleFor); its colour
+  // follows the active base with a transition
+  function baseBgColor(name) {
+    return name === 'satellite' ? '#0B0F17'
       : ['interpolate', ['linear'], ['zoom'], GLOBE_DARK_FROM - 1, GRAPHITE.water, GLOBE_DARK_TO,
          name === 'outdoor' ? '#B9D3DC' : '#E4E8EC'];
-    style.layers.unshift({ id: 'base-bg', type: 'background', paint: { 'background-color': color } });
   }
   // Reliéf krajiny pod cestami a popisky (vlastní zdroj – terén a stínování ze stejného zdroje
   // MapLibre nedoporučuje). Turistická má stínování v dlaždicích, satelit ve snímcích.
@@ -936,9 +936,34 @@
     })(t0);
   }
 
-  // ── Styl = podklad + zeměkoule + atmosféra + zdroj terénu ───────────────────
-  function styleFor(name) {
-    var def = BASE_LAYERS[name], vector = def.gl && vectorState === 'ready' && vectorStyle;
+  // ── Styl = všechny podklady + zeměkoule + atmosféra + zdroj terénu ──────────
+  // Sprint 3 (2026-11-05): ONE composite style holds every base (Standard, Outdoor, Satellite) as
+  // a group of layers tagged metadata['kairos:base']. Switching a base no longer calls setStyle:
+  // setStyle({diff: false}) tore down every source, so the screen sat on black / bare background
+  // until the new tiles arrived and decoded. Now the new group is shown, the switch waits until
+  // its tiles are loaded (BASE_WAIT_MAX_MS at most), and opacities cross-fade with MapLibre paint
+  // transitions while the old picture stays on screen. Sources the bases share (OpenFreeMap vector
+  // tiles for Standard + Satellite labels, DEM) stay decoded across the switch; pins, routes,
+  // terrain and the sky are untouched. Hidden groups have visibility 'none', so their sources
+  // fetch nothing. Stacking order is BASE_ORDER (bottom -> top): the upper group of a pair is
+  // the one that fades, the lower one is simply drawn at full underneath.
+  // Standard keeps the original layer ids ('relief', 'underlay', 'label_city', ...); the other
+  // groups get an '@<base>' suffix (prefix-anchored regexes such as THIN_LAYERS still match).
+  var BASE_ORDER = ['standard', 'outdoor', 'satellite'];
+  var BASE_FADE_MS = 320, BASE_WAIT_MAX_MS = 1600, BASE_POLL_MS = 32;
+  var BASE_FADE_PROPS = { raster: ['raster-opacity'], fill: ['fill-opacity'], line: ['line-opacity'],
+                          symbol: ['text-opacity', 'icon-opacity'], 'fill-extrusion': ['fill-extrusion-opacity'],
+                          background: ['background-opacity'], circle: ['circle-opacity'],
+                          hillshade: ['hillshade-exaggeration'], heatmap: ['heatmap-opacity'] };
+  var baseGroups = {};                // base -> [layer id] (bottom -> top)
+  var baseSpec = {};                  // layer id -> { base, vis: spec visibility, fade: {prop: spec value} }
+  var builtVector = false;            // the composite was built with the vector style
+  var styleDirty = false;             // hidden groups are stale (HiDPI raster change, new vector style)
+  var baseSwap = null;                // cross-fade in flight
+  var baseSwaps = 0;                  // switches done without setStyle (tests, diagnostics)
+
+  function baseStyle(name, vectorOk) {    // one base on its own (no background, sky, terrain)
+    var vector = BASE_LAYERS[name].gl && vectorOk;
     var s = vector ? window.buildVectorStyle(name) : rasterStyle(name);
     if (vector && name !== 'satellite') {
       Object.keys(s.sources).forEach(function (k) { s.sources[k].attribution = OFM_ATTRIBUTION; });
@@ -946,16 +971,154 @@
       addHillshade(s);
       addGlobeDark(s);
     }
-    addBaseBackground(s, name);
-    s.projection = { type: GLOBE_PROJECTION };
-    s.sky = skySpec(skyNow.sky ? skyNow : DAY_SKY);
-    s.sources.dem = { type: 'raster-dem', tiles: [DEM_TILES], tileSize: 256, maxzoom: DEM_MAX_ZOOM,
-                      encoding: 'terrarium', attribution: DEM_ATTRIBUTION };
-    return { style: s, engine: vector ? 'vector' : 'raster' };
+    return s;
+  }
+  function sameSource(a, b) {
+    return ['type', 'url', 'tiles', 'tileSize', 'maxzoom', 'encoding'].every(function (k) {
+      return JSON.stringify(a[k]) === JSON.stringify(b[k]);
+    });
+  }
+
+  function styleFor(name) {
+    var vectorOk = !!(vectorState === 'ready' && vectorStyle);
+    var bg = { id: 'base-bg', type: 'background', paint: { 'background-color': baseBgColor(name) } };
+    var out = { version: 8, sources: {}, layers: [bg] }, groups = {}, spec = {};
+    BASE_ORDER.forEach(function (n) {
+      var s = baseStyle(n, vectorOk), rename = {}, suffix = n === 'standard' ? '' : '@' + n;
+      if (s.glyphs && !out.glyphs) out.glyphs = s.glyphs;
+      if (s.sprite && !out.sprite) out.sprite = s.sprite;
+      Object.keys(s.sources).forEach(function (id) {
+        var have = out.sources[id];
+        if (!have) out.sources[id] = s.sources[id];
+        else if (!sameSource(have, s.sources[id])) { rename[id] = id + suffix; out.sources[id + suffix] = s.sources[id]; }
+      });
+      groups[n] = [];
+      s.layers.forEach(function (l) {
+        var c = Object.assign({}, l), fade = {};
+        c.id = l.id + suffix;
+        if (c.source && rename[c.source]) c.source = rename[c.source];
+        c.metadata = Object.assign({}, l.metadata, { 'kairos:base': n });
+        (BASE_FADE_PROPS[l.type] || []).forEach(function (p) {
+          var v = l.paint ? l.paint[p] : undefined;
+          // data-driven opacity can't take a constant and come back without a worker relayout:
+          // such a layer just appears / disappears with its group
+          if (!dataDriven(v)) fade[p] = v === undefined ? null : v;
+        });
+        spec[c.id] = { base: n, vis: (l.layout && l.layout.visibility) || 'visible', fade: fade };
+        if (n !== name) c.layout = Object.assign({}, l.layout, { visibility: 'none' });
+        groups[n].push(c.id);
+        out.layers.push(c);
+      });
+    });
+    baseGroups = groups;
+    baseSpec = spec;
+    builtVector = vectorOk;
+    styleDirty = false;
+    out.projection = { type: GLOBE_PROJECTION };
+    out.sky = skySpec(skyNow.sky ? skyNow : DAY_SKY);
+    out.sources.dem = { type: 'raster-dem', tiles: [DEM_TILES], tileSize: 256, maxzoom: DEM_MAX_ZOOM,
+                        encoding: 'terrarium', attribution: DEM_ATTRIBUTION };
+    return { style: out, engine: BASE_LAYERS[name].gl && vectorOk ? 'vector' : 'raster' };
+  }
+
+  // Sources the active base draws from + those of no base (terrain 'dem', pins, routes): what
+  // LOD-aware prefetch, warm-up and film baking should fetch. Hidden groups fetch nothing.
+  function activeSourceIds() {
+    var style = map && map.getStyle();
+    if (!style) return [];
+    var byBase = {}, active = {};
+    (style.layers || []).forEach(function (l) {
+      if (!l.source) return;
+      var b = l.metadata && l.metadata['kairos:base'];
+      if (b) byBase[l.source] = true;
+      if (!b || b === baseName) active[l.source] = true;
+    });
+    return Object.keys(style.sources || {}).filter(function (id) { return active[id] || !byBase[id]; });
+  }
+
+  function groupLayers(n) { return (baseGroups[n] || []).filter(function (id) { return map.getLayer(id); }); }
+  function groupOpacity(n, on, ms) {
+    groupLayers(n).forEach(function (id) {
+      var f = baseSpec[id].fade;
+      Object.keys(f).forEach(function (p) {
+        map.setPaintProperty(id, p + '-transition', { duration: ms, delay: 0 });
+        map.setPaintProperty(id, p, on ? f[p] : 0);
+      });
+    });
+  }
+  function groupVisible(n, on) {
+    groupLayers(n).forEach(function (id) {
+      var want = on && baseSpec[id].vis !== 'none' && !(id === 'relief' && PERF.map_hillshade === false) ? 'visible' : 'none';
+      if ((map.getLayoutProperty(id, 'visibility') || 'visible') !== want) map.setLayoutProperty(id, 'visibility', want);
+    });
+  }
+  function groupLoaded(n) {
+    var ids = {};
+    groupLayers(n).forEach(function (id) {
+      var l = map.getLayer(id);
+      if (l && l.source && baseSpec[id].vis !== 'none') ids[l.source] = true;
+    });
+    return Object.keys(ids).every(function (id) {
+      try { return !map.getSource(id) || map.isSourceLoaded(id); } catch (e) { return true; }
+    });
+  }
+  function finishBaseSwap() {         // end state at once: new group at full, old one hidden
+    var s = baseSwap;
+    if (!s) return;
+    baseSwap = null;
+    clearTimeout(s.timer);
+    try {
+      if (s.up) groupOpacity(s.to, true, 0);
+      groupVisible(s.from, false);
+      groupOpacity(s.from, true, 0);  // back to its own opacities for the next time it shows
+    } catch (e) { /* styl se právě vyměnil */ }
+  }
+  function crossfadeBase(from, to) {
+    finishBaseSwap();
+    settleDetail(true);               // relief back at full detail, labels un-thinned
+    thinLabels(false);
+    var up = BASE_ORDER.indexOf(to) > BASE_ORDER.indexOf(from), ms = reduceMotion ? 0 : BASE_FADE_MS;
+    var swap = baseSwap = { from: from, to: to, up: up, t0: performance.now(), timer: 0 };
+    map.setPaintProperty('base-bg', 'background-color-transition', { duration: ms, delay: 0 });
+    map.setPaintProperty('base-bg', 'background-color', baseBgColor(to));
+    if (up) groupOpacity(to, false, 0);   // the upper group fades in over the old picture
+    groupVisible(to, true);               // the lower one is drawn at full under the fading old one
+    baseSwaps++;
+    tileSourceIds = activeSourceIds();
+    (function poll() {
+      if (baseSwap !== swap) return;
+      // first check after a frame: the source caches pick up the new layers on the next render
+      var waited = performance.now() - swap.t0;
+      if (waited < BASE_POLL_MS || (!groupLoaded(to) && waited < BASE_WAIT_MAX_MS)) {
+        swap.timer = setTimeout(poll, BASE_POLL_MS);
+        return;
+      }
+      try {
+        if (up) groupOpacity(to, true, ms);
+        else groupOpacity(from, false, ms);
+      } catch (e) { /* styl se právě vyměnil */ }
+      swap.timer = setTimeout(function () { if (baseSwap === swap) finishBaseSwap(); }, ms + 40);
+    })();
+    rewarmHotspots();
+    map.triggerRepaint();
+  }
+  window.getBaseSwapState = function () {
+    return { swaps: baseSwaps, inFlight: baseSwap ? { from: baseSwap.from, to: baseSwap.to } : null,
+             builtVector: builtVector, dirty: styleDirty,
+             visible: Object.keys(baseGroups).filter(function (n) {
+               return map && groupLayers(n).some(function (id) { return map.getLayoutProperty(id, 'visibility') !== 'none'; });
+             }) };
+  };
+  window.skipBaseFade = function () { finishBaseSwap(); return true; };      // tests: skip the fade
+
+  function canCrossfade(from, to) {
+    return !!(map && styleReady && from !== to && !styleDirty && !journey.active && baseGroups[to] && baseGroups[from]
+              && map.getLayer('base-bg') && builtVector === !!(vectorState === 'ready' && vectorStyle));
   }
 
   function applyStyle() {
     if (!map) return;
+    if (baseSwap) { clearTimeout(baseSwap.timer); baseSwap = null; }
     var built = styleFor(baseName);
     engine = built.engine;
     map.setMaxZoom(BASE_LAYERS[baseName].maxZoom);
@@ -978,6 +1141,7 @@
     vectorStyle = style;
     vectorState = 'ready';
     if (map && baseName && BASE_LAYERS[baseName].gl) applyStyle();
+    else styleDirty = true;            // Outdoor on screen: the composite is rebuilt at the next switch
     return true;
   };
 
@@ -1117,6 +1281,7 @@
     tint.id = 'tint';
     map.getCanvasContainer().insertBefore(tint, map.getCanvasContainer().firstChild.nextSibling);
     if (BASE_LAYERS[baseName].gl && engine === 'raster') loadVectorStyle();
+    applyPendingFocus();                // mini-map click that opened the Map tab (focusPlace)
     initialView();
     render();
   }
@@ -1127,7 +1292,7 @@
     resetDetailState();
     reliefLit = null;                   // nový styl = výchozí nasvícení reliéfu
     mapImages = {};                     // setStyle zahodí obrázky mapy – piny se přidají znovu
-    tileSourceIds = Object.keys((map.getStyle() || {}).sources || {});
+    tileSourceIds = activeSourceIds();   // Sprint 3: hidden base groups fetch / warm nothing
     applyTileLod();
     if (PERF.map_hillshade === false && map.getLayer('relief')) map.setLayoutProperty('relief', 'visibility', 'none');
     applySky(skyNow.sky ? skyNow : DAY_SKY);
@@ -2269,7 +2434,12 @@
     if (!p || typeof p !== 'object') return PERF.tier;
     var hidpi = PERF.map_hidpi_raster;
     Object.keys(PERF).forEach(function (k) { if (p[k] !== undefined) PERF[k] = p[k]; });
-    if (map && styleReady && !!hidpi !== !!PERF.map_hidpi_raster && baseName !== 'standard') applyStyle();
+    if (map && styleReady && !!hidpi !== !!PERF.map_hidpi_raster) {
+      // raster tile size lives in the Outdoor / Satellite groups: rebuild now if one is on screen,
+      // otherwise at the next switch (Standard is vector – no flash for a setting it doesn't use)
+      if (baseName !== 'standard' || engine === 'raster') applyStyle();
+      else styleDirty = true;
+    }
     TERRAIN_EXAGGERATION = +PERF.map_terrain_exaggeration || TERRAIN_EXAGGERATION;
     TILE_LOD_ZOOM_LEVELS = +PERF.map_lod_levels || TILE_LOD_ZOOM_LEVELS;
     TILE_LOD_RATIO = +PERF.map_lod_ratio || TILE_LOD_RATIO;
@@ -2313,14 +2483,19 @@
   window.setBaseLayer = function (name, notify) {
     name = LEGACY_LAYERS[name] || name;
     if (!BASE_LAYERS[name]) name = 'standard';
-    var changed = name !== baseName || !engineMatches(name);
+    var changed = name !== baseName || !engineMatches(name), from = baseName;
     baseName = name;
     mapEl.classList.remove('theme-standard', 'theme-satellite', 'theme-outdoor');
     mapEl.classList.add(BASE_LAYERS[name].theme);
     document.querySelectorAll('#layers button').forEach(function (b) {
       b.setAttribute('aria-pressed', b.dataset.layer === name ? 'true' : 'false');
     });
-    if (map && changed) applyStyle();
+    if (map && changed && canCrossfade(from, name)) {
+      // Sprint 3: same composite style, the groups cross-fade – no setStyle, no black void
+      engine = BASE_LAYERS[name].gl && builtVector ? 'vector' : 'raster';
+      map.setMaxZoom(BASE_LAYERS[name].maxZoom);
+      crossfadeBase(from, name);
+    } else if (map && changed) applyStyle();
     else if (!map && BASE_LAYERS[name].gl && glSupported()) loadVectorStyle();
     if (notify && bridge && bridge.setMapLayer) bridge.setMapLayer(name);   // zapamatovat v config.json
     return baseName;
@@ -3272,6 +3447,34 @@
                                                 lat: c.lat, lon: c.lon, card: tipHtml(c) }; });
   };
   window.clickCluster = function (i) { if (clusters[i]) openCluster(clusters[i]); return !!clusters[i]; };
+  // Sprint 3: the viewer's native mini-map was clicked -> fly to that photo's place. Before the
+  // map exists (hidden tab, first visit) the place waits and createMap jumps straight there.
+  var FOCUS_ZOOM = 15, pendingFocus = null;
+  window.focusPlace = function (lat, lon, zoom) {
+    lat = Number(lat); lon = Number(lon);
+    if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return false;
+    if (!map) { pendingFocus = [lat, lon, zoom]; return true; }
+    var z = Math.min(map.getMaxZoom() - 1, +zoom || FOCUS_ZOOM);
+    var opts = { center: [lon, lat], zoom: z, pitch: z >= TERRAIN_MIN_ZOOM ? FLY_PITCH : 0, bearing: 0 };
+    fitted = true;                                          // no initialView jump over it later
+    stopSpin();
+    hidePinCard();
+    warmView(opts);
+    if (reduceMotion || !hasSize()) { map.jumpTo(opts); return true; }
+    descent.on = z >= TERRAIN_MIN_ZOOM;
+    descent.at = Math.max(TERRAIN_MIN_ZOOM, z - DESCENT_TERRAIN_LEAD);
+    var hops = Math.abs(z - map.getZoom());
+    map.flyTo(Object.assign(opts, { duration: Math.min(4200, 1400 + hops * 260), curve: 1.5, essential: true }));
+    return true;
+  };
+  function applyPendingFocus() {
+    if (!pendingFocus || !map) return;
+    var f = pendingFocus;
+    pendingFocus = null;
+    var z = Math.min(map.getMaxZoom() - 1, +f[2] || FOCUS_ZOOM);
+    fitted = true;
+    map.jumpTo({ center: [f[1], f[0]], zoom: z, pitch: 0, bearing: 0 });
+  }
   window.flyToPhotos = function (items) {               // bench / tests: the cluster-click flight
     if (!map || !Array.isArray(items) || !items.length) return false;
     flyIn(items);
@@ -4871,13 +5074,16 @@
     return u.slice(u.indexOf('/', cut + 1) + 1);              // without /token/
   }
   function warmSources() {            // tiled sources of the current style worth keeping on disk
-    var out = [], layers = (map.getStyle() || {}).layers || [];
+    var out = [], layers = ((map.getStyle() || {}).layers || []).filter(function (l) {
+      var b = l.metadata && l.metadata['kairos:base'];
+      return !b || b === baseName;                         // Sprint 3: only the base on screen
+    });
     tileSourceIds.forEach(function (id) {
       var s = map.getSource(id);
       if (!s || !Array.isArray(s.tiles) || !s.tiles.length || id === 'pins' || id.indexOf('j-') === 0) return;
       var minz = 99;
       layers.forEach(function (l) { if (l.source === id) minz = Math.min(minz, l.minzoom || 0); });
-      if (s.type === 'raster-dem') minz = HILLSHADE_MIN_ZOOM;    // terrain has no layer of its own
+      if (s.type === 'raster-dem' && (id === 'dem' || minz < 99)) minz = HILLSHADE_MIN_ZOOM;   // terrain has no layer of its own
       if (minz < 99) out.push({ id: id, s: s, minz: minz });
     });
     return out;
@@ -5050,7 +5256,10 @@
         else applyTileLod();
       }
       // C7b: reliéf z výšek ≤ z11 (relief-film), mimo film zase plné rozlišení
-      if (map.getLayer('relief-film') && PERF.map_hillshade !== false) swapRelief(on);
+      // Sprint 3: relief belongs to the Standard group – hidden under Outdoor / Satellite, it
+      // must not come up as 'relief-film' when a film starts there
+      if (map.getLayer('relief-film') && PERF.map_hillshade !== false
+          && (!on || (map.getLayer('relief') && map.getLayoutProperty('relief', 'visibility') !== 'none'))) swapRelief(on);
       underlayFilm(on);
       if (!on) reliefLight(null);
     } catch (e) { /* styl se právě mění – onStyleLoad zavolá znovu */ }

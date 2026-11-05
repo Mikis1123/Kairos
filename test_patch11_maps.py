@@ -441,7 +441,9 @@ class TestVectorMapPage(unittest.TestCase):
         self.m.offline.urls.clear()
         self.js("setBaseLayer('outdoor')")
         self.m.wait_style()
-        self.assertEqual(self.js("map.getStyle().layers.filter(function (l) { return l.type === 'raster'; })"
+        # Sprint 3: one composite style holds every base – look at the Outdoor group only
+        self.assertEqual(self.js("map.getStyle().layers.filter(function (l) { return l.type === 'raster' && "
+                                 "l.metadata && l.metadata['kairos:base'] === 'outdoor'; })"
                                  ".map(function (l) { return l.minzoom || 0; })"),
                          [0, 11, 12], "podklad vždy, pěší od z11, cyklo od z12")
 
@@ -482,6 +484,61 @@ class TestVectorMapPage(unittest.TestCase):
             self.js(f"setBaseLayer('{name}'); 0")
             self.assertEqual(self.js("map.getMaxZoom()"), z, name)
         self.js("setBaseLayer('standard')")
+
+    def test_14_switch_crossfades_in_one_style(self):
+        """Sprint 3: a base switch keeps the same style object (no setStyle = no black void),
+        the old group stays on screen until the new one has faded in, shared sources stay loaded,
+        pins survive and the hidden group's opacities are restored afterwards."""
+        self._inject()
+        self.js("setBaseLayer('standard'); skipBaseFade(); 0")
+        self.assertTrue(self.m.wait_style())
+        self.js("window.__st = map.style; window.__omt = map.getSource('openmaptiles'); 0")
+        swaps = self.js("getBaseSwapState().swaps")
+        self.js("setBaseLayer('satellite'); 0")
+        st = self.js("getBaseSwapState()")
+        self.assertEqual(st["swaps"], swaps + 1, "cross-fade, not a rebuild")
+        self.assertEqual(st["inFlight"], {"from": "standard", "to": "satellite"})
+        self.assertEqual(sorted(st["visible"]), ["satellite", "standard"], "old picture stays under the fade")
+        self.assertTrue(self.js("styleReady === true && map.style === __st"), "same style, no style.load")
+        self.assertEqual(self.js("map.getLayoutProperty('esri-imagery@satellite', 'visibility') || 'visible'"), "visible")
+        for _ in range(40):
+            if not self.js("getBaseSwapState().inFlight"):
+                break
+            wait(100)
+        st = self.js("getBaseSwapState()")
+        self.assertIsNone(st["inFlight"])
+        self.assertEqual(st["visible"], ["satellite"])
+        self.assertTrue(self.js("map.getSource('openmaptiles') === __omt"), "shared vector source kept")
+        self.assertEqual(self.js("getBaseLayerEngine()"), "vector")
+        ids = self.js("tileSourceIds")
+        self.assertIn("esri", ids)
+        self.assertNotIn("r0", ids, "the hidden Outdoor group fetches / warms nothing")
+        self.assertNotIn("dem-shade", ids, "Standard relief stays with Standard")
+        self.js("setBaseLayer('outdoor'); 0")
+        self.assertEqual(self.js("getBaseLayerEngine()"), "raster")
+        self.assertEqual(self.js("map.getMaxZoom()"), 17)
+        self.js("skipBaseFade(); 0")
+        self.assertEqual(self.js("getBaseSwapState().visible"), ["outdoor"])
+        # satellite faded out (it lies above outdoor) and got its own opacity back while hidden
+        self.assertIsNone(self.js("map.getPaintProperty('esri-imagery@satellite', 'raster-opacity')"))
+        self.js("setBaseLayer('standard'); skipBaseFade(); 0")
+        self.assertEqual(self.js("getBaseSwapState().visible"), ["standard"])
+        self.assertTrue(self.js("map.style === __st"))
+        self.assertEqual(self.js("map.getLayoutProperty('relief-film', 'visibility')"), "none", "spec visibility kept")
+
+    def test_15_focus_place_from_the_mini_map(self):
+        """Sprint 3: a click on the viewer's native mini-map flies the map to that place."""
+        self.assertFalse(self.js("focusPlace('x', 2)"))
+        self.assertFalse(self.js("focusPlace(91, 2)"))
+        self.js("window.__rm = reduceMotion; reduceMotion = true; 0")
+        try:
+            self.assertTrue(self.js("focusPlace(49.2, 16.6)"))
+            c = self.js("[map.getCenter().lng, map.getCenter().lat, map.getZoom()]")
+            self.assertAlmostEqual(c[0], 16.6, places=3)
+            self.assertAlmostEqual(c[1], 49.2, places=3)
+            self.assertAlmostEqual(c[2], 15, places=3)
+        finally:
+            self.js("reduceMotion = __rm; 0")
 
     def test_08_only_allowed_hosts_requested(self):
         self._inject()

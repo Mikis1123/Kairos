@@ -156,8 +156,8 @@ def test_map_page_defaults_in_sync():
 
 
 def test_pages_have_no_czech_ui_text():
-    """map_vault.html / mini_map.html: visible text comes from setStrings(), comments may stay."""
-    for name in ("map_vault.html", "mini_map.html"):
+    """map_vault.html: visible text comes from setStrings(), comments may stay."""
+    for name in ("map_vault.html",):
         src = open(os.path.join(HERE, name), encoding="utf-8").read()
         src = re.sub(r"<!--.*?-->", "", src, flags=re.S)
         src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)

@@ -1,6 +1,6 @@
 /* Kairos – one base-map style for every map surface (founder audit 2026-11-03).
  *
- * The main map (map_vault.html) and the viewer's mini-map (mini_map.html) used to build their
+ * The main map (map_vault.html) and the viewer's former mini-map page (now native, mini_map.py) built their
  * styles separately: the mini-map loaded OpenFreeMap "dark", which at street zoom is an almost
  * pitch-black surface and looked nothing like the main map. Both pages now take the same
  * OpenFreeMap "liberty" style through the same pure transforms defined here:

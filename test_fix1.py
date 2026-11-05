@@ -3,9 +3,7 @@
 Spuštění (ve složce projektu):   python -m pytest test_fix1.py -v
 
 Pokrývá:
-  mini_map.html – přibalený MapLibre, rastrová záloha bez stylu, vektorový styl, posun pinu
-                  bez nového načtení stránky, jen povolené servery.
-  viewer.py     – minimapa se načte jednou; souřadnice čekající na načtení; další fotka = posun.
+  (mini_map.html / viewer minimap tests moved to test_sprint3_map.py: the minimap is native now)
   main.py       – Cesta z detailu / přehledu událostí se vloží nad ně; konec Cesty, Zpět i
                   postranní panel vrátí zpět (Cesta skončí tiše); Cesta spuštěná v mapě nikam nevrací.
 """
@@ -52,122 +50,7 @@ def _offline_profile():
     return profile
 
 
-@unittest.skipUnless(HAS_QT, "Qt není dostupné")
-class TestMiniMapPage(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        cls.profile = _offline_profile()
-        cls.view = QWebEngineView()
-        cls.page = QWebEnginePage(cls.profile, cls.view)
-        cls.page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-        cls.view.setPage(cls.page)
-        cls.view.resize(320, 180)
-        cls.view.show()
-        loop = QEventLoop()
-        cls.page.loadFinished.connect(lambda ok: loop.quit())
-        QTimer.singleShot(15000, loop.quit)
-        cls.page.load(QUrl.fromLocalFile(os.path.join(HERE, "mini_map.html")))
-        loop.exec()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.view.close()
-        cls.view.deleteLater()
-        wait(50)
-
-    def js(self, code):
-        return _js(self.page, code, 5000)
-
-    def state(self):
-        return self.js("miniState()")
-
-    def test_place_pin_and_move_without_reload(self):
-        self.assertEqual(self.js("typeof maplibregl"), "object", "MapLibre z vendor/maplibre")
-        self.assertFalse(self.js("showPlace('x', 2)"))
-        self.assertFalse(self.js("showPlace(91, 2)"))
-        self.assertTrue(self.js("showPlace(45.1, 13.6)"))
-        self.assertTrue(_until(lambda: self.state()["ready"]), "mapa vznikla")
-        st = self.state()
-        self.assertEqual(st["engine"], "raster", "bez stylu (offline) rastrová záloha")
-        self.assertAlmostEqual(st["pin"][0], 13.6, places=5)
-        self.assertAlmostEqual(st["pin"][1], 45.1, places=5)
-        self.js("window.__same = true; 0")
-        self.assertTrue(self.js("showPlace(50.08, 14.43)"))         # daleko = skok
-        st = self.state()
-        self.assertAlmostEqual(st["center"][0], 14.43, places=4)
-        self.assertAlmostEqual(st["pin"][1], 50.08, places=5)
-        self.assertTrue(self.js("showPlace(50.081, 14.431)"))       # blízko = krátký posun
-        self.assertTrue(_until(lambda: abs(self.state()["center"][0] - 14.431) < 1e-4, 30, 50))
-        self.assertTrue(self.js("window.__same === true"), "stránka se nenačítala znovu")
-        self.assertEqual(self.js("document.querySelectorAll('.maplibregl-canvas').length"), 1)
-
-    def test_vector_style_with_czech_names(self):
-        self.js("showPlace(49.2, 16.6); 0")
-        self.assertTrue(_until(lambda: self.state()["ready"]))
-        self.js("setStrings({}, 'cs'); 0")             # jazyk aplikace (viewer.py po načtení)
-        self.assertTrue(self.js(f"setMiniStyle({json.dumps(FIXTURE_STYLE)})"))
-        self.assertTrue(_until(lambda: self.js("map.isStyleLoaded() === true || map.getStyle().layers.length > 1")))
-        self.assertEqual(self.state()["engine"], "vector")
-        fields = self.js("JSON.stringify(map.getStyle().layers.filter(function (l) {"
-                         " return l.layout && l.layout['text-field']; }).map(function (l) {"
-                         " return l.layout['text-field']; }))")
-        self.assertIn("name:cs", fields)
-
-    def test_only_allowed_hosts_requested(self):
-        self.js("showPlace(48.2, 16.37); 0")
-        self.assertTrue(_until(lambda: self.state()["ready"]))
-        _until(lambda: any("openfreemap" in u for u in self.profile._offline.urls), 30, 50)
-        remote = [u for u in self.profile._offline.urls
-                  if QUrl(u).scheme() not in ("file", "qrc", "data", "blob")]
-        self.assertTrue(remote, "styl / dlaždice se zkoušely stáhnout")
-        for u in remote:
-            self.assertTrue(main.is_allowed_web_url(u), u)
-        self.assertTrue(any("tiles.openfreemap.org/styles/liberty" in u for u in remote), remote)
-
-
-@unittest.skipUnless(HAS_QT, "Qt není dostupné")
-class TestViewerMiniMap(TempEnv):
-
-    def setUp(self):
-        super().setUp()
-        self.add(self.jpg("A.jpg"), date="2026-07-01 10:00:00")
-        self.add(self.jpg("B.jpg"), date="2026-07-02 10:00:00")
-        self.x("UPDATE media_items SET latitude = 45.1, longitude = 13.6 WHERE file_name = 'A.jpg'")
-        self.x("UPDATE media_items SET latitude = 50.08, longitude = 14.43 WHERE file_name = 'B.jpg'")
-        self.profile = _offline_profile()
-        self.v = viewer.MediaViewerWidget()
-        self.v.web_profile_factory = lambda: self.profile
-        self.v.resize(1100, 700)
-        self.v.show()
-        self.addCleanup(self._close)
-
-    def _close(self):
-        self.v.cleanup_playback()
-        self.v.hide()
-        self.v.deleteLater()
-        wait(50)
-
-    def pin(self):
-        return (_js(self.v.mini_map.page(), "miniState()") or {}).get("pin")
-
-    def test_loads_once_then_moves_pin(self):
-        self.v.set_media_data(main.fetch_media_records(order_by="m.date_taken, m.id"), 0)
-        self.v.btn_info.setChecked(True)
-        self.v.toggle_info_panel()
-        m = self.v.mini_map
-        self.assertIsNotNone(m)
-        self.assertIs(m.page().profile(), self.profile, "trvalý profil mapy (sdílená cache)")
-        self.assertTrue(_until(lambda: self.v._mini_map_ready))
-        self.assertTrue(m.url().toLocalFile().endswith(viewer.MINI_MAP_PAGE))
-        loads = []
-        m.loadFinished.connect(loads.append)
-        self.assertTrue(_until(lambda: self.pin() is not None), "souřadnice čekající na načtení")
-        self.assertAlmostEqual(self.pin()[1], 45.1, places=5)
-        self.v.show_next()
-        self.assertTrue(_until(lambda: abs(self.pin()[1] - 50.08) < 1e-5, 30, 50))
-        self.assertIs(self.v.mini_map, m)
-        self.assertEqual(loads, [], "další fotka stránku znovu nenačítá")
+# Sprint 3: the viewer's mini-map is native (mini_map.py) – its tests live in test_sprint3_map.py
 
 
 @unittest.skipUnless(HAS_QT, "Qt není dostupné")

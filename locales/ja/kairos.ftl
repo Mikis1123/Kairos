@@ -645,6 +645,7 @@ viewer-location-unknown = 位置不明
 viewer-next = 次へ（→）
 viewer-no-camera = カメラ情報なし
 viewer-open-google-maps = Google マップで開く
+viewer-mini-map-open = マップで表示
 viewer-place = 場所
 viewer-place-taken = 撮影場所
 viewer-play-live-tooltip = Live Photoを再生（スペース）
@@ -906,7 +907,6 @@ map-show-photos = { $count } 枚の写真を表示
 map-play-journey = 旅を再生
 map-stop-n = 立ち寄り先 { $n }
 map-journey-end = 旅の終わり
-minimap-unavailable = マップを利用できません
 # Gate 2 B: trip kinds
 event-kind-day-trip = 日帰り旅行
 event-kind-journey = 旅 · { $days }日間

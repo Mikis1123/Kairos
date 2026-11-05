@@ -31,9 +31,9 @@ if os.path.exists('exiftool.exe') and os.path.isdir('exiftool_files'):
     datas.append(('exiftool.exe', EXIFTOOL_DIR))
     datas.append(('exiftool_files', os.path.join(EXIFTOOL_DIR, 'exiftool_files')))
 
-# Mapa a minimapa prohlížeče: stránky + lokálně přibalený MapLibre (main.py / viewer.py je
+# Mapa: stránky + lokálně přibalený MapLibre (main.py je; minimapa prohlížeče je nativní – mini_map.py,
 # hledají v paths.RESOURCE_DIR = sys._MEIPASS, stránky odkazují relativně na vendor/maplibre)
-for page in ('map_vault.html', 'mini_map.html', 'map_style.js', 'director.js', 'reel_player.html'):
+for page in ('map_vault.html', 'map_style.js', 'director.js', 'reel_player.html'):
     if os.path.exists(page):
         datas.append((page, '.'))
 # Vrstva videa prohlížeče (QML VideoOutput, viewer_hud.py)
@@ -42,7 +42,7 @@ if os.path.isdir('locales'):
     datas.append(('locales', 'locales'))
 if os.path.exists('video_output.qml'):
     datas.append(('video_output.qml', '.'))
-# Batch 6: MapLibre GL JS 5 (zeměkoule, terén, Cesta, minimapa), vč. licence – jediný mapový stack
+# Batch 6: MapLibre GL JS 5 (zeměkoule, terén, Cesta), vč. licence – jediný mapový stack
 if os.path.isdir(os.path.join('vendor', 'maplibre')):
     datas.append((os.path.join('vendor', 'maplibre'), os.path.join('vendor', 'maplibre')))
 # Gate 2: mapa ve WebView2 (map_host.py) – SDK z NuGet Microsoft.Web.WebView2: spravované

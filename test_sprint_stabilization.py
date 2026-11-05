@@ -130,7 +130,8 @@ class TestQuietConsole(unittest.TestCase):
         self.assertIn("--log-level=3", os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", ""))
         src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
         self.assertIn('QuietWebPage(profile, self.map_view, tag="Mapa")', src)
-        self.assertIn("QuietWebPage", open(os.path.join(HERE, "viewer.py"), encoding="utf-8").read())
+        # Sprint 3: the viewer has no web page any more (native mini-map, mini_map.py)
+        self.assertNotIn("QWebEngine", open(os.path.join(HERE, "viewer.py"), encoding="utf-8").read())
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -393,7 +394,10 @@ class TestMapPage(unittest.TestCase):
         from test_patch11_maps import FIXTURE_STYLE
         self.js(f"setVectorStyle({json.dumps(FIXTURE_STYLE)}); 0")
         self.assertTrue(self.m.wait_style())
-        layers = self.js("map.getStyle().layers.map(function (l) { return [l.id, l.type, l.minzoom || 0, l.maxzoom || 24]; })")
+        # Sprint 3: the composite style also holds the hidden Outdoor / Satellite groups
+        layers = self.js("map.getStyle().layers.filter(function (l) { var b = l.metadata && l.metadata['kairos:base'];"
+                         " return !b || b === 'standard'; })"
+                         ".map(function (l) { return [l.id, l.type, l.minzoom || 0, l.maxzoom || 24]; })")
         by = {l[0]: l for l in layers}
         for gid in ("globe-land", "globe-water", "globe-border"):
             self.assertIn(gid, by)

@@ -645,6 +645,7 @@ viewer-location-unknown = Poloha neznámá
 viewer-next = Následující (→)
 viewer-no-camera = Bez údajů o fotoaparátu
 viewer-open-google-maps = Otevřít v Google Maps
+viewer-mini-map-open = Zobrazit na mapě
 viewer-place = Místo
 viewer-place-taken = Místo pořízení
 viewer-play-live-tooltip = Přehrát Live Photo (mezerník)
@@ -1063,7 +1064,6 @@ map-show-photos = { $count ->
 map-play-journey = Přehrát cestu
 map-stop-n = Zastávka { $n }
 map-journey-end = Konec cesty
-minimap-unavailable = Mapa není k dispozici
 # Gate 2 B: trip kinds
 event-kind-day-trip = Jednodenní výlet
 event-kind-journey = { $days ->

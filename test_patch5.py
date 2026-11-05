@@ -243,22 +243,20 @@ class TestWebPrivacy(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(HERE, "vendor", "leaflet")))
         spec = open(os.path.join(HERE, "app.spec"), encoding="utf-8").read()
         self.assertNotIn("leaflet", spec.lower())
-        self.assertIn("'mini_map.html'", spec)
+        self.assertNotIn("mini_map.html", spec, "Sprint 3: the mini-map is native (mini_map.py)")
         import viewer
         src = inspect.getsource(viewer.MediaViewerWidget)
         self.assertNotIn("leaflet", src.lower())
         self.assertNotIn("tile.openstreetmap.org", src)
 
-    def test_viewer_minimap_page_is_local_maplibre(self):
-        html = open(os.path.join(HERE, "mini_map.html"), encoding="utf-8").read()
-        self.assertIn('src="vendor/maplibre/maplibre-gl.js"', html)
-        self.assertIn('href="vendor/maplibre/maplibre-gl.css"', html)
-        for bad in ("leaflet", "unpkg.com", "google", "tile.openstreetmap.org"):
-            self.assertNotIn(bad, html.lower(), bad)
-        hosts = set(re.findall(r"https://([a-z0-9.-]+)/", html))
-        self.assertTrue(hosts, "styl / záloha")
-        for host in hosts - {"openfreemap.org", "www.openmaptiles.org"}:   # jen odkazy v atribuci
-            self.assertIn(host, main.ALLOWED_WEB_HOSTS, host)
+    def test_viewer_minimap_is_native_and_uses_allowed_tiles(self):
+        """Sprint 3: no second web page – Qt composites tiles of an allowed host."""
+        self.assertFalse(os.path.exists(os.path.join(HERE, "mini_map.html")))
+        src = open(os.path.join(HERE, "mini_map.py"), encoding="utf-8").read()
+        for bad in ("leaflet", "unpkg.com", "tile.openstreetmap.org", "import QWebEngine", "PyQt6.QtWebEngine"):
+            self.assertNotIn(bad, src, bad)
+        import mini_map
+        self.assertIn(mini_map.TILE_HOST, main.ALLOWED_WEB_HOSTS)
 
 
 @unittest.skipUnless(HAS_QT, "Qt není dostupné")

@@ -18,7 +18,7 @@ else:
 # / nová verze by knihovnu smazala.
 BASE_DIR = INSTALL_DIR
 
-# Přibalené zdroje jen pro čtení (map_vault.html, mini_map.html, vendor/maplibre). PyInstaller 6 je dává
+# Přibalené zdroje jen pro čtení (map_vault.html, map_style.js, vendor/maplibre). PyInstaller 6 je dává
 # do _internal (sys._MEIPASS), ne vedle .exe; ze zdrojáků je to totéž co BASE_DIR.
 RESOURCE_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
 

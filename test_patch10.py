@@ -187,12 +187,14 @@ class TestViewerResponsiveness(TempEnv):
             set_source.assert_called_once()      # při odchodu z prohlížeče ano
 
     def test_mini_map_is_created_lazily(self):
-        self.assertIsNone(self.v.mini_map, "QWebEngine stránka (~1 s) až když je potřeba")
+        self.assertIsNone(self.v.mini_map, "až když je potřeba (Sprint 3: nativní widget, ne QWebEngine)")
         self.x("UPDATE media_items SET latitude = 49.2, longitude = 13.5 WHERE id = ?", (self.p1,))
         self.v.set_media_data(main.fetch_media_records(order_by="m.date_taken, m.id"), 0)
         self.v.btn_info.setChecked(True)
         self.v.toggle_info_panel()
         self.assertIsNotNone(self.v.mini_map)
+        import mini_map
+        self.assertIsInstance(self.v.mini_map, mini_map.MiniMapWidget)
 
 
 @unittest.skipUnless(HAS_QT, "Qt není dostupné")

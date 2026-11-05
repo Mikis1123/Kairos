@@ -327,8 +327,7 @@ def create_media_viewer(records, index=0, parent=None):
     Nevytváří samostatné okno: MainWindow ho vkládá do svého zásobníku stránek
     (NavigationController) a „‹ Zpět“ / Esc vrací do mřížky na stejné místo."""
     viewer = MediaViewerWidget(parent)
-    viewer.web_profile_factory = map_web_profile   # minimapa sdílí diskovou cache dlaždic s mapou
-    viewer.page_setup = attach_tile_store          # Founder audit: minimapa přes stejné úložiště dlaždic
+    viewer.tile_service = mini_map_tile_service    # Sprint 3: native mini-map reads the tile store
     records = list(records)
     viewer.set_media_data(records, index)
     return viewer
@@ -379,14 +378,14 @@ def build_map_markers(geo_rows):
     return markers
 
 
-# Jediné povolené vzdálené zdroje webových stránek aplikace (mapa i minimapa prohlížeče):
+# Jediné povolené vzdálené zdroje webových stránek aplikace (mapa; minimapa prohlížeče je od Sprintu 3 nativní – mini_map.py):
 # dlaždice podkladů z přepínače mapy (OpenFreeMap, Esri, OpenTopoMap). Dlaždice prozrazují
 # jen zobrazenou oblast mapy, nikdy id ani metadata fotek.
 ALLOWED_WEB_HOSTS = frozenset({
-    "server.arcgisonline.com",       # Základní (Esri World Street Map) + Satelitní + záloha minimapy (Dark Gray)
+    "server.arcgisonline.com",       # Základní (Esri World Street Map) + Satelitní + nativní minimapa prohlížeče
     "tile.opentopomap.org",          # Turistická: vrstevnice a stínování terénu
     "tile.waymarkedtrails.org",      # Turistická: značené pěší a cyklistické trasy
-    "tiles.openfreemap.org",         # vektorové podklady mapy i minimapy (styl, dlaždice, písma, ikony)
+    "tiles.openfreemap.org",         # vektorové podklady mapy (styl, dlaždice, písma, ikony)
     "elevation-tiles-prod.s3.amazonaws.com",   # Batch 6: 3D terén (AWS Terrain Tiles, jen tento bucket)
 })
 MAP_HTTP_CACHE_MB = 512              # dlaždice a styl na disku – mapa se po restartu nestahuje znovu
@@ -554,13 +553,14 @@ def install_tile_store(page, budget_mb=tile_store.DEFAULT_BUDGET_MB):
     return _inject_tile_store(page, srv)
 
 
-def attach_tile_store(page):
-    """Minimapa prohlížeče: připojí se k už běžícímu úložišti (nemění jeho rozpočet);
-    když neběží (mapa se v této relaci neotevřela), spustí ho s rozpočtem z Předvoleb."""
+def mini_map_tile_service():
+    """Native mini-map of the viewer (mini_map.py, worker thread): the running tile store, which
+    keeps its budget; when the Map tab wasn't opened this session it is started with the budget
+    from Preferences. None = no store (the mini-map shows its background and the pin)."""
     srv = tile_store.service()
     if srv is None:
         srv = tile_store.start(int(load_config().get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
-    return _inject_tile_store(page, srv) if srv is not None else None
+    return srv
 
 
 def _inject_tile_store(page, srv):
@@ -4350,6 +4350,7 @@ class MainWindow(QMainWindow):
         self._filtered_records = []
         self._map_loaded = False
         self._pending_journey = None     # data Cesty čekající na načtení mapy
+        self._pending_place = None       # mini-map click waiting for the map page (show_place_on_map)
         self._journey_return = False     # mapa s Cestou vložená nad událost (návrat po konci)
         self._tint_job = None            # tint.TintJob – odstíny obálek událostí na pozadí
         self._current_filter = "all"
@@ -4456,7 +4457,7 @@ class MainWindow(QMainWindow):
         """The window is born with a Direct3D (RHI) surface instead of switching to it later.
 
         Qt 6 recreates a top-level window – and every native child HWND in it – the first time an
-        RHI widget (the viewer's video QQuickWidget, the minimap's QWebEngineView) is added. That
+        RHI widget (the viewer's video QQuickWidget, formerly also the minimap's QWebEngineView) is added. That
         happened on the first photo open: the window flashed as if it restarted, and WebView2
         disposed the map's controller with its destroyed parent HWND (blank Map / Journey). A hidden
         1x1 QQuickWidget, created before the window exists, flags the window as RHI from birth."""
@@ -4902,7 +4903,7 @@ class MainWindow(QMainWindow):
     def _build_map_view_qtwebengine(self, layout):
         self.map_host_kind = "qtwebengine"
         try:
-            # Platí pro výchozí profil = mapa i minimapa prohlížeče (viz is_allowed_web_url)
+            # Platí pro výchozí profil = mapa (viz is_allowed_web_url)
             from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEngineSettings
             from PyQt6.QtWebEngineWidgets import QWebEngineView
             from PyQt6.QtWebChannel import QWebChannel
@@ -6096,6 +6097,9 @@ class MainWindow(QMainWindow):
         self._refresh_map()
         if self._map_warm_allowed():         # the library's photo places, z10-15, in the background
             page.runJavaScript("window.warmPhotoHotspots && window.warmPhotoHotspots();")
+        place, self._pending_place = getattr(self, "_pending_place", None), None
+        if place is not None:               # mini-map click before the map page had loaded
+            page.runJavaScript(f"window.focusPlace && window.focusPlace({place[0]!r}, {place[1]!r});")
         data, self._pending_journey = self._pending_journey, None
         if data is not None:                # Cesta vyžádaná z Událostí dřív, než se mapa načetla
             page.runJavaScript(f"window.playJourney && window.playJourney({json.dumps(data)});")
@@ -6577,8 +6581,21 @@ class MainWindow(QMainWindow):
             self._viewer.fullscreen_toggled.connect(lambda on: self._set_immersive("viewer", on))
             self._viewer.slideshow_requested.connect(
                 lambda records, index: self._start_slideshow(records, index, self._viewer_model))
+            self._viewer.show_on_map_requested.connect(self.show_place_on_map)
             self._viewer.transition_provider = self._viewer_transition
         return self._viewer
+
+    def show_place_on_map(self, lat: float, lon: float):
+        """Mini-map click in the viewer: the Map tab, flown to the photo's place. A map page that
+        hasn't loaded yet keeps the place (_pending_place) and flies there in _on_map_loaded."""
+        if not MainWindow._ensure_map_view(self):
+            return False
+        self._switch_page(self.SIDEBAR_PAGES.index("map"))      # closes the viewer like the sidebar
+        if not self._map_loaded:
+            self._pending_place = (float(lat), float(lon))
+            return True
+        self.map_view.page().runJavaScript(f"window.focusPlace && window.focusPlace({float(lat)!r}, {float(lon)!r});")
+        return True
 
     # ── Polish P5: přechody prohlížeč <-> dlaždice ────────────────────────────
 

@@ -645,6 +645,7 @@ viewer-location-unknown = 位置未知
 viewer-next = 下一张（→）
 viewer-no-camera = 无相机信息
 viewer-open-google-maps = 在 Google 地图中打开
+viewer-mini-map-open = 在地图上显示
 viewer-place = 地点
 viewer-place-taken = 拍摄地点
 viewer-play-live-tooltip = 播放实况照片（空格）
@@ -906,7 +907,6 @@ map-show-photos = 显示 { $count } 张照片
 map-play-journey = 播放旅程
 map-stop-n = 第 { $n } 站
 map-journey-end = 旅程结束
-minimap-unavailable = 地图不可用
 # Gate 2 B: trip kinds
 event-kind-day-trip = 一日游
 event-kind-journey = 旅程 · { $days } 天
