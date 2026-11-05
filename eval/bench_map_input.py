@@ -107,13 +107,17 @@ PROBE = r"""
     var orig = m._render;
     m._render = function () {
       var a = performance.now(), r = orig.apply(this, arguments), c = performance.now() - a;
-      if (P.on) { var ct = m.getCenter(); P.rend.push([O + a, c, ct.lng, ct.lat, m.getZoom(), m.getBearing(), m.getPitch()]); }
+      if (P.on) { var ct = m.getCenter(); P.rend.push([O + a, c, ct.lng, ct.lat, m.getZoom(), m.getBearing(), m.getPitch(),
+                                                       m.getPixelRatio(), m.areTilesLoaded() ? 1 : 0]); }
       return r;
     };
+    m.on('moveend', function () { if (P.on) P.me.push(O + performance.now()); });
   }
   hook();
-  window.__ipStart = function () { P.ev = []; P.co = []; P.rend = []; P.vs = []; P.loaf = []; P.on = true; return 1; };
-  window.__ipStop = function () { P.on = false; return JSON.stringify({ loaf: P.loaf, ev: P.ev, co: P.co, rend: P.rend, vs: P.vs,
+  window.__ipStart = function () { P.ev = []; P.co = []; P.rend = []; P.vs = []; P.loaf = []; P.me = []; P.on = true; return 1; };
+  window.__ipStop = function () { P.on = false; return JSON.stringify({ loaf: P.loaf, ev: P.ev, co: P.co, rend: P.rend, vs: P.vs, me: P.me,
+      momentum: window.getMomentumState ? window.getMomentumState() : null, thin: window.getThinState ? window.getThinState() : null,
+      predict: window.getPredictState ? (function (s) { delete s.lastPoses; return s; })(window.getPredictState()) : null,
       dpr: devicePixelRatio, cap: window.getFrameCap ? window.getFrameCap() : null }); };
   return 'installed';
 } catch (e) { return 'ERR ' + e; } })()
@@ -189,6 +193,8 @@ def gesture_plan(kind, hz):
         steps = [["move", cx + 80, cy + 40], ["sleep", 120]] + sum([[["wheel", 120], ["sleep", 90]] for _ in range(10)], [])
     elif kind == "wheelout":
         steps = [["move", cx, cy], ["sleep", 120]] + sum([[["wheel", -120], ["sleep", 90]] for _ in range(6)], [])
+    elif kind == "flick":             # short fast drag, released while still moving: the coast
+        steps = [["move", cx - 300, cy], ["sleep", 120], ["down"], ["drag", 500, 0, 220, hz], ["up"]]
     elif kind == "orbit":
         steps = [["move", cx - 200, cy], ["sleep", 120], ["rdown"], ["drag", 400, -80, 1500, hz], ["rup"]]
     else:
@@ -289,7 +295,7 @@ def run(cap, todo):
         def poll():
             if proc.poll() is None:
                 return later(30, poll)
-            later(900, lambda: js("window.__ipStop()", lambda v: analyse(cap, kind, v, lf, ox, oy, dpr, late0, todo)))
+            later(2600 if kind == "flick" else 900, lambda: js("window.__ipStop()", lambda v: analyse(cap, kind, v, lf, ox, oy, dpr, late0, todo)))
         later(30, poll)
     js("window.__ipStart()", launch)
 
@@ -380,15 +386,65 @@ def analyse(cap, kind, v, lf, ox, oy, dpr, late0, todo):
                   "loaf": [l for l in d.get("loaf", []) if l[1] > 25]}
     if os.environ.get("KAIROS_BENCH_RAW"):
         row["raw"]["inj"] = [[k, round(t * 1000 - t_first, 1)] for k, x, y, t in inj]
-        row["raw"]["rend"] = [[round(r[0] - t_first, 1), round(r[1], 1), round(r[4], 2), round(r[2], 3), round(r[3], 3)] for r in rend]
+        row["raw"]["rend"] = [[round(r[0] - t_first, 1), round(r[1], 1), round(r[4], 3), round(r[2], 7), round(r[3], 7)] for r in rend]
         row["raw"]["co"] = [[c[0], round(c[3] - t_first, 1), round(c[4] - t_first, 1)] for c in co]
         row["raw"]["ev"] = [[e[0], round(e[1]), round(e[4] - t_first, 1)] + e[5:] for e in ev]
+    # LOD recovery: last moveend -> first render back at the native pixel ratio
+    me = d.get("me") or []
+    full = d.get("dpr", dpr)
+    if me and rend and len(rend[0]) > 7:
+        t_end = me[-1]
+        shed = any(r[7] < full - 0.01 for r in rend)
+        back = next((r[0] for r in rend if r[0] >= t_end and r[7] >= full - 0.01), None)
+        row["ratio_shed"] = shed
+        row["ratio_restore_ms"] = round(back - t_end, 1) if (shed and back) else (0 if not shed else None)
+        row["unloaded_frame_share"] = round(sum(1 for r in rs if not r[8]) / max(1, len(rs)), 3)
+    if kind == "flick":
+        row.update(coast_metrics(inj, rend, full))
+    row["momentum"] = d.get("momentum"); row["thin"] = d.get("thin"); row["predict"] = d.get("predict")
     results["runs"].append(row)
     print(json.dumps({k: row[k] for k in row if k != "raw"}, ensure_ascii=False))
     if EXTRA_JS:
         js(EXTRA_JS, lambda v: (print("JS", v), later(600, lambda: run(cap, todo))))
     else:
         later(600, lambda: run(cap, todo))
+
+
+def coast_metrics(inj, rend, dpr):
+    """Camera speed (CSS px/s) frame by frame around the release of a flick."""
+    import math
+    t_up = inj[-1][3] * 1000
+    def mx(lng): return (lng + 180) / 360
+    def my(lat):
+        r = math.radians(max(-85.05, min(85.05, lat)))
+        return (1 - math.log(math.tan(r) + 1 / math.cos(r)) / math.pi) / 2
+    sp = []                          # (t, px/s, interval)
+    for a, b in zip(rend, rend[1:]):
+        dt = b[0] - a[0]
+        if dt <= 0:
+            continue
+        world = 512 * 2 ** b[4]
+        d = math.hypot((mx(b[2]) - mx(a[2])) * world, (my(b[3]) - my(a[3])) * world)
+        sp.append((b[0], d / dt * 1000, dt))
+    drag = [v for t, v, _ in sp if t_up - 60 <= t <= t_up]
+    coast = [(t, v, dt) for t, v, dt in sp if t > t_up and v > 1]
+    if not drag or not coast:
+        return {"coast": None}
+    v_rel = statistics.median(drag)
+    # the frame spanning the release is reported on its own (release_frame_iv): a dropped vsync there
+    # halves its apparent speed; continuity = the coast's own opening speed vs the hand's
+    rel_iv = coast[0][2]
+    first = statistics.median([v for _, v, _ in coast[1:4]]) if len(coast) > 3 else coast[0][1]
+    ivs = [dt for _, _, dt in coast]
+    # stutter: a frame whose speed jumps UP by > 8 % or drops by > 2.5x what the neighbours imply
+    bumps = sum(1 for (_, a, _), (_, b, _) in zip(coast, coast[1:]) if b > a * 1.08)
+    cliffs = sum(1 for (_, a, _), (_, b, _) in zip(coast, coast[1:]) if a > 30 and b < a / 2.5)
+    return {"release_speed": round(v_rel), "coast_first_speed": round(first),
+            "release_continuity": round(first / v_rel, 2) if v_rel else None,
+            "release_frame_iv": round(rel_iv, 1),
+            "coast_ms": round(coast[-1][0] - t_up), "coast_frames": len(coast),
+            "coast_iv_p50": pct(ivs, .5), "coast_iv_p95": pct(ivs, .95), "coast_iv_max": pct(ivs, 1),
+            "coast_speed_bumps": bumps, "coast_speed_cliffs": cliffs}
 
 
 def finish():

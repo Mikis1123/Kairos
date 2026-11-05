@@ -64,7 +64,7 @@ class TestZeroVoidMap(unittest.TestCase):
         self.assertLess(ids.index("underlay"), ids.index("park"), "podklad musí být pod vektorovými plochami")
         src = self.js("(function () { var s = map.getStyle().sources.underlay; return [s.type, s.maxzoom, s.tiles[0]]; })()")
         self.assertEqual(src[0], "raster")
-        self.assertEqual(src[1], 9)
+        self.assertEqual(src[1], 10 if self.js("window.devicePixelRatio >= 1.5") else 9)   # HiDPI: true 256 px, z10
         self.assertIn("World_Light_Gray_Base", src[2])
 
     def test_underlay_blends_into_land_colour(self):
