@@ -23,8 +23,18 @@ How:
     that float over the map are handled two ways (AirspaceGuard):
       - "native" overlays (toasts, the F12 meter) get their own child HWND above the map,
       - modal overlays (sheets, command palette, guide callouts) freeze the map: a still frame
-        is captured (CapturePreviewAsync), painted by this widget, and the live view is hidden
-        until the last such overlay closes.
+        is captured (CapturePreviewAsync), painted by this widget, and the live view is parked
+        (see below) until the last such overlay closes.
+  * Seamless hand-off (no black / grey void when the map comes back):
+      - warm: leaving the map tab does NOT set IsVisible = False. Qt hides this HWND (and the
+        WebView2 child with it); Chromium keeps its last frame, so returning shows it at once.
+        An idle hidden map costs nothing (measured: 0 MapLibre frames, CPU within noise of a
+        hidden controller); only after WARM_HIDE_MS hidden, or when minimized, it goes cold.
+      - parked: the live view is moved just off the widget (same size, clipped by this HWND, so
+        Chromium keeps rendering) while this widget paints a still / the placeholder underneath.
+        Used under modal overlays, on the first load and when resuming from cold: the live view
+        moves back only once the page reports a presented frame (double rAF ping) - never an
+        unrendered surface. The page fades its own canvas veil out (window.__kairosHandoff).
   * Keyboard: while WebView2 has focus, Qt never sees the keys. Accelerator keys that match a
     QShortcut / QAction of the window are handed back to Qt; browser accelerators (reload, find,
     print, zoom) are disabled.
@@ -42,7 +52,8 @@ import tempfile
 import time
 
 from PyQt6.QtCore import QEvent, QKeyCombination, QObject, QRect, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QKeySequence, QPainter, QAction, QShortcut, QPainterPath, QRegion
+from PyQt6.QtGui import (QColor, QImage, QKeySequence, QPainter, QAction, QShortcut, QPainterPath, QRegion,
+                         QPen, QRadialGradient)
 from PyQt6.QtWidgets import QApplication, QWidget
 
 RESOURCE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -57,8 +68,20 @@ BROWSER_ARGS = ("--allow-file-access-from-files --autoplay-policy=no-user-gestur
                 "--disable-features=ElasticOverscroll,msSmartScreenProtection "
                 "--ignore-gpu-blocklist --enable-gpu-rasterization --enable-zero-copy")
 DISK_CACHE_MB = 256
+BUSY_RETRY_MS = (250, 500, 1000, 1500, 2000, 3000)   # ~8 s in all, then the QtWebEngine fallback
 POLL_MS = 4                      # pending .NET tasks are polled from a Qt timer (no blocking waits)
 SNAPSHOT_QUALITY_FORMAT = "Jpeg"
+WARM_HIDE_MS = 180_000           # hidden longer than this -> cold (IsVisible False, Chromium frees its frame)
+PREROLL_MAX_MS = 700             # a parked live view comes back after this even without the page's ping
+PARK_GAP = 64                    # parked bounds sit this far left of the widget: clipped, still rendering
+SPINNER_DELAY_MS = 350           # the cold-load placeholder shows its spinner only if loading takes longer
+MAP_BACKGROUND = "#06070C"       # map_vault.html <body>; what shows under / before the page (not grey)
+PRESENTED_PREFIX = "__kairosHost:presented:"
+# Two rAFs: the first runs before a frame is drawn, the second after that frame was produced.
+PRESENTED_JS = ("requestAnimationFrame(function () { requestAnimationFrame(function () {"
+                " if (window.chrome && chrome.webview) chrome.webview.postMessage('" + PRESENTED_PREFIX + "%d');"
+                " }); }); 0")
+HANDOFF_JS = "window.__kairosHandoff && window.__kairosHandoff(%s); 0"
 
 BRIDGE_JS = """(function () {
   if (!(window.chrome && chrome.webview)) return;
@@ -292,7 +315,7 @@ class WebView2Host(QWidget):
         self.tag = tag
         self._debug = os.environ.get("KAIROS_JS_DEBUG") == "1" if debug is None else bool(debug)
         self._udf = user_data_dir or os.path.join(tempfile.gettempdir(), "kairos_wv2")
-        self._bg = QColor("#1C1C1E")
+        self._bg = QColor(MAP_BACKGROUND)
         self._page = _PageShim(self)
         self._env = self._ctl = self._core = None
         self._url = None
@@ -303,10 +326,31 @@ class WebView2Host(QWidget):
         self._pending = []                       # [(task, on_done)]
         self._closed = False
         self._frozen = False
-        self._snapshot = None
+        self._snapshot = None                    # still painted under a parked / cold live view
         self._snap_seq = 0
+        self._parked = False                     # live view moved off the widget (rendering, warm)
+        self._cold = False                       # hidden > WARM_HIDE_MS / minimized: IsVisible False
+        self._ctl_visible = None                 # last IsVisible set on the controller
+        self._presented = False                  # the page presented a frame since the controller came up
+        self._preroll_seq = 0
+        self.handoffs = 0                        # parked live view brought back on a presented frame
+        self.handoff_timeouts = 0                # ... or on PREROLL_MAX_MS
+        self._placeholder_since = None
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(16)
+        self._spin_timer.timeout.connect(self._spin_step)
+        self._cool_timer = QTimer(self)
+        self._cool_timer.setSingleShot(True)
+        self._cool_timer.setInterval(WARM_HIDE_MS)
+        self._cool_timer.timeout.connect(self._cool_down)
         self._handlers = []                      # keep .NET delegates alive
         self._wv_focus = False                   # Win32 keyboard focus is inside WebView2
+        self._parent_hwnd = 0                    # HWND the controller is parented to right now
+        self._recovering = False
+        self._navigated = False
+        self.recoveries = 0                      # controller re-created after its HWND died
+        self._busy_retries = 0                   # ERROR_BUSY retries (previous session still closing)
+        self.reparents = 0                       # controller moved onto a new HWND of this widget
         self.console_printed = 0
         self.console_suppressed = 0
         self._seen = {}
@@ -360,7 +404,11 @@ class WebView2Host(QWidget):
         try:
             task = self._core.ExecuteScriptAsync(code)
         except Exception as e:
-            print(f"[{self.tag}] ExecuteScript: {e}")
+            if self.is_disposed_error(e):
+                self._queued_js.append((code, callback))   # runs on the re-created controller
+                self._recover("script")
+            else:
+                print(f"[{self.tag}] ExecuteScript: {e}")
             return
         if callback is not None:
             def done(t, cb=callback):
@@ -425,12 +473,21 @@ class WebView2Host(QWidget):
             self._fail(f"environment: {task.Exception}")
             return
         self._env = task.Result
+        self._request_controller()
+
+    def _request_controller(self):
+        if self._closed or self._env is None:
+            self._recovering = False
+            return
         try:
             ns = _load_clr()
-            ctask = self._env.CreateCoreWebView2ControllerAsync(ns["IntPtr"](int(self.winId())))
+            hwnd = int(self.winId())
+            ctask = self._env.CreateCoreWebView2ControllerAsync(ns["IntPtr"](hwnd))
         except Exception as e:
+            self._recovering = False
             self._fail(f"controller: {e}")
             return
+        self._ctl_request_hwnd = hwnd
         self._watch(ctask, self._on_controller)
 
     def _on_controller(self, task):
@@ -440,11 +497,24 @@ class WebView2Host(QWidget):
             except Exception:
                 pass
             return
+        self._recovering = False
         if task.IsFaulted:
+            # ERROR_BUSY: the browser process of the previous session (same user data folder) is
+            # still shutting down – seen on every quick relaunch. Failing here meant the QtWebEngine
+            # fallback, which is locked to 60 fps. Retry for a few seconds first.
+            if self.is_busy_error(task.Exception) and self._busy_retries < len(BUSY_RETRY_MS):
+                delay = BUSY_RETRY_MS[self._busy_retries]
+                self._busy_retries += 1
+                print(f"[{self.tag}] WebView2 busy (previous session closing) – retry {self._busy_retries} in {delay} ms")
+                QTimer.singleShot(delay, self._request_controller)
+                return
             self._fail(f"controller: {task.Exception}")
             return
         self._ctl = task.Result
         self._core = self._ctl.CoreWebView2
+        self._parent_hwnd = getattr(self, "_ctl_request_hwnd", 0)
+        if self._parent_hwnd != int(self.winId()):  # HWND re-created while the controller was on its way
+            self._attach_to_hwnd()
         ns = _load_clr()
         s = self._core.Settings
         s.AreDefaultContextMenusEnabled = False
@@ -467,6 +537,9 @@ class WebView2Host(QWidget):
         self._hook("GotFocus", self._ctl, self._on_wv_got_focus)
         self._hook("LostFocus", self._ctl, self._on_wv_lost_focus)
         self._hook_console()
+        self._parked = True                      # placeholder until the page presents (_on_nav_completed)
+        self._presented = False
+        self._ctl_visible = None
         self._sync_bounds()
         self._sync_visible()
         for code in self._init_scripts:
@@ -492,7 +565,7 @@ class WebView2Host(QWidget):
         def done(t):
             if t in self._script_tasks:
                 self._script_tasks.remove(t)
-            if not self._script_tasks and self._url and self._core is not None and not getattr(self, "_navigated", False):
+            if not self._script_tasks and self._url and self._core is not None and not self._navigated:
                 self._navigate()
         self._watch(task, done)
 
@@ -558,6 +631,7 @@ class WebView2Host(QWidget):
         if not ok:
             print(f"[{self.tag}] navigation failed: {args.WebErrorStatus}")
         self.loadFinished.emit(ok)
+        self._preroll("load")
 
     def _on_new_window(self, args):
         args.Handled = True                      # no popups (attribution links etc.)
@@ -567,6 +641,12 @@ class WebView2Host(QWidget):
             text = args.TryGetWebMessageAsString()
         except Exception:
             text = None
+        if text and text.startswith(PRESENTED_PREFIX):
+            try:
+                self._on_presented(int(text[len(PRESENTED_PREFIX):]))
+            except ValueError:
+                pass
+            return
         if text == "kairos-drop":
             paths = []
             try:
@@ -655,24 +735,223 @@ class WebView2Host(QWidget):
         self._console("error", str(exc.get("description") or data.get("text") or "uncaught exception"))
 
     # ── geometry / visibility / painting ──
+    def _controller_usable(self):
+        return self._ctl is not None and not self._closed
+
     def _sync_bounds(self):
-        if self._ctl is None:
+        if not self._controller_usable():
             return
         dpr = self.devicePixelRatioF()
         R = _load_clr()["Rectangle"]
+        w, h = max(1, round(self.width() * dpr)), max(1, round(self.height() * dpr))
         try:
-            self._ctl.Bounds = R(0, 0, max(1, round(self.width() * dpr)), max(1, round(self.height() * dpr)))
+            self._ctl.Bounds = R(-(w + PARK_GAP) if self._parked else 0, 0, w, h)
         except Exception as e:
-            print(f"[{self.tag}] bounds: {e}")
+            self._controller_error("bounds", e)
+
+    def _wants_live(self):
+        """Should Chromium render at all? Yes while shown, frozen or briefly hidden (warm)."""
+        win = self.window()
+        return not self._cold and not (win is not None and win.isMinimized())
 
     def _sync_visible(self):
-        if self._ctl is not None:
+        if not self._controller_usable():
+            return
+        want = self._wants_live()
+        if want == self._ctl_visible:
+            return
+        if want:
+            self._park()                         # from cold: render parked, show on a presented frame
+            if self._set_ctl_visible(True) and self._navigated:
+                self._preroll("resume")
+        elif self._ctl_visible is None:
+            self._set_ctl_visible(False)
+        else:                                    # going cold: keep a still (and the page's veil) first
+            self._hold_still(self._apply_cold)
+
+    def _set_ctl_visible(self, on):
+        try:
+            self._ctl.IsVisible = bool(on)
+        except Exception as e:
+            self._controller_error("visible", e)
+            return False
+        self._ctl_visible = bool(on)
+        return True
+
+    def _apply_cold(self):
+        if not self._controller_usable():
+            return
+        if self._wants_live():                   # shown again before the still arrived: stay live
+            if not self._frozen:
+                self._snapshot = None
+            self.run_js(HANDOFF_JS % '"release"')
+            self.update()
+            return
+        self._set_ctl_visible(False)
+
+    def _cool_down(self):
+        """Hidden for WARM_HIDE_MS: let Chromium drop its frame and GPU memory."""
+        if self._closed or self.isVisible():
+            return
+        self._cold = True
+        self._sync_visible()
+
+    # -- seamless hand-off --
+    def is_parked(self):
+        return self._parked
+
+    def _park(self):
+        if not self._parked:
+            self._parked = True
+            self._sync_bounds()
+
+    def _unpark(self):
+        if self._parked:
+            self._parked = False
+            self._sync_bounds()
+        if not self._frozen:
+            self._snapshot = None                # the live view covers this widget again
+        self._spin_timer.stop()
+        self._placeholder_since = None
+
+    def _preroll(self, why):
+        """Bring a parked live view back once the page has presented a frame (or after a cap)."""
+        if not self._controller_usable():
+            return
+        self._preroll_seq += 1
+        seq = self._preroll_seq
+        self.run_js(PRESENTED_JS % seq)
+        QTimer.singleShot(PREROLL_MAX_MS, lambda s=seq: self._on_presented(s, timed_out=True))
+
+    def _on_presented(self, seq, timed_out=False):
+        if self._closed or seq != self._preroll_seq:
+            return
+        self._preroll_seq += 1                   # the other half of this round (ping / cap) is ignored
+        self._presented = True
+        if timed_out:
+            self.handoff_timeouts += 1
+        else:
+            self.handoffs += 1
+        if not self._frozen:
+            self._unpark()
+            self.run_js(HANDOFF_JS % '"release"')   # the page fades its canvas veil out
+        self.update()
+
+    def _hold_still(self, then=None):
+        """Still of the live view for this widget to paint, plus the page's own canvas veil
+        (window.__kairosHandoff('hold')) that the page fades out after the next resume."""
+        self.run_js(HANDOFF_JS % '"hold"')
+        self._capture_still(then)
+
+    def _capture_still(self, then=None):
+        self._snap_seq += 1
+        seq = self._snap_seq
+        path = os.path.join(tempfile.gettempdir(), f"kairos_map_still_{os.getpid()}_{seq}.jpg")
+
+        def done(ok):
+            if ok and seq == self._snap_seq:
+                img = QImage(path)
+                if not img.isNull():
+                    img.setDevicePixelRatio(self.devicePixelRatioF())
+                    self._snapshot = img
             try:
-                win = self.window()
-                self._ctl.IsVisible = bool(self.isVisible() and not self._frozen
-                                           and not (win is not None and win.isMinimized()))
+                os.remove(path)
+            except OSError:
+                pass
+            if seq != self._snap_seq:
+                return                           # superseded (unfrozen / shown again meanwhile)
+            self.update()
+            if then is not None:
+                then()
+        self.capture_jpeg(path, done)
+
+    # ── HWND lifecycle ──
+    # WebView2 disposes a controller whose parent HWND is destroyed. Qt destroys every HWND of a
+    # top-level window when it switches the window's surface (Raster -> Direct3D the first time an
+    # RHI widget such as the viewer's video QQuickWidget joins it); that left the map blank with
+    # "members cannot be accessed after the WebView2 control is disposed". MainWindow now creates
+    # its window with the RHI surface up front (_reserve_rhi_surface), so this should not happen –
+    # but any controller access that finds it disposed re-creates it here and reloads the page
+    # (main._on_map_loaded restores layer, pins and a pending Journey), instead of a dead map.
+    def event(self, event):
+        result = super().event(event)
+        if event.type() == QEvent.Type.WinIdChange and not self._closed:
+            # Qt sends this twice: HWND gone (not created yet – calling winId() now would re-enter
+            # the teardown) and new HWND ready. Re-attach once the event loop is back in charge.
+            QTimer.singleShot(0, self._attach_to_hwnd)
+        return result
+
+    def _attach_to_hwnd(self):
+        """Controller onto the current HWND (after Qt re-created it); a dead one is re-created."""
+        if self._closed or self._ctl is None or not self.testAttribute(Qt.WidgetAttribute.WA_WState_Created):
+            return
+        hwnd = int(self.winId())
+        if hwnd == self._parent_hwnd:
+            return
+        try:
+            self._ctl.ParentWindow = _load_clr()["IntPtr"](hwnd)
+        except Exception as e:
+            self._controller_error("reparent", e)
+            return
+        self._parent_hwnd = hwnd
+        self.reparents += 1
+        self._sync_bounds()
+        self._sync_visible()
+        self.window_moved()
+
+    @staticmethod
+    def is_busy_error(exc):
+        """HRESULT_FROM_WIN32(ERROR_BUSY) = 0x800700AA from CreateCoreWebView2ControllerAsync."""
+        return "800700AA" in str(exc).upper()
+
+    @staticmethod
+    def is_disposed_error(exc):
+        text = str(exc).upper()
+        return ("DISPOSED" in text or "8007139F" in text
+                or type(exc).__name__ in ("ObjectDisposedException", "InvalidOperationException"))
+
+    def _controller_error(self, what, exc):
+        if self.is_disposed_error(exc):
+            self._recover(what)
+        else:
+            print(f"[{self.tag}] {what}: {exc}")
+
+    def _drop_controller(self):
+        for obj, event, handler in self._handlers:
+            try:
+                ev = getattr(obj, event)
+                ev -= handler
             except Exception:
                 pass
+        self._handlers.clear()
+        ctl, self._ctl, self._core = self._ctl, None, None
+        if ctl is not None:
+            try:
+                ctl.Close()
+            except Exception:
+                pass
+        self._parent_hwnd = 0
+        self._script_tasks = []
+        self._navigated = False
+        self._wv_focus = False
+        self._ctl_visible = None
+        self._presented = False
+        self._preroll_seq += 1
+
+    def _recover(self, why=""):
+        """The controller was disposed under us: a new one on the current HWND, page reloaded."""
+        if self._closed or self._recovering:
+            return
+        self._recovering = True
+        self.recoveries += 1
+        print(f"[{self.tag}] WebView2 controller lost ({why}) – re-creating")
+        self.created_at = time.perf_counter()
+        self._drop_controller()
+        if self._env is None:
+            self._recovering = False
+            QTimer.singleShot(0, self._create)
+            return
+        QTimer.singleShot(0, self._request_controller)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -680,13 +959,19 @@ class WebView2Host(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._cool_timer.stop()
+        self._cold = False
         self._sync_bounds()
         self._sync_visible()
         self._airspace.attach()
 
     def hideEvent(self, event):
+        """Warm: the controller stays visible (Qt hid its HWND already), so coming back shows
+        Chromium's last frame at once instead of an unrendered surface. Cold after WARM_HIDE_MS."""
         super().hideEvent(event)
-        self._sync_visible()
+        self._spin_timer.stop()
+        if not event.spontaneous():
+            self._cool_timer.start()
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -694,15 +979,15 @@ class WebView2Host(QWidget):
             self._sync_bounds()
 
     def window_moved(self):
-        if self._ctl is not None:
+        if self._controller_usable():
             try:
                 self._ctl.NotifyParentWindowPositionChanged()
-            except Exception:
-                pass
+            except Exception as e:
+                self._controller_error("position", e)
 
     def focusInEvent(self, event):
         super().focusInEvent(event)
-        if self._ctl is not None and not self._wv_focus:      # Tab / setFocus() into the map
+        if self._controller_usable() and not self._wv_focus:  # Tab / setFocus() into the map
             try:
                 self._ctl.MoveFocus(_load_clr()["Core"].CoreWebView2MoveFocusReason.Programmatic)
             except Exception:
@@ -728,49 +1013,51 @@ class WebView2Host(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
-        if self._frozen and self._snapshot is not None:
+        if self._snapshot is not None:
             p.drawImage(self.rect(), self._snapshot)
         else:
-            p.fillRect(self.rect(), self._bg)
+            paint_placeholder(p, self.rect(), self._bg, self._spinner_clock())
         p.end()
+
+    def _spinner_clock(self):
+        """None (no spinner) or perf_counter seconds: only before the page has ever presented,
+        and only once loading has taken longer than SPINNER_DELAY_MS."""
+        if self._presented or self._closed or not self.isVisible():
+            return None
+        now = time.perf_counter()
+        if self._placeholder_since is None:
+            self._placeholder_since = now
+        if not self._spin_timer.isActive():
+            self._spin_timer.start()
+        return now if (now - self._placeholder_since) * 1000 >= SPINNER_DELAY_MS else None
+
+    def _spin_step(self):
+        if self._presented or self._snapshot is not None or not self.isVisible():
+            self._spin_timer.stop()
+            return
+        self.update(spinner_rect(self.rect()))
 
     # ── airspace freeze ──
     def is_frozen(self):
         return self._frozen
 
     def freeze(self, on):
-        """Still frame instead of the live view while a modal Qt overlay covers the map."""
+        """Still frame instead of the live view while a modal Qt overlay covers the map. The live
+        view is parked (not hidden), so it is back the instant the overlay closes."""
         on = bool(on)
         if on == self._frozen:
             return
         self._frozen = on
-        self._snap_seq += 1
         if not on:
-            self._snapshot = None
-            self._sync_visible()
+            self._snap_seq += 1                  # a still on its way is dropped
+            if self._presented:
+                self._unpark()
             self.update()
             return
         if self._core is None or not self.isVisible():
-            self._sync_visible()
+            self._park()
             return
-        seq = self._snap_seq
-        path = os.path.join(tempfile.gettempdir(), f"kairos_map_still_{os.getpid()}.jpg")
-
-        def done(ok):
-            if seq != self._snap_seq or not self._frozen:
-                return
-            if ok:
-                img = QImage(path)
-                if not img.isNull():
-                    img.setDevicePixelRatio(self.devicePixelRatioF())
-                    self._snapshot = img
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            self.update()
-            self._sync_visible()                 # hide the live view only once the still is up
-        self.capture_jpeg(path, done)
+        self._capture_still(lambda: self._frozen and self._park())   # park once the still is up
 
     # ── teardown ──
     def close_webview(self):
@@ -778,20 +1065,11 @@ class WebView2Host(QWidget):
             return
         self._closed = True
         self._poll.stop()
+        self._spin_timer.stop()
+        self._cool_timer.stop()
         self._airspace.detach()
-        for obj, event, handler in self._handlers:
-            try:
-                ev = getattr(obj, event)
-                ev -= handler
-            except Exception:
-                pass
-        self._handlers.clear()
-        if self._ctl is not None:
-            try:
-                self._ctl.Close()
-            except Exception:
-                pass
-        self._ctl = self._core = self._env = None
+        self._drop_controller()
+        self._env = None
 
     def closeEvent(self, event):
         self.close_webview()
@@ -802,6 +1080,37 @@ class WebView2Host(QWidget):
             self.close_webview()
         except Exception:
             pass
+
+
+# ── placeholder ──────────────────────────────────────────────────────────────
+
+def spinner_rect(rect):
+    c = rect.center()
+    return QRect(c.x() - 18, c.y() - 18, 36, 36)
+
+
+def paint_placeholder(p, rect, bg, spin_now=None):
+    """What the map page itself shows before MapLibre draws (map_vault.html #map): deep space
+    with a faint glow - so a cold load hands over to the page without a colour jump. A thin
+    arc spinner (spin_now = perf_counter seconds) only when loading takes a while."""
+    p.fillRect(rect, bg)
+    c = rect.center()
+    g = QRadialGradient(float(c.x()), float(rect.top() + rect.height() * 0.46),
+                        max(1.0, 0.70 * max(rect.width(), rect.height())))
+    g.setColorAt(0.0, QColor("#141B33"))
+    g.setColorAt(0.55, QColor("#0A0D18"))
+    g.setColorAt(1.0, QColor("#05060B"))
+    p.fillRect(rect, g)
+    if spin_now is None:
+        return
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    r = spinner_rect(rect).adjusted(7, 7, -7, -7)
+    p.setPen(QPen(QColor(255, 255, 255, 30), 2.0))
+    p.drawEllipse(r)
+    pen = QPen(QColor(255, 255, 255, 150), 2.0)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    p.drawArc(r, int(-(spin_now % 0.9) / 0.9 * 360 * 16), 80 * 16)
 
 
 # ── airspace ─────────────────────────────────────────────────────────────────

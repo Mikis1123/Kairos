@@ -143,14 +143,17 @@ def test_zoom_in_children_spring_out_of_the_parent(mappage):
     st = m.js("getPinSpring()")
     assert st["active"], "split runs as a spring"
     assert st["split"] == 4 and st["merge"] == 0 and st["fade"] == 1, "children burst out, the parent dissolves"
-    hidden = m.js("JSON.stringify(map.getPaintProperty('pins', 'icon-opacity'))")
-    assert '"anim"' in hidden, "GL pins under the sprites stay hidden until they land"
+    # constant paint (no source reload per frame), opacity per feature in feature-state
+    paint = m.js("JSON.stringify(map.getPaintProperty('pins', 'icon-opacity'))")
+    assert '"feature-state"' in paint and paint == m.js("JSON.stringify(PIN_OPACITY)")
+    ops = m.js("getPinOps()")
+    assert ops["state"] and 0 in ops["state"].values(), "GL pins under the sprites stay hidden until they land"
     assert m.js("document.querySelectorAll('#pinSprites .pin-sprite').length") == 5
     assert _wait_js(m, "!getPinSpring().active", 2500), "settles"
     last = m.js("getPinSpring().last")
     assert 0 < last["overshoot"] < 0.25, "a slight bounce past the target, not a wobble"
     assert last["ms"] < 1400
-    assert m.js("map.getPaintProperty('pins', 'icon-opacity')") == 1, "GL pins back at full opacity"
+    assert m.js("getPinOps()")["ids"] == {}, "GL pins back at full opacity (no per-feature state left)"
     assert m.js("document.querySelectorAll('#pinSprites .pin-sprite').length") == 0
 
 
@@ -165,7 +168,7 @@ def test_zoom_out_children_collapse_into_the_parent(mappage):
     assert st["active"] and st["split"] == 0 and st["merge"] >= 2 and st["merge"] + st["fade"] == 4
     assert _wait_js(m, "!getPinSpring().active", 2500)
     assert m.js("getClusterCount()") == 1
-    assert m.js("map.getPaintProperty('pins', 'icon-opacity')") == 1
+    assert m.js("getPinOps()")["ids"] == {}
 
 
 def test_reduced_motion_keeps_the_instant_path(mappage):

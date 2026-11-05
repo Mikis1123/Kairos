@@ -153,6 +153,131 @@ def set_thread_eco(enabled):
         return False
 
 
+# ── Interactive QoS for the map's web processes (2026-11-04) ──
+# MapLibre's JavaScript runs in the WebView2 RENDERER process (msedgewebview2.exe), and frames
+# are composited by its GPU process. Neither owns a window. Measured with
+# GetProcessInformation(ProcessPowerThrottling): Chromium sets EcoQoS explicitly on BACKGROUND
+# renderers (ControlMask=5, StateMask=5 on another app's WebView2), but on the VISIBLE map
+# renderer it leaves execution speed to Windows (ControlMask=4: timer bit only). On battery /
+# Energy Saver / "best power efficiency", Windows' heuristics may then put a windowless process
+# on efficiency cores at low clock. That is the "slow on battery" map: every frame is
+# main-thread JS. While the map page is shown, the app's own web processes opt out
+# (EXECUTION_SPEED controlled, state 0 = HighQoS). When it is hidden they return to the
+# system default. An idle map draws 0 frames, so the opt-out costs nothing at rest.
+_ProcessPowerThrottling = 4
+_PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+WEB_PROCESS_NAMES = ("msedgewebview2.exe", "qtwebengineprocess.exe")
+
+
+class _PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+    _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong), ("StateMask", ctypes.c_ulong)]
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong), ("th32ProcessID", ctypes.c_ulong),
+                ("th32DefaultHeapID", ctypes.c_void_p), ("th32ModuleID", ctypes.c_ulong),
+                ("cntThreads", ctypes.c_ulong), ("th32ParentProcessID", ctypes.c_ulong),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def _process_table():
+    """[(pid, parent pid, exe name lower-case)] of all processes (Toolhelp snapshot)."""
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)                 # TH32CS_SNAPPROCESS
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return []
+    out = []
+    try:
+        e = _PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(e)
+        ok = k32.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(e))
+        while ok:
+            out.append((e.th32ProcessID, e.th32ParentProcessID, e.szExeFile.lower()))
+            ok = k32.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(e))
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(snap))
+    return out
+
+
+def web_process_ids(root_pid=None, table=None):
+    """PIDs of the web-engine processes descended from root_pid (default: this process)."""
+    import os
+    root = os.getpid() if root_pid is None else int(root_pid)
+    table = _process_table() if table is None else table
+    kids = {}
+    for pid, ppid, name in table:
+        kids.setdefault(ppid, []).append((pid, name))
+    found, todo, seen = [], [root], {root}
+    while todo:
+        for pid, name in kids.get(todo.pop(), ()):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            todo.append(pid)
+            if name in WEB_PROCESS_NAMES:
+                found.append(pid)
+    return found
+
+
+def set_process_high_qos(pid, high):
+    """high=True: the process opts out of execution-speed throttling (EcoQoS); False: back to
+    the system's default. Other throttling bits (timer resolution) are kept as they are."""
+    if sys.platform != "win32":
+        return False
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x0200 | 0x1000, False, int(pid))   # SET_INFORMATION | QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        st = _PROCESS_POWER_THROTTLING_STATE(1, 0, 0)
+        if not k32.GetProcessInformation(ctypes.c_void_p(h), _ProcessPowerThrottling, ctypes.byref(st), ctypes.sizeof(st)):
+            st = _PROCESS_POWER_THROTTLING_STATE(1, 0, 0)
+        st.Version = 1
+        if high:
+            st.ControlMask |= _PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            st.StateMask &= ~_PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        else:
+            st.ControlMask &= ~_PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            st.StateMask &= ~_PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        return bool(k32.SetProcessInformation(ctypes.c_void_p(h), _ProcessPowerThrottling, ctypes.byref(st), ctypes.sizeof(st)))
+    except Exception:
+        return False
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def process_qos_state(pid):
+    """(ControlMask, StateMask) of a process's power throttling, or None (tests / diagnostics)."""
+    if sys.platform != "win32":
+        return None
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x1000, False, int(pid))
+    if not h:
+        return None
+    try:
+        st = _PROCESS_POWER_THROTTLING_STATE(1, 0, 0)
+        if not k32.GetProcessInformation(ctypes.c_void_p(h), _ProcessPowerThrottling, ctypes.byref(st), ctypes.sizeof(st)):
+            return None
+        return st.ControlMask, st.StateMask
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def set_web_processes_interactive(high):
+    """All of this app's web-engine processes to HighQoS (map shown) or system default (hidden).
+    Returns the number of processes changed. Safe to call repeatedly: Chromium rewrites the
+    flags on its own visibility changes, so the map re-applies this on its power poll."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        return sum(1 for pid in web_process_ids() if set_process_high_qos(pid, high))
+    except Exception:
+        return 0
+
+
 _monitor = PowerMonitor()
 
 

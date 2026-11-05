@@ -2,6 +2,7 @@
 import gzip
 import json
 import os
+import sqlite3
 import re
 import tempfile
 import threading
@@ -85,7 +86,25 @@ class TileStoreDbTest(unittest.TestCase):
         self.store.close()
         self.store = tile_store.TileStore(os.path.join(self.dir, "t.sqlite"), budget_mb=1)
         self.assertEqual(self.store.get("h/k")[0], b"data")
+        self.assertTrue(self.store.ready.wait(5))         # size is counted by the writer thread
         self.assertEqual(self.store.bytes, 4)
+
+    def test_open_does_not_scan_tile_data(self):
+        """Opening the store must not run SUM(size) on the caller's (GUI) thread: without the
+        covering index it reads every BLOB (5.5 s for a 238 MB store)."""
+        self.store.put("h/k", b"x" * 5000, "image/png", None)
+        self.store.close()
+        self.store = tile_store.TileStore(os.path.join(self.dir, "t.sqlite"), budget_mb=1)
+        self.assertTrue(self.store.ready.wait(5))
+        self.assertEqual(self.store.bytes, 5000)
+        conn = sqlite3.connect(os.path.join(self.dir, "t.sqlite"))
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        plan = " ".join(str(r) for r in conn.execute(
+            "EXPLAIN QUERY PLAN SELECT COALESCE(SUM(size), 0) FROM tiles INDEXED BY tiles_used_size"))
+        conn.close()
+        self.assertIn("tiles_used_size", names)
+        self.assertIn("tiles_key_size", names)
+        self.assertIn("COVERING INDEX", plan)
 
     def test_freshness_versioned_vs_raster(self):
         old = time.time() - tile_store.RASTER_TTL_S - 10

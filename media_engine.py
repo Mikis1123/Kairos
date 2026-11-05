@@ -41,6 +41,7 @@ class _PlayerCore(QObject):
         self.player = None
         self.audio = None
         self.seq = 0
+        self.tracks_off = set()        # {"audio", "video"} switched off for the current source
         self.dispose_requested.connect(self._dispose)
 
     @pyqtSlot(int, str, object)
@@ -55,12 +56,21 @@ class _PlayerCore(QObject):
             self.player.mediaStatusChanged.connect(self._emit)
             self.player.positionChanged.connect(self._emit)
             self.player.durationChanged.connect(self._emit)
+            self.player.mediaStatusChanged.connect(self._on_status)
             self.player.errorOccurred.connect(lambda _e, s: self.frame_error.emit(s))
             return
         if self.player is None:
             return
         if name == "setVideoSink":
             self.player.setVideoSink(arg)
+        elif name == "setTrackEnabled":
+            kind, on = arg
+            (self.tracks_off.discard if on else self.tracks_off.add)(kind)
+            self._apply_tracks(kind)
+            return
+        elif name == "setSource":
+            self.tracks_off.clear()    # Qt resets the active tracks with every new source too
+            self.player.setSource(arg)
         elif name in ("setMuted", "setVolume"):
             getattr(self.audio, name)(arg)
             return
@@ -69,6 +79,21 @@ class _PlayerCore(QObject):
         else:
             getattr(self.player, name)(arg)
         self._emit()
+
+    def _on_status(self, status):
+        if status == _MS.LoadedMedia and self.tracks_off:
+            self._apply_tracks()           # a choice made before loading would be overwritten
+
+    def _apply_tracks(self, only=None):
+        p = self.player
+        if p is None or p.mediaStatus() in (_MS.NoMedia, _MS.LoadingMedia, _MS.InvalidMedia):
+            return                         # applied on LoadedMedia
+        for kind in (only,) if only else ("audio", "video"):
+            setter = p.setActiveAudioTrack if kind == "audio" else p.setActiveVideoTrack
+            current = p.activeAudioTrack() if kind == "audio" else p.activeVideoTrack()
+            want = -1 if kind in self.tracks_off else 0
+            if current != want:
+                setter(want)
 
     def _emit(self, *_):
         p = self.player
@@ -205,6 +230,17 @@ class ThreadedPlayer(QObject):
     def setPlaybackRate(self, rate):
         self._rate = float(rate)
         self._send("setPlaybackRate", self._rate, bump=False)
+
+    def setAudioTrackEnabled(self, on):
+        """False = play the current source without its audio track (until the next setSource).
+
+        Live Photo clips: Qt 6.11's FFmpeg backend slaves video to the audio clock and holds
+        it back ~12 % (37.5 ms instead of 33.3 ms per frame, measured); video alone is exact."""
+        self._send("setTrackEnabled", ("audio", bool(on)), bump=False)
+
+    def setVideoTrackEnabled(self, on):
+        """False = audio only (no HEVC decode) for the current source."""
+        self._send("setTrackEnabled", ("video", bool(on)), bump=False)
 
     def setVideoOutput(self, output):
         self._output = output

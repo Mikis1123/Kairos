@@ -1,0 +1,755 @@
+{
+ "runs": [
+  {
+   "cap": "app@1",
+   "kind": "pan",
+   "events": 754,
+   "unmatched": 751,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830407.1608717
+     ],
+     [
+      "move",
+      1206,
+      858,
+      1793830407.1614475
+     ],
+     [
+      "down",
+      1206,
+      858,
+      1793830407.2856631
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@1",
+   "kind": "wheelin",
+   "events": 12,
+   "unmatched": 10,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830411.936277
+     ],
+     [
+      "move",
+      1586,
+      898,
+      1793830411.936933
+     ],
+     [
+      "wheel",
+      1586,
+      898,
+      1793830412.0578542
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@1",
+   "kind": "orbit",
+   "events": 379,
+   "unmatched": 376,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830414.5961838
+     ],
+     [
+      "move",
+      1306,
+      858,
+      1793830414.5971336
+     ],
+     [
+      "rdown",
+      1306,
+      858,
+      1793830414.726976
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@1",
+   "kind": "pan",
+   "events": 754,
+   "unmatched": 751,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830420.886997
+     ],
+     [
+      "move",
+      1206,
+      858,
+      1793830420.887669
+     ],
+     [
+      "down",
+      1206,
+      858,
+      1793830421.012623
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@2",
+   "kind": "pan",
+   "events": 754,
+   "unmatched": 751,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830430.2414062
+     ],
+     [
+      "move",
+      1206,
+      858,
+      1793830430.2418637
+     ],
+     [
+      "down",
+      1206,
+      858,
+      1793830430.3701472
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@2",
+   "kind": "wheelin",
+   "events": 12,
+   "unmatched": 10,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830435.038449
+     ],
+     [
+      "move",
+      1586,
+      898,
+      1793830435.0390716
+     ],
+     [
+      "wheel",
+      1586,
+      898,
+      1793830435.159634
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@2",
+   "kind": "orbit",
+   "events": 379,
+   "unmatched": 376,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830437.7553718
+     ],
+     [
+      "move",
+      1306,
+      858,
+      1793830437.7560954
+     ],
+     [
+      "rdown",
+      1306,
+      858,
+      1793830437.8784075
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@2",
+   "kind": "pan",
+   "events": 754,
+   "unmatched": 751,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830444.1158469
+     ],
+     [
+      "move",
+      1206,
+      858,
+      1793830444.1164367
+     ],
+     [
+      "down",
+      1206,
+      858,
+      1793830444.2399561
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@4",
+   "kind": "pan",
+   "events": 754,
+   "unmatched": 751,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830453.5222137
+     ],
+     [
+      "move",
+      1206,
+      858,
+      1793830453.5228422
+     ],
+     [
+      "down",
+      1206,
+      858,
+      1793830453.6471682
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@4",
+   "kind": "wheelin",
+   "events": 12,
+   "unmatched": 10,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830458.3387842
+     ],
+     [
+      "move",
+      1586,
+      898,
+      1793830458.3392906
+     ],
+     [
+      "wheel",
+      1586,
+      898,
+      1793830458.4604452
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@4",
+   "kind": "orbit",
+   "events": 379,
+   "unmatched": 376,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830461.0638366
+     ],
+     [
+      "move",
+      1306,
+      858,
+      1793830461.064524
+     ],
+     [
+      "rdown",
+      1306,
+      858,
+      1793830461.189075
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  },
+  {
+   "cap": "app@4",
+   "kind": "pan",
+   "events": 754,
+   "unmatched": 751,
+   "recv_p50": null,
+   "recv_p95": null,
+   "recv_max": null,
+   "disp_p50": null,
+   "disp_p95": null,
+   "disp_max": null,
+   "frame_p50": null,
+   "frame_p95": null,
+   "frame_max": null,
+   "vsync_hz": 119.0,
+   "renders": 0,
+   "render_iv_p50": null,
+   "render_iv_p95": null,
+   "render_iv_max": null,
+   "gaps_over_2vs": 0,
+   "cost_p50": null,
+   "cost_p95": null,
+   "cost_max": null,
+   "zoom": null,
+   "pitch": null,
+   "gui_late": [],
+   "frame_cap": {
+    "fps": 0,
+    "div": 1,
+    "k": 1,
+    "vsync": 8.33,
+    "pace": 8.33
+   },
+   "raw": {
+    "inj0": [
+     [
+      "move",
+      1506,
+      858,
+      1793830467.4052587
+     ],
+     [
+      "move",
+      1206,
+      858,
+      1793830467.406321
+     ],
+     [
+      "down",
+      1206,
+      858,
+      1793830467.534059
+     ]
+    ],
+    "co0": [],
+    "rend0": [],
+    "loaf": []
+   }
+  }
+ ],
+ "gui_late": [
+  [
+   1793830393.852,
+   114
+  ],
+  [
+   1793830394.578,
+   74
+  ],
+  [
+   1793830396.93,
+   859
+  ],
+  [
+   1793830396.974,
+   44
+  ],
+  [
+   1793830397.141,
+   73
+  ],
+  [
+   1793830397.218,
+   34
+  ],
+  [
+   1793830397.278,
+   60
+  ],
+  [
+   1793830397.56,
+   46
+  ],
+  [
+   1793830398.666,
+   46
+  ],
+  [
+   1793830399.326,
+   660
+  ]
+ ],
+ "cpu_sha256_mbps": 1588
+}

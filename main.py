@@ -2573,6 +2573,8 @@ class SearchModelWarmup(QThread):
 # ── Map bridge ────────────────────────────────────────────────────────────────
 
 MAP_HOLD_TTL_S = 20.0       # nejdelší pohyb kamery mapy bez nového hlášení
+MAP_POWER_POLL_MS = 5000    # map page open: power source / Battery Saver re-checked (frame cap)
+MAP_REFRESH_AFTER_SWITCH_MS = 40     # markers re-sent this long after the Map tab is shown
 
 
 class ClipRelay(QObject):
@@ -4054,6 +4056,7 @@ class MainWindow(QMainWindow):
         self._search_debounce.setInterval(400)
         self._search_debounce.timeout.connect(self._run_ai_search)
 
+        self._reserve_rhi_surface()
         self._build_ui()
         # Podstránky (prohlížeč, osoba, událost, kontroly) v témže okně místo dialogů
         self.nav = NavigationController(self.stack, self)
@@ -4116,6 +4119,28 @@ class MainWindow(QMainWindow):
             self._viewer.request_close()      # zastaví přehrávání a pak se vrátí
         else:
             self.nav.pop()
+
+    def _reserve_rhi_surface(self):
+        """The window is born with a Direct3D (RHI) surface instead of switching to it later.
+
+        Qt 6 recreates a top-level window – and every native child HWND in it – the first time an
+        RHI widget (the viewer's video QQuickWidget, the minimap's QWebEngineView) is added. That
+        happened on the first photo open: the window flashed as if it restarted, and WebView2
+        disposed the map's controller with its destroyed parent HWND (blank Map / Journey). A hidden
+        1x1 QQuickWidget, created before the window exists, flags the window as RHI from birth."""
+        try:
+            from PyQt6.QtQuickWidgets import QQuickWidget
+        except Exception as e:                 # no QtQuick: map_host still recovers the controller
+            print(f"[Okno] RHI surface not reserved: {e}")
+            self._rhi_anchor = None
+            return
+        anchor = QQuickWidget(self)
+        anchor.setObjectName("kairos_rhi_anchor")
+        anchor.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        anchor.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        anchor.setGeometry(0, 0, 1, 1)
+        anchor.hide()
+        self._rhi_anchor = anchor
 
     def _apply_stylesheet(self):
         tokens.apply_stylesheet(self, "main")
@@ -4505,7 +4530,7 @@ class MainWindow(QMainWindow):
         import paths as _paths
         view = map_host.WebView2Host(user_data_dir=os.path.join(_paths.WEB_CACHE_DIR, "wv2"), tag="Mapa")
         view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        view.page().setBackgroundColor(QColor("#1C1C1E"))
+        view.page().setBackgroundColor(QColor(map_host.MAP_BACKGROUND))
         srv = tile_store.start(int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
         if srv is not None:                  # C7e: like install_tile_store, before the page's scripts
             view.add_init_script(f"window.TILE_STORE_CONFIG = {json.dumps(srv.config())};")
@@ -4561,7 +4586,7 @@ class MainWindow(QMainWindow):
                                   else QuietWebPage(self.map_view, tag="Mapa"))
             # Žádné menu Chromia (Zpět / Znovu načíst / Zobrazit zdroj) na pravém tlačítku
             self.map_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-            self.map_view.page().setBackgroundColor(QColor("#1C1C1E"))
+            self.map_view.page().setBackgroundColor(QColor(map_host.MAP_BACKGROUND))
             install_tile_store(self.map_view.page(),
                                int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
             settings = self.map_view.settings()
@@ -5642,7 +5667,9 @@ class MainWindow(QMainWindow):
             self._load_events()
         elif idx == 3:
             self._ensure_map_view()
-            self._refresh_map()
+            # after the tab has painted: the marker query + JSON grows with the library and would
+            # hold the switch (the warm map surface is already showing the pins it had)
+            QTimer.singleShot(MAP_REFRESH_AFTER_SWITCH_MS, self._refresh_shown_map)
 
     def _on_map_loaded(self, ok: bool):
         self._map_loaded = ok
@@ -5657,7 +5684,8 @@ class MainWindow(QMainWindow):
         page = self.map_view.page()
         # adaptivní škálování mapy: meze rozlišení, LOD dlaždic a terénu podle profilu stroje
         page.runJavaScript(f"window.setPerfProfile && window.setPerfProfile({json.dumps(self.perf.for_map())});")
-        page.runJavaScript(f"window.setFrameCap && window.setFrameCap({self._map_fps_cap()});")
+        self._map_cap_pushed = self._map_fps_cap()
+        page.runJavaScript(f"window.setFrameCap && window.setFrameCap({self._map_cap_pushed});")
         page.runJavaScript(f"window.setBaseLayer && window.setBaseLayer({json.dumps(layer)});")
         page.runJavaScript(f"window.setJourneyMusic && window.setJourneyMusic({json.dumps(self._music_config())});")
         self._push_map_strings()
@@ -5692,11 +5720,50 @@ class MainWindow(QMainWindow):
         active = self.stack.currentWidget() is self.page_map
         self.map_view.page().runJavaScript(f"window.setMapActive && window.setMapActive({json.dumps(active)});")
         if active:                           # the power source may have changed since the last visit
-            self.map_view.page().runJavaScript(f"window.setFrameCap && window.setFrameCap({self._map_fps_cap()});")
+            self._push_map_fps_cap(force=True)
+        else:
+            self._map_web_qos(False)
+        timer = getattr(self, "_map_power_timer", None)
+        if active and timer is None:         # unplugged / Battery Saver while the map is open
+            timer = self._map_power_timer = QTimer(self)
+            timer.setInterval(MAP_POWER_POLL_MS)
+            timer.timeout.connect(self._push_map_fps_cap)
+        if timer is not None:
+            timer.start() if active else timer.stop()
+
+    def _map_web_qos(self, high):
+        """Map shown: the web processes that draw it run at full speed even when Windows would
+        throttle them (battery, Energy Saver, best power efficiency); hidden: system default.
+        Re-applied on the 5 s power poll because Chromium rewrites the flags itself (power.py)."""
+        if self.config.get("map_high_qos", True) is False:
+            high = False
+        if not high and not getattr(self, "_map_qos_on", False):
+            return
+        self._map_qos_on = bool(high)
+        # the process-table walk costs ~12 ms – not on the GUI thread during a tab switch.
+        # One worker keeps the on/off order.
+        pool = getattr(self, "_qos_pool", None)
+        if pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            pool = self._qos_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="map-qos")
+        pool.submit(power.set_web_processes_interactive, high)
+
+    def _push_map_fps_cap(self, force=False):
+        if getattr(self, "map_view", None) is None or not self._map_loaded:
+            return
+        if self.stack.currentWidget() is self.page_map:
+            self._map_web_qos(True)
+        cap = self._map_fps_cap()
+        if force or cap != getattr(self, "_map_cap_pushed", None):
+            self._map_cap_pushed = cap
+            self.map_view.page().runJavaScript(f"window.setFrameCap && window.setFrameCap({cap});")
 
     def _map_fps_cap(self):
-        """Gate 2: map frame cap – 0 = the panel's own rate (120 Hz in WebView2), 60 on battery
-        (unless the battery policy is "full"); config "map_fps_cap" overrides both."""
+        """Map frame cap: 0 = the panel's own rate. Only Windows Battery Saver (an explicit "save
+        power" from the user) caps the map at 60; plain battery keeps the panel rate – the founder's
+        bar is a fluid map on battery, and the panel already drops itself to 60 Hz there on most
+        laptops. CPU pressure is handled in the page (even-cadence pacing governor), not here.
+        Battery policy "full" never caps; config "map_fps_cap" overrides everything."""
         try:
             cap = int(self.config.get("map_fps_cap", 0) or 0)
         except (TypeError, ValueError):
@@ -5706,7 +5773,8 @@ class MainWindow(QMainWindow):
         if self.config.get("battery_policy", power.DEFAULT_POLICY) == "full":
             return 0
         try:
-            return 60 if power.get().state().on_battery else 0
+            st = power.get().state()
+            return 60 if (st.on_battery and st.saver) else 0
         except Exception:
             return 0
 
@@ -6004,6 +6072,11 @@ class MainWindow(QMainWindow):
             save_config(self.config)
         except Exception as e:
             print(f"[Map] Volbu podkladu se nepodařilo uložit: {e}")
+
+    def _refresh_shown_map(self):
+        """Deferred refresh of a tab switch: only while the map is still what the user sees."""
+        if self.isVisible() and self.stack.currentWidget() is self.page_map:
+            self._refresh_map()
 
     def _refresh_map(self):
         """Pošle do mapy všechny viditelné fotky s polohou (R*Tree index přes query_geo_bounds)."""

@@ -257,11 +257,23 @@ def pil_to_qimage(img):
     return QImage(img.tobytes("raw", "RGB"), w, h, w * 3, QImage.Format.Format_RGB888).copy()
 
 
-def qimage_to_pil(qimg):
+def _qt_format(qimg, alpha):
+    """QImage.Format for the conversion, as the enum class sip itself returns for `qimg`.
+    PyQt6 builds its enums lazily; when several decode threads touch QImage.Format for the first
+    time at once, the class attribute can end up a different 'Format' class than the one the
+    argument parser checks (observed in the app: every thumbnail worker then failed with
+    "argument 1 has unexpected type 'Format'"). type(qimg.format()) is always the parser's class."""
     from PyQt6.QtGui import QImage
+    name = "Format_RGBA8888" if alpha else "Format_RGB888"
+    try:
+        return getattr(type(qimg.format()), name)
+    except Exception:
+        return getattr(QImage.Format, name)
+
+
+def qimage_to_pil(qimg):
     alpha = qimg.hasAlphaChannel()
-    fmt = QImage.Format.Format_RGBA8888 if alpha else QImage.Format.Format_RGB888
-    q = qimg.convertToFormat(fmt)
+    q = qimg.convertToFormat(_qt_format(qimg, alpha))
     w, h = q.width(), q.height()
     ptr = q.constBits()
     ptr.setsize(q.sizeInBytes())

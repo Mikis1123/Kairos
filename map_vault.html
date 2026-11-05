@@ -30,6 +30,17 @@
   /* Vesmír za zeměkoulí: plátno MapLibre je mimo glóbus průhledné */
   #map { position: absolute; inset: 0;
          background: radial-gradient(ellipse 70% 60% at 50% 46%, #141B33 0%, #0A0D18 55%, #05060B 100%); }
+  /* Seamless hand-off (map_host.py): last frame above the canvas, under every control */
+  #handoff-veil { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  /* Cold load: the same thin arc the host paints before the page exists (map_host.paint_placeholder) */
+  #maploading { position: absolute; left: 50%; top: 50%; width: 22px; height: 22px; margin: -11px 0 0 -11px;
+                pointer-events: none; opacity: 0; transition: opacity .2s var(--ease); }
+  #maploading.on { opacity: 1; }
+  #maploading::before, #maploading::after { content: ''; position: absolute; inset: 0; border-radius: 50%;
+                box-sizing: border-box; border: 2px solid rgba(255,255,255,0.12); }
+  #maploading::after { border-color: transparent; border-top-color: rgba(255,255,255,0.59);
+                       animation: maploading-spin .9s linear infinite; }
+  @keyframes maploading-spin { to { transform: rotate(360deg); } }
   .glass { background: var(--glass); border: 1px solid var(--hair); box-shadow: 0 8px 28px rgba(0,0,0,0.45);
            backdrop-filter: blur(18px) saturate(1.4); -webkit-backdrop-filter: blur(18px) saturate(1.4); }
   button { font: inherit; }
@@ -266,6 +277,7 @@
 </head>
 <body>
 <div id="map" class="theme-standard"></div>
+<div id="maploading" aria-hidden="true"></div>
 <div id="layers" class="glass" role="group" aria-label="Map style" data-i18n-aria="layers-a11y">
   <button type="button" data-layer="standard" aria-pressed="true" title="Light vector map with local place names (OpenFreeMap)" data-i18n="layer-standard" data-i18n-title="layer-standard-tip">Standard</button>
   <button type="button" data-layer="satellite" aria-pressed="false" title="Aerial imagery (Esri) with vector roads and labels" data-i18n="layer-satellite" data-i18n-title="layer-satellite-tip">Satellite</button>
@@ -401,25 +413,63 @@
   // dává vzdálené polovině okna dlaždice o 3–4 úrovně hrubší = „půlka ostrá, půlka rozmazaná“.
   // 6 drží vzdálené dlaždice ostřejší za cenu pár dlaždic navíc (jen při náklonu).
   var TILE_LOD_ZOOM_LEVELS = 6, TILE_LOD_RATIO = 3;
-  // ── Gate 2: frame pacing cap ────────────────────────────────────────────────
-  // WebView2 paces requestAnimationFrame at the panel's rate (119.5 fps measured on 120 Hz).
-  // On battery the app asks for 60 fps: callbacks then run on every other vsync – an even
-  // 16.7 ms cadence, never a mix of 8 and 25 ms. MapLibre looks requestAnimationFrame up at
-  // call time, so wrapping window.requestAnimationFrame paces the whole map.
-  var rafDiv = 1, rafQueue = [], rafSeq = 0, rafPumpId = 0, rafVsync = 0;
+  // ── Frame pacing (Gate 2, reworked after eval/bench_map_input.py) ──────────────
+  // WebView2 paces requestAnimationFrame at the panel's rate. MapLibre looks
+  // requestAnimationFrame up at call time, so wrapping it paces the whole map.
+  //  * The vsync interval is MEASURED live (fastest recent native callbacks), never taken from
+  //    the refresh rate at start-up: a laptop started on mains at 120 Hz that is unplugged drops
+  //    its panel to 60 Hz, and the old fixed divisor (120 / cap 60 = every 2nd vsync) then
+  //    halved a 60 Hz panel to 30 fps.
+  //  * Pacing is time-based: callbacks run on the first vsync at least (target - vsync/2) after
+  //    the previous run – an even cadence at any panel rate – and the first frame after a pause
+  //    (a gesture starting) runs on the very next vsync, never waiting for a slot.
+  //  * Locked cadence under CPU pressure: when MapLibre can't finish frames within the vsync
+  //    (throttled / power-saving CPU), Chromium alternates 8 / 17 / 25 ms frames – judder.
+  //    The governor then steps down to an even divisor of the panel rate (120 -> 60 -> 40 -> 30)
+  //    and steps back up after calm gestures. Input is never dropped: MapLibre accumulates
+  //    pointer deltas between frames and applies them on the next one.
+  var rafQueue = [], rafSeq = 0, rafPumpId = 0;
   var nativeRAF = window.requestAnimationFrame.bind(window), nativeCAF = window.cancelAnimationFrame.bind(window);
+  var VSYNC_RING = 24, PACE_MAX_MS = 34, PACE_MISS = 0.3, PACE_ESCALATE_MS = 400;
+  var vs = { ring: [], ms: 0, last: 0, work: 0 };
+  var pace = { k: 1, capMs: 0, lastRun: 0, lastRender: 0, miss: 0, overSince: 0, worst: 0, calm: 0, calmNeed: 2,
+               moving: false };
+  function vsyncMs() { return vs.ms || 1000 / Math.max(30, PERF.refresh_hz || 60); }
+  function noteVsync(t) {
+    // Only an interval that followed a LIGHT callback (< 2 ms of work) measures the panel: after a
+    // long MapLibre frame the next callback is late by the frame itself (measured: 4x slower CPU
+    // in the 3D view read "25 ms vsync" and the pacer slowed itself to 50 ms).
+    var d = vs.last ? t - vs.last : 0, light = vs.work < 2;
+    vs.last = t;
+    if (!light || d < 4 || d > 50) return;
+    vs.ring.push(d);
+    if (vs.ring.length > VSYNC_RING) vs.ring.shift();
+    if (vs.ring.length >= 6) {                          // 20th percentile: busy frames only make it longer
+      var s = vs.ring.slice().sort(function (a, b) { return a - b; });
+      var v = s[Math.floor(s.length * 0.2)];
+      vs.ms = v > 5.5 && v < 7.5 ? 1000 / 144 : v > 7.5 && v < 9.6 ? 1000 / 120 : v > 15 && v < 18.5 ? 1000 / 60 : v;
+    }
+  }
+  function paceMs() { return Math.max(pace.capMs, vsyncMs() * pace.k); }
+  function paceDiv() { return Math.max(1, Math.round(paceMs() / vsyncMs())); }
   function rafPump(t) {
     rafPumpId = 0;
-    rafVsync++;
-    if (rafDiv > 1 && rafVsync % rafDiv) { rafPumpId = nativeRAF(rafPump); return; }
-    var q = rafQueue;
+    noteVsync(t);
+    var target = paceMs(), v = vsyncMs();
+    if (target > v * 1.25 && pace.lastRun && t - pace.lastRun < target - v * 0.5 && t - pace.lastRun < target * 2) {
+      vs.work = 0;
+      rafPumpId = nativeRAF(rafPump);
+      return;
+    }
+    pace.lastRun = t;
+    var q = rafQueue, a = performance.now();
     rafQueue = [];
     for (var i = 0; i < q.length; i++) {
       try { q[i].cb(t); } catch (e) { setTimeout(function () { throw e; }, 0); }
     }
+    vs.work = performance.now() - a;
   }
   window.requestAnimationFrame = function (cb) {
-    if (rafDiv === 1 && !rafQueue.length) return nativeRAF(cb);
     var id = -(++rafSeq);
     rafQueue.push({ id: id, cb: cb });
     if (!rafPumpId) rafPumpId = nativeRAF(rafPump);
@@ -429,15 +479,73 @@
     if (id < 0) { rafQueue = rafQueue.filter(function (x) { return x.id !== id; }); return; }
     nativeCAF(id);
   };
+  // Stepping back UP (2026-11-04, real input at 2x slower CPU): the old rule needed the single
+  // worst frame of a whole gesture under 55 % of the faster cadence, for 2-8 gestures in a row.
+  // One tile-upload spike per gesture blocked it for good, so a flat pan costing 9.7 ms ran at
+  // 40 fps (k=3) on a 120 Hz panel, with 25 ms between frames. Now the decision uses the 90th
+  // percentile of recent frame costs, and it can step up mid-gesture too (sustained headroom,
+  // hysteresis against the escalation rule, a longer wait after each re-escalation).
+  var PACE_RING = 40, PACE_UP_SHARE = 0.65, PACE_UP_HOLD_MS = 700;
+  function paceP90() {
+    var r = pace.costs;
+    if (!r || r.length < 12) return Infinity;
+    var s = r.slice().sort(function (a, b) { return a - b; });
+    return s[Math.floor(s.length * 0.9)];
+  }
+  function paceTick(now, cost) {                        // from 'render' while the camera moves
+    var dt = pace.lastRender ? now - pace.lastRender : 0;
+    pace.lastRender = now;
+    if (!pace.moving) { pace.moving = true; pace.miss = 0; pace.overSince = 0; pace.worst = 0; return; }
+    if (!dt || dt > 250) return;
+    var target = paceMs(), v = vsyncMs();
+    pace.miss = pace.miss * 0.9 + (dt > target + v * 0.5 ? 0.1 : 0);
+    pace.worst = Math.max(pace.worst, cost || 0);
+    if (!pace.costs) pace.costs = [];
+    if (cost > 0) { pace.costs.push(cost); if (pace.costs.length > PACE_RING) pace.costs.shift(); }
+    if (pace.miss > PACE_MISS && v * (pace.k + 1) <= PACE_MAX_MS) {
+      if (!pace.overSince) pace.overSince = now;
+      if (now - pace.overSince > PACE_ESCALATE_MS) {
+        pace.k++;
+        pace.miss = 0;
+        pace.overSince = 0;
+        pace.calm = 0;
+        pace.calmNeed = Math.min(8, pace.calmNeed * 2);
+        pace.changedAt = now;
+        pace.costs = [];
+      }
+    } else {
+      pace.overSince = 0;
+      if (pace.k > 1 && now - (pace.changedAt || 0) > PACE_UP_HOLD_MS * pace.calmNeed / 2 &&
+          paceP90() < PACE_UP_SHARE * v * (pace.k - 1)) {
+        pace.k--;
+        pace.changedAt = now;
+        pace.miss = 0;
+        pace.costs = [];
+      }
+    }
+  }
+  function paceSettle() {                               // camera at rest: may step back up
+    if (!pace.moving) return;
+    pace.moving = false;
+    pace.lastRender = 0;
+    if (pace.k > 1 && paceP90() < 0.55 * vsyncMs() * (pace.k - 1)) {
+      pace.k--;
+      pace.calmNeed = Math.max(2, pace.calmNeed / 2);
+    }
+    pace.costs = [];
+  }
   var fpsCap = 0;
-  window.setFrameCap = function (fps) {                 // main.py: 60 on battery, 0 = panel rate
+  window.setFrameCap = function (fps) {                 // main.py: 60 in Battery Saver, 0 = panel rate
     fpsCap = Math.max(0, +fps || 0);
-    var hz = PERF.refresh_hz || 60;
-    rafDiv = fpsCap && hz / fpsCap >= 1.8 ? Math.round(hz / fpsCap) : 1;
-    calibrateCadence();
-    return rafDiv;
+    pace.capMs = fpsCap ? 1000 / fpsCap - 0.5 : 0;      // -0.5: a 60 cap on a 59.9 Hz panel is no cap
+    return paceDiv();
   };
-  window.getFrameCap = function () { return { fps: fpsCap, div: rafDiv }; };
+  window.getFrameCap = function () {
+    return { fps: fpsCap, div: paceDiv(), k: pace.k, vsync: +vsyncMs().toFixed(2), pace: +paceMs().toFixed(2) };
+  };
+  window.__clustersForBench = function () { return clusters; };
+  window.setMapPixelRatio = function (r) { setRatio(r); return map ? map.getPixelRatio() : 0; };   // bench / tests
+  window.resetPace = function () { pace.k = 1; pace.calm = 0; pace.calmNeed = 2; return paceDiv(); };
 
   var bridge = null;
   var map = null;                     // maplibregl.Map, vzniká až na viditelné stránce
@@ -656,7 +764,13 @@
                        'hillshade-accent-color': '#39415A', 'hillshade-illumination-anchor': 'viewport',
                        'hillshade-illumination-direction': 335 };
   function addHillshade(style) {
-    style.sources['dem-shade'] = { type: 'raster-dem', tiles: [DEM_TILES], tileSize: 256, maxzoom: DEM_MAX_ZOOM,
+    // tileSize 512 = the 3D terrain's own tile grid (2026-11-04). At 256 the relief came one zoom
+    // level deeper: ~51 small tiles instead of ~14, and the set of them under a terrain tile
+    // changed on almost every frame of a pan as edge tiles entered the view. Each change re-drew
+    // that terrain tile's whole layer stack into its RTT texture: 288 re-draws in one 3 s pan,
+    // all from 'dem-shade' (openmaptiles, at 512, caused none). Terrarium data over Europe is
+    // ~25-30 m (native ~z12), so z13 relief added no real detail.
+    style.sources['dem-shade'] = { type: 'raster-dem', tiles: [DEM_TILES], tileSize: 512, maxzoom: DEM_MAX_ZOOM,
                                    encoding: 'terrarium' };
     style.sources['dem-film'] = { type: 'raster-dem', tiles: [DEM_TILES], tileSize: 256, maxzoom: DEM_FILM_MAX_ZOOM,
                                   encoding: 'terrarium' };
@@ -683,7 +797,8 @@
   // Mimo film mizí od z10 (pobřeží z9 by v detailu prosvítalo), ve filmu drží ve všech zoomech.
   var UNDERLAY_MAX_ZOOM = 9, UNDERLAY_OPACITY = 0.55;
   var UNDERLAY_TILES = ESRI + 'Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}';
-  var UNDERLAY_REST = ['interpolate', ['linear'], ['zoom'], 10, UNDERLAY_OPACITY, 12.5, 0];
+  var UNDERLAY_REST_MAX_ZOOM = 12.5;
+  var UNDERLAY_REST = ['interpolate', ['linear'], ['zoom'], 10, UNDERLAY_OPACITY, UNDERLAY_REST_MAX_ZOOM, 0];
   function addUnderlay(style) {
     if (PERF.map_underlay === false) return;
     // tileSize 512 u 256px obrázků: 4× méně dlaždic na obrazovce (kreslení i dekódování),
@@ -692,11 +807,15 @@
                                attribution: 'Basemap &copy; Esri, HERE, Garmin, ' + OSM };
     var at = style.layers.findIndex(function (l) { return l.type !== 'background' && l.type !== 'raster'; });
     style.layers.splice(at < 0 ? style.layers.length : at, 0, {
-      id: 'underlay', type: 'raster', source: 'underlay',
+      // invisible above z12.5 (UNDERLAY_REST): maxzoom stops its tile covering and its draw into
+      // every terrain texture there; the film lifts it (underlayFilm)
+      id: 'underlay', type: 'raster', source: 'underlay', maxzoom: UNDERLAY_REST_MAX_ZOOM,
       paint: { 'raster-opacity': UNDERLAY_REST, 'raster-fade-duration': 0, 'raster-resampling': 'linear' } });
   }
   function underlayFilm(on) {         // konstantní paint = bez přenačtení zdroje
-    if (map && map.getLayer('underlay')) map.setPaintProperty('underlay', 'raster-opacity', on ? UNDERLAY_OPACITY : UNDERLAY_REST);
+    if (!map || !map.getLayer('underlay')) return;
+    map.setPaintProperty('underlay', 'raster-opacity', on ? UNDERLAY_OPACITY : UNDERLAY_REST);
+    map.setLayerZoomRange('underlay', 0, on ? 24 : UNDERLAY_REST_MAX_ZOOM);
   }
 
   // ── Zeměkoule, atmosféra, světlo ────────────────────────────────────────────
@@ -924,6 +1043,7 @@
     window.map = map;
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
     installOrbitGestures();
+    installGlobeAroundGuard();
     map.on('terrain', guardTerrainRtt);
     map.on('rotatestart', function () { warmOrbitRing(); });
     map.on('pitchstart', function () { warmOrbitRing(); });
@@ -934,6 +1054,7 @@
       if (!map.hasImage(e.id)) map.addImage(e.id, BLANK_ICON);
     });
     map.on('style.load', onStyleLoad);
+    map.once('load', function () { clearTimeout(loadingTimer); document.getElementById('maploading').classList.remove('on'); });
     // Režisér Cesty volá jumpTo za snímek a jumpTo synchronně vysílá zoomend / moveend – bez téhle
     // pojistky se za KAŽDÝ snímek Cesty přepočítávaly shluky pinů a terén (piny jsou přitom skryté)
     map.on('zoomend', function () { if (director.directing) return; syncTerrain(); render(); });
@@ -962,11 +1083,13 @@
         meterTick(mapMeter, now);
         adaptResolution(now);
         motionDetailTick(now);
+        paceTick(now, md.lastCost || md.cost);
       }
     });
-    map.on('mousemove', 'pins', onPinMove);
-    map.on('mouseleave', 'pins', function () { setPinHover(null); });
-    map.on('click', 'pins', onPinClick);
+    installPinHover();
+    quietMapMouseEvents();
+    installWheelNotch();
+    map.on('click', onPinClick);
     var tint = document.createElement('div');
     tint.id = 'tint';
     map.getCanvasContainer().insertBefore(tint, map.getCanvasContainer().firstChild.nextSibling);
@@ -1130,6 +1253,7 @@
   function cameraRested() {
     setInteraction('map', false);       // vždy: pohyb začatý před Cestou jinak držel governor navždy
     descent.on = false;
+    paceSettle();
     if (director.directing) return;     // kamera Cesty jede po trase (jumpTo za snímek)
     terrainHold = false; syncTerrain(); render();
     restResolution();
@@ -1213,6 +1337,32 @@
   // vertical-perspective MapLibre nepodporuje – za každý snímek hlásil „calculateFogMatrix is not
   // supported on globe projection“ a „terrain is not fully supported on vertical perspective“.
   var terrainHold = false;            // dlouhý přelet: terén až v cíli (moveend)
+  // ── Globe: no easing "around" a point ──
+  // MapLibre's double-click zoom and its zoom / rotate inertia call easeTo({around}). Under globe
+  // projection that is unsupported: it logs "Easing around a point is not supported under globe
+  // projection" and pins the location every frame instead. On the globe the anchor becomes a
+  // plain center target: the anchor point keeps its share of the view as the zoom changes,
+  // center = anchor + (center - anchor) * 2^-dz (exact in Mercator, close on the globe).
+  function globeEaseOptions(opts, zoomNow, centerNow) {
+    if (!opts || !opts.around) return opts;
+    var o = Object.assign({}, opts), a = maplibregl.LngLat.convert(opts.around);
+    delete o.around;
+    delete o.aroundPoint;
+    if (o.center === undefined && typeof o.zoom === 'number') {
+      var f = Math.pow(2, -(o.zoom - zoomNow)), dl = centerNow.lng - a.lng;
+      if (dl > 180) dl -= 360; else if (dl < -180) dl += 360;
+      o.center = [a.lng + dl * f, Math.max(-85, Math.min(85, a.lat + (centerNow.lat - a.lat) * f))];
+    }
+    return o;
+  }
+  window.globeEaseOptions = globeEaseOptions;          // tests
+  function installGlobeAroundGuard() {
+    var ease = map.easeTo;
+    map.easeTo = function (opts, data) {
+      if (opts && opts.around && globeRendering()) opts = globeEaseOptions(opts, this.getZoom(), this.getCenter());
+      return ease.call(this, opts, data);
+    };
+  }
   function globeRendering() {
     try { return !!(map && map.transform && map.transform.isGlobeRendering); } catch (e) { return false; }
   }
@@ -1301,26 +1451,29 @@
     if (!map || Math.abs(r - (res.ratio || map.getPixelRatio())) < 0.01) return;
     res.ratio = r;
     res.changedAt = performance.now();
-    try { map.setPixelRatio(r); } catch (e) { /* starší MapLibre */ }
+    applyPixelRatio(r);
   }
-  // Skutečná kadence snímků stránky: QtWebEngine řídí requestAnimationFrame 60 Hz i na 120Hz
-  // displeji (změřeno: 16,7 ms) – rozpočet podle displeje by každý snímek označil za pomalý
-  // a rozlišení mapy zbytečně snížil. Rozpočet = delší z obou.
-  var rafCadenceMs = 0;
-  function calibrateCadence() {
-    var t = [], last = 0;
-    function f(now) {
-      if (last) t.push(now - last);
-      last = now;
-      if (t.length < 40) { requestAnimationFrame(f); return; }
-      t.sort(function (a, b) { return a - b; });
-      rafCadenceMs = t[Math.floor(t.length / 2)];
-    }
-    requestAnimationFrame(f);
+  // map.setPixelRatio() -> map.resize() calls map.stop() whenever no camera ANIMATION runs – and a
+  // drag is not one: every handler is reset and the map stops following a mouse button that is
+  // still held (measured with real input: the drag died on the frame of the ratio change, the
+  // rest of the gesture moved nothing). Resize the canvas without stopping the gesture.
+  function applyPixelRatio(r) {
+    try {
+      if (typeof map._resizeInternal === 'function') {
+        map._overridePixelRatio = r;
+        map._resizeInternal(true);
+        map.fire('resize');
+        map.triggerRepaint();
+      } else {
+        map.setPixelRatio(r);
+      }
+    } catch (e) { /* starší MapLibre */ }
   }
-  calibrateCadence();
-  window.getFrameCadence = function () { return rafCadenceMs; };
-  function frameBudgetMs() { return Math.max(1000 / Math.max(30, PERF.refresh_hz || 60), rafCadenceMs || 0); }
+  // Rozpočet snímku = skutečná (živě měřená) kadence requestAnimationFrame × krok tempa:
+  // QtWebEngine řídí rAF 60 Hz i na 120Hz displeji, panel na baterii spadne na 60 Hz,
+  // a governor tempa (paceTick) při slabém CPU drží sudý dělitel – vše se tu promítne samo.
+  window.getFrameCadence = function () { return vsyncMs(); };
+  function frameBudgetMs() { return paceMs(); }
   function adaptResolution(now) {     // volá se z 'render' během pohybu kamery
     // Film: rozlišení se mění jen během okamžiku zastávky (kamera skoro stojí) – realokace plátna
     // uprostřed přeletu byla vidět jako škubnutí a skok ostrosti
@@ -1336,7 +1489,8 @@
     if (res.ema > budget * RES_SLOW) {
       res.fastSince = 0;
       if (!res.slowSince) res.slowSince = now;
-      if (now - res.slowSince > 350 && now - res.changedAt > RES_HOLD_MS && cur > minRatio() + 0.01) setRatio(cur - RES_STEP);
+      // fewer pixels only help a GPU-bound frame; a CPU-bound one just pays the canvas realloc
+      if (now - res.slowSince > 350 && now - res.changedAt > RES_HOLD_MS && cur > minRatio() + 0.01 && gpuBound()) setRatio(cur - RES_STEP);
     } else if (res.ema < budget * RES_FAST) {
       res.slowSince = 0;
       if (!res.fastSince) res.fastSince = now;
@@ -1347,7 +1501,7 @@
     clearTimeout(res.restTimer);
     res.restTimer = setTimeout(function () {
       res.lastFrame = 0; res.ema = 0; res.slowSince = res.fastSince = 0;
-      if (map && !map.isMoving() && !director.directing && !orbitActive()) setRatio(maxRatio());
+      if (map && !map.isMoving() && !director.directing && !orbitActive() && !md.ratioShed) setRatio(maxRatio());
     }, RES_REST_MS);
   }
   // ── Gate 2: adaptive detail while moving (LOD) ─────────────────────────────────
@@ -1366,9 +1520,15 @@
   var MD_DROP = 0.1;                                    // share of frames over 1.5x budget (EMA)
   var MD_MESH = [128, 64, 32];
   var md = { level: 0, learned: -1, cost: 0, drops: 0, last: 0, overSince: 0, worst: 0, calm: 0,
-             calmNeed: MD_CALM_RUNS, settleTimer: 0, fadeTimer: 0, relief: {}, ratioShed: false,
+             calmNeed: MD_CALM_RUNS, settleTimer: 0, fadeTimer: 0, relief: {}, ratioShed: false, ratioTimer: 0,
              moving: false, levelTime: [0, 0, 0], levelSince: 0, hooked: false };
+  var RATIO_REST_MS = 1500, GPU_BOUND_SHARE = 0.45;
   function highRefresh() { return frameBudgetMs() < 11; }
+  // MapLibre's JS render time well under the frame budget while frames still run late = the GPU
+  // (fill rate) is the limit, and fewer pixels help. A CPU-bound frame doesn't get faster.
+  function gpuBound() { return md.cost < GPU_BOUND_SHARE * frameBudgetMs(); }
+  // MapLibre's JS alone takes most of a vsync, or the pacer already had to step down
+  function cpuPressed() { return pace.k > 1 || md.cost > 0.6 * vsyncMs(); }
   function detailFloor() {
     if (md.learned < 0) md.learned = highRefresh() ? 1 : 0;     // first motion: proactive at 120 Hz
     return Math.min(MD_MAX, md.learned);
@@ -1379,6 +1539,7 @@
     map._render = function (t) {
       var a = performance.now(), r = orig.call(this, t), c = performance.now() - a;
       md.cost = md.cost ? md.cost * 0.8 + c * 0.2 : c;
+      md.lastCost = c;
       return r;
     };
     md.hooked = true;
@@ -1386,11 +1547,26 @@
   function reliefIds() { return ['relief', 'relief-film'].filter(function (id) { return map.getLayer(id); }); }
   function shedRelief(on) {
     clearTimeout(md.fadeTimer);
+    // With 3D terrain the relief is baked into the cached RTT textures and costs nothing per
+    // frame. Hiding it (and showing it again at rest) wiped the whole RTT cache twice per gesture
+    // and reloaded 'dem-shade': the first frame of every drag re-drew every tile's layer stack
+    // (real input, 4x slower CPU: 21 full wipes in one pan). It is shed only on the flat map.
+    if (on && map.getTerrain()) return;
     reliefIds().forEach(function (id) {
       try {
         if (on) {
           if (md.relief[id] || map.getLayoutProperty(id, 'visibility') === 'none') return;
           md.relief[id] = { ex: map.getPaintProperty(id, 'hillshade-exaggeration') };
+          if (cpuPressed()) {
+            // CPU-bound: a fade is a paint transition = full style re-evaluation on every frame
+            // of it. Measured at z12 + terrain, 4x slower CPU: fade-shedding frame interval p95
+            // 64-85 ms, relief hidden at once 45 ms. Gone at once now, faded back in at rest.
+            map.setPaintProperty(id, 'hillshade-exaggeration-transition', { duration: 0, delay: 0 });
+            map.setPaintProperty(id, 'hillshade-exaggeration', 0);
+            map.setLayoutProperty(id, 'visibility', 'none');
+            md.relief[id].hidden = true;
+            return;
+          }
           map.setPaintProperty(id, 'hillshade-exaggeration-transition', { duration: MD_FADE_MS, delay: 0 });
           map.setPaintProperty(id, 'hillshade-exaggeration', 0);
         } else if (md.relief[id]) {
@@ -1405,7 +1581,7 @@
     if (on) {                                           // faded out -> stop drawing it at all
       md.fadeTimer = setTimeout(function () {
         Object.keys(md.relief).forEach(function (id) {
-          if (md.level >= 1 && map.getLayer(id)) {
+          if (md.level >= 1 && map.getLayer(id) && !md.relief[id].hidden) {
             try { map.setLayoutProperty(id, 'visibility', 'none'); md.relief[id].hidden = true; } catch (e) { /* styl */ }
           }
         });
@@ -1433,11 +1609,231 @@
     }
     return false;
   }
+  // ── RTT cache, part 2 (2026-11-04, A/B harness: 4x slower CPU, z12 at 50 deg, pan) ──
+  // Frame cost was 75-85 ms, and 205 of its ~295 draws per frame went into RTT textures: almost
+  // every terrain tile was re-drawn on every frame. Instrumented, there were two causes:
+  //  1. RenderPool cascade (MapLibre 5.24). getOrCreateFreeObject() hands out the least recently
+  //     used FREE object before it creates a new one. During a frame, the tiles that come later
+  //     in the loop are still "free" (freeAllObjects ran at the end of the previous frame). So
+  //     one invalidated tile overwrote the cached texture of a later tile, which overwrote the
+  //     next one, all the way down the list. 977 steals in 200 frames, and the pool never grew
+  //     past the tile count. Fix: a free object no tile references comes first, then a new
+  //     object (up to the pool size), and only then a steal.
+  //  2. Every 'style' data event calls freeRtt() for ALL tiles. Pin cross-fades and the spring
+  //     set icon-opacity on every frame of an animation (45 full wipes in one pan), and a
+  //     symbol-only change never touches an RTT texture. Fix: the style change is classified
+  //     in Style.update(). If only non-RTT layers changed, no source was reloaded, no image was
+  //     used by an RTT pattern, and the RTT stack partition is unchanged, the wipe is dropped.
+  function rttStackSig(st, z) {       // RTT layer runs as MapLibre stacks them (render_to_texture.ts)
+    var out = '', prev = false;
+    for (var i = 0; i < st._order.length; i++) {
+      var l = st._layers[st._order[i]];
+      if (!l || l.isHidden(z)) continue;
+      var r = !!RTT_LAYER_TYPES[l.type];
+      if (r) out += l.id + ',';
+      else if (prev) out += '|';
+      prev = r;
+    }
+    return out;
+  }
+  // Image names an RTT layer can draw (every string in its *-pattern value, constant or
+  // expression); null = a pattern whose names can't be listed (then any image change counts)
+  var RTT_PATTERN_PROPS = { fill: 'fill-pattern', line: 'line-pattern', background: 'background-pattern' };
+  function rttPatternNames(st) {
+    var names = {};
+    function walk(v) {
+      if (typeof v === 'string') names[v] = 1;
+      else if (Array.isArray(v)) v.forEach(walk);
+      else if (v && typeof v === 'object') return false;
+      return true;
+    }
+    for (var id in st._layers) {
+      var l = st._layers[id], prop = RTT_PATTERN_PROPS[l.type];
+      if (!prop || typeof l.getPaintProperty !== 'function') continue;     // raster/hillshade: none
+      var v = l.getPaintProperty(prop);
+      if (v !== undefined && walk(v) === false) return null;
+    }
+    return names;
+  }
+  function imagesTouchRtt(st) {
+    var changed = Object.keys(st._changedImages || {});
+    if (!changed.length) return false;
+    var names = rttPatternNames(st);
+    if (!names) return true;
+    for (var i = 0; i < changed.length; i++) if (names[changed[i]]) return true;
+    return false;                     // e.g. a new pin photo: only the pins' icon atlas changes
+  }
+  function styleChangeSkipsRtt(st, z) {
+    // the stack signature is refreshed on EVERY classified change, also an unsafe one (else the
+    // next harmless change would see a stale signature and wipe again)
+    var sig = rttStackSig(st, z), sameStacks = sig === rttGuard.sig;
+    rttGuard.sig = sig;
+    if (!sameStacks) return false;
+    if (Object.keys(st._removedLayers || {}).length || st._glyphsDidChange) return false;
+    // a data-driven paint change reloads its source (pins: ['case', ['get', 'stay'], ...]) – harmless
+    // unless that source draws into the terrain textures
+    var srcs = Object.keys(st._updatedSources || {});
+    for (var s = 0; s < srcs.length; s++) if (sourceDrawsIntoTerrain(srcs[s])) return false;
+    var ids = Object.keys(st._updatedLayers || {}).concat(Object.keys(st._updatedPaintProps || {}));
+    for (var i = 0; i < ids.length; i++) {
+      var l = st._layers[ids[i]];
+      if (!l || RTT_LAYER_TYPES[l.type]) return false;
+    }
+    return !imagesTouchRtt(st);
+  }
+  function wrapStyleUpdate() {
+    var st = map.style;
+    if (!st || st.__kairosUpd || typeof st.update !== 'function' || !st._order) return;
+    var upd = st.update;
+    st.update = function (params) {
+      rttGuard.styleSafe = false;
+      if (this._changed && map.terrain) {
+        try { rttGuard.styleSafe = styleChangeSkipsRtt(this, params.zoom); } catch (e) { rttGuard.styleSafe = false; }
+      }
+      try { return upd.apply(this, arguments); } finally { rttGuard.styleSafe = false; }
+    };
+    // addImage/removeImage fire their own 'style' event right away (Style._afterImageUpdated),
+    // before update(): a new pin photo wiped every terrain texture on each re-cluster
+    var aiu = st._afterImageUpdated;
+    if (typeof aiu === 'function') {
+      st._afterImageUpdated = function (imageId) {
+        var safe = false;
+        if (map.terrain) { try { var names = rttPatternNames(this); safe = !!names && !names[imageId]; } catch (e) { safe = false; } }
+        rttGuard.styleSafe = safe;
+        try { return aiu.apply(this, arguments); } finally { rttGuard.styleSafe = false; }
+      };
+    }
+    st.__kairosUpd = true;
+    try { rttGuard.sig = rttStackSig(st, map.getZoom()); } catch (e) { rttGuard.sig = ''; }
+  }
+  function patchRttPool() {
+    var rt = map.painter && map.painter.renderToTexture, pool = rt && rt.pool, tm = map.terrain && map.terrain.tileManager;
+    if (!pool || !tm || pool.__kairos || typeof pool._createObject !== 'function' || !pool._objects) return;
+    pool.getOrCreateFreeObject = function () {
+      rttGuard.draws++;                                   // = one tile's layer stack re-drawn
+      var objs = this._objects, live = {}, order = this._recentlyUsed, steal = null, k, r, i;
+      for (k in tm._tiles) {
+        r = tm._tiles[k].rtt || [];
+        for (i = 0; i < r.length; i++) if (r[i] && objs[r[i].id] && objs[r[i].id].stamp === r[i].stamp) live[r[i].id] = 1;
+      }
+      for (i = 0; i < order.length; i++) {
+        var o = objs[order[i]];
+        if (o.inUse) continue;
+        if (!live[o.id]) return o;                        // orphan (its tile left the view)
+        if (!steal) steal = o;
+      }
+      if (objs.length < this._size) { var n = this._createObject(objs.length); objs.push(n); return n; }
+      if (steal) { rttGuard.steals++; return steal; }
+      throw new Error('No free RenderPool available, call freeAllObjects() required!');
+    };
+    pool.__kairos = true;
+  }
+  //  3. Edge churn. A terrain tile's fingerprint is the list of source tiles IN VIEW over it. At
+  //     the screen edge, and under the far, coarser terrain tiles of a tilted view, source tiles
+  //     drop out of and come back into view on almost every frame. Each change re-drew the
+  //     tile's whole layer stack (107 re-draws in a 3 s pan after fix 1). If the new list is a
+  //     subset of the one the texture was drawn with (same revision), the texture already holds
+  //     everything that is visible, so it is kept. Any added tile (one entering the view, or
+  //     children replacing a parent) still re-draws, exactly as before.
+  function fpSubset(now, drawn) {
+    if (!drawn || !now) return false;
+    var a = now.split('#'), b = drawn.split('#');
+    if (a[1] !== b[1]) return false;
+    var have = {}, i, bk = b[0] ? b[0].split(',') : [], ak = a[0] ? a[0].split(',') : [];
+    for (i = 0; i < bk.length; i++) have[bk[i]] = 1;
+    for (i = 0; i < ak.length; i++) if (!have[ak[i]]) return false;
+    return true;
+  }
+  //  4. RenderToTexture.prepareForRender (port of MapLibre 5.24.0, render_to_texture.ts) built the
+  //     source-tile -> terrain-tile map (a mat4 per pair) for EVERY source on every frame. That
+  //     includes pins, pins-out, the terrain DEM and the hidden film relief, none of which draws
+  //     into a texture: 21 % of a static 3D frame. Only sources with a visible RTT layer are
+  //     mapped now, and the subset rule (3) is applied inline. Other MapLibre versions keep the
+  //     original method, with (3) wrapped around it.
+  function prepareRtt(rt, tm, style, zoom) {
+    rttGuard.frames++;
+    rt._stacks = [];
+    rt._prevType = null;
+    rt._rttTiles = [];
+    rt._renderableTiles = tm.getRenderableTiles();
+    var order = style._order, ids = [], need = {}, i, id, l;
+    for (i = 0; i < order.length; i++) {
+      l = style._layers[order[i]];
+      if (l.isHidden(zoom)) continue;
+      ids.push(order[i]);
+      if (RTT_LAYER_TYPES[l.type] && l.source) need[l.source] = 1;
+    }
+    rt._renderableLayerIds = ids;
+    var coords = rt._coordsAscending = {};
+    for (id in style.tileManagers) {
+      coords[id] = {};
+      if (!need[id]) continue;
+      var mgr = style.tileManagers[id], src = mgr.getSource(), ranges = src && src.terrainTileRanges ? src.terrainTileRanges : null;
+      var vis = mgr.getVisibleCoordinates();
+      for (i = 0; i < vis.length; i++) {
+        var keys = tm.getTerrainCoords(vis[i], ranges);
+        for (var key in keys) (coords[id][key] || (coords[id][key] = [])).push(keys[key]);
+      }
+    }
+    var fps = rt._rttFingerprints = {};
+    for (i = 0; i < order.length; i++) {
+      l = style._layers[order[i]];
+      var s = l.source;
+      if (!RTT_LAYER_TYPES[l.type] || fps[s]) continue;
+      fps[s] = {};
+      var mgr2 = style.tileManagers[s], rev = mgr2 && mgr2.getState() ? mgr2.getState().revision || 0 : 0;
+      for (var k in coords[s]) fps[s][k] = coords[s][k].map(function (c) { return c.key; }).sort().join() + '#' + rev;
+    }
+    var tiles = rt._renderableTiles;
+    for (i = 0; i < tiles.length; i++) {
+      var t = tiles[i];
+      if (!t.rtt.length) continue;
+      for (var sid in fps) {
+        var f = fps[sid][t.tileID.key], drawn = t.rttFingerprint[sid];
+        if (!f || f === drawn) continue;
+        if (fpSubset(f, drawn)) { rttGuard.fpKept++; continue; }
+        t.rtt = [];
+        break;
+      }
+    }
+  }
+  function patchRttFingerprints() {
+    var rt = map.painter && map.painter.renderToTexture, tm = map.terrain && map.terrain.tileManager;
+    if (!rt || !tm || rt.__kairosFp || typeof rt.prepareForRender !== 'function') return;
+    var prep = rt.prepareForRender;
+    if (typeof maplibregl.getVersion === 'function' && maplibregl.getVersion() === '5.24.0') {
+      rt.prepareForRender = function (style, zoom) { return prepareRtt(this, tm, style, zoom); };
+      rt.__kairosFp = true;
+      return;
+    }
+    rt.prepareForRender = function () {
+      var before = {}, k, t;
+      for (k in tm._tiles) { t = tm._tiles[k]; if (t.rtt && t.rtt.length) before[k] = t.rtt; }
+      var r = prep.apply(this, arguments), fps = this._rttFingerprints || {};
+      for (k in before) {
+        t = tm._tiles[k];
+        if (!t || (t.rtt && t.rtt.length)) continue;
+        var keep = true;
+        for (var s in fps) {
+          var f = fps[s][k];
+          if (f && f !== t.rttFingerprint[s] && !fpSubset(f, t.rttFingerprint[s])) { keep = false; break; }
+        }
+        if (keep) { t.rtt = before[k]; rttGuard.fpKept++; }
+      }
+      return r;
+    };
+    rt.__kairosFp = true;
+  }
   function guardTerrainRtt() {
     if (!map || !map.terrain || !map.style || window.ORBIT_TUNING_OFF) return;
+    try { patchRttPool(); patchRttFingerprints(); wrapStyleUpdate(); } catch (e) { /* jiná verze MapLibre: chování beze změny */ }
     var cb = map._terrainDataCallback;
     if (typeof cb !== 'function' || cb.__kairos) return;
     var guarded = function (e) {
+      if (e && e.dataType === 'style') {
+        if (rttGuard.styleSafe) { rttGuard.styleKept++; return; }
+        rttGuard.styleWipes++;
+      }
       if (e && e.dataType === 'source' && e.tile && e.sourceId) {
         var t = map.getTerrain();
         if (!t || e.sourceId !== t.source) {
@@ -1455,9 +1851,12 @@
       rttGuard.installs++;
     } catch (e) { /* styl se mění: příští 'terrain' to zkusí znovu */ }
   }
-  var rttGuard = { installs: 0, skipped: 0, passed: 0 };
+  var rttGuard = { installs: 0, skipped: 0, passed: 0, styleKept: 0, styleSafe: false, sig: '', steals: 0, fpKept: 0, styleWipes: 0, draws: 0, frames: 0 };
   window.getRttGuard = function () {
+    var pool = map && map.painter && map.painter.renderToTexture && map.painter.renderToTexture.pool;
     return { installs: rttGuard.installs, skipped: rttGuard.skipped, passed: rttGuard.passed,
+             styleKept: rttGuard.styleKept, steals: rttGuard.steals, fpKept: rttGuard.fpKept, styleWipes: rttGuard.styleWipes, draws: rttGuard.draws, frames: rttGuard.frames, pool: !!(pool && pool.__kairos),
+             poolObjects: pool && pool._objects ? pool._objects.length : 0,
              active: !!(map && map._terrainDataCallback && map._terrainDataCallback.__kairos) };
   };
   function setMesh(n) {
@@ -1477,11 +1876,20 @@
     try {
       if (PERF.map_hillshade !== false) shedRelief(level >= 1);
       setMesh(MD_MESH[level]);
-      var floor = level >= 2 && !journey.active;        // the film changes resolution only in dwells
-      if (floor !== md.ratioShed) {
-        md.ratioShed = floor;
-        if (floor) setRatio(minRatio());
-        else if (!map.isMoving() && !director.directing) setRatio(maxRatio());   // settled: full crispness
+      // Pixel-ratio floor: a canvas realloc costs a hitch (measured 9 ms at full CPU, 56-70 ms on
+      // a 4x slower one), so it happens only mid-motion when the GPU is the bottleneck, and the
+      // full ratio returns after RATIO_REST_MS of rest – quick successive gestures keep the floor
+      // instead of reallocating twice per gesture. The film changes resolution only in dwells.
+      if (level >= 2 && !journey.active && (md.ratioShed || gpuBound())) {
+        clearTimeout(md.ratioTimer);
+        if (!md.ratioShed) { md.ratioShed = true; setRatio(minRatio()); }
+      } else if (level < 2 && md.ratioShed) {
+        clearTimeout(md.ratioTimer);
+        md.ratioTimer = setTimeout(function () {
+          if (!map || map.isMoving() || director.directing || orbitActive() || md.level >= 2) return;
+          md.ratioShed = false;
+          setRatio(maxRatio());                         // settled: full crispness
+        }, RATIO_REST_MS);
       }
     } catch (e) { /* styl se právě mění – onStyleLoad začne od plného detailu */ }
     map.triggerRepaint();
@@ -1499,7 +1907,9 @@
     if (!moving) { if (md.moving) settleDetail(); return; }
     clearTimeout(md.settleTimer);
     if (!md.moving) { md.moving = true; md.worst = 0; md.overSince = 0; md.last = 0; md.drops = 0; }
-    if (md.level < detailFloor()) setDetail(detailFloor());
+    var floor = detailFloor();
+    if (floor >= 2 && !md.ratioShed) floor = 1;         // no canvas realloc on a gesture's first frame
+    if (md.level < floor) setDetail(floor);
     var budget = frameBudgetMs(), share = md.cost / budget;
     var dt = md.last ? now - md.last : 0;
     md.last = now;
@@ -1539,6 +1949,7 @@
   function resetDetailState() {                         // new style: layers came back at full detail
     clearTimeout(md.settleTimer);
     clearTimeout(md.fadeTimer);
+    clearTimeout(md.ratioTimer);
     md.level = 0; md.relief = {}; md.ratioShed = false; md.moving = false;
   }
   window.setDetailMax = function (n) {                 // bench / tests: cap the deepest level
@@ -1956,7 +2367,43 @@
     map.addLayer({ id: 'pins', type: 'symbol', source: 'pins',
                    layout: { 'icon-image': ['get', 'img'], 'icon-allow-overlap': true, 'icon-ignore-placement': true,
                              'icon-pitch-alignment': 'viewport', 'icon-rotation-alignment': 'viewport',
-                             'symbol-sort-key': ['get', 'count'], visibility: journey.active ? 'none' : 'visible' } });
+                             'symbol-sort-key': ['get', 'count'], visibility: journey.active ? 'none' : 'visible' },
+                   paint: { 'icon-opacity': PIN_OPACITY, 'icon-opacity-transition': { duration: 0, delay: 0 } } });
+    pinOps.ids = {};
+  }
+  // ── Pin fades without re-layout (2026-11-04) ──
+  // The cross-fade and the spring used to set a NEW data-driven icon-opacity expression
+  // (['case', ['get', 'stay'], ..., <k>]) on every frame. A data-driven paint change reloads the
+  // source: the worker re-laid out every pin, and the main thread re-uploaded the pins' icon
+  // atlas (photo thumbnails, with a CPU premultiply). That was ~15 % of renderer time in a 3D pan
+  // at 4x slower CPU, and each change also marked the style dirty. Now the expression is constant
+  // and the animation writes per-feature state: no reload and no style change. A pin without
+  // state shows at 1.
+  var PIN_OPACITY = ['case', ['==', ['get', 'stay'], 1], 1, ['coalesce', ['feature-state', 'op'], 1]];
+  var PIN_OUT_OPACITY = ['coalesce', ['feature-state', 'op'], 1];
+  var pinOps = { ids: {}, outIds: {} };
+  window.getPinOps = function () {           // tests: feature-state opacities now in force
+    var st = {};
+    Object.keys(pinOps.ids).forEach(function (id) { st[id] = map.getFeatureState({ source: 'pins', id: +id }).op; });
+    return { ids: Object.assign({}, pinOps.ids), state: st };
+  };
+  function setPinOps(src, store, valueOf, feats) {
+    if (!map || !map.getSource(src)) return;
+    for (var i = 0; i < feats.length; i++) {
+      var f = feats[i], v = valueOf(f);
+      if (v === null) continue;
+      v = Math.round(v * 1000) / 1000;
+      if (store[f.id] === v) continue;
+      store[f.id] = v;
+      try { map.setFeatureState({ source: src, id: f.id }, { op: v }); } catch (e) { /* zdroj se mění */ }
+    }
+  }
+  function clearPinOps(src, store) {
+    var ids = Object.keys(store);
+    for (var i = 0; i < ids.length; i++) {
+      try { if (map && map.getSource(src)) map.removeFeatureState({ source: src, id: +ids[i] }, 'op'); } catch (e) { /* zdroj se mění */ }
+    }
+    for (var k in store) delete store[k];
   }
   function setPinsVisible(on) {
     if (!map) return;
@@ -1968,15 +2415,88 @@
   }
 
   // Najetí a klik: shluk, jehož kruh je pod kurzorem (obrázek má okraj na stín a odznak)
-  function pinAt(e) {
-    var best = null, bestD = PIN_D / 2 + 3;
-    (e.features || []).forEach(function (f) {
-      var c = clusters[f.id];
-      if (!c) return;
-      var p = map.project([c.lon, c.lat]), d = Math.hypot(p.x - e.point.x, p.y - e.point.y);
-      if (d <= bestD) { best = f.id; bestD = d; }
-    });
+  // ── Input latency (eval/bench_map_input.py, real OS input) ──
+  // The pins used to be hit-tested with layer-delegated map.on('mousemove'/'mouseleave', 'pins'),
+  // i.e. queryRenderedFeatures on EVERY mouse move, drags included. With 3D terrain each query
+  // reads the terrain depth framebuffer back from the GPU (gl.readPixels = a full CPU<->GPU sync
+  // through Chromium's GPU process). Measured at z12 with terrain and a 4x slower CPU: readPixels
+  // was the largest single cost in the renderer (21 % of busy time), mousemove queries alone
+  // ~0.75 s per 3 s pan, and pointer events waited behind them (dispatch p95 111 ms).
+  // Pins are a handful of screen circles whose clusters we know: hit-test them in screen space
+  // (map.project reads elevation from the CPU-side DEM, no readback), at most once per frame,
+  // and never while a button is held or the camera moves.
+  function pinsHittable() {
+    if (!map || journey.active || !map.getLayer('pins')) return false;
+    return map.getLayoutProperty('pins', 'visibility') !== 'none';
+  }
+  function pinAtPoint(pt) {
+    if (!pinsHittable()) return null;
+    var best = null, bestD = PIN_D / 2 + 3, tr = map.transform;
+    for (var i = 0; i < clusters.length; i++) {
+      var c = clusters[i];
+      if (!c) continue;
+      var ll = [c.lon, c.lat];
+      try { if (tr && tr.isLocationOccluded && tr.isLocationOccluded(maplibregl.LngLat.convert(ll))) continue; } catch (e) { /* mercator */ }
+      var p = map.project(ll), d = Math.hypot(p.x - pt.x, p.y - pt.y);
+      if (d <= bestD) { best = i; bestD = d; }
+    }
     return best;
+  }
+  function pinAt(e) { return pinAtPoint(e.point); }
+  var hoverAt = null, hoverRaf = 0;
+  function installPinHover() {
+    var el = map.getCanvasContainer();
+    function busy(e) { return (e && e.buttons) || map.isMoving() || director.directing || orbitActive(); }
+    el.addEventListener('mousemove', function (e) {
+      if (busy(e)) { hoverAt = null; return; }
+      var r = el.getBoundingClientRect();
+      hoverAt = { x: e.clientX - r.left, y: e.clientY - r.top };
+      if (!hoverRaf) hoverRaf = requestAnimationFrame(function () {
+        hoverRaf = 0;
+        if (!hoverAt || busy(null)) return;
+        setPinHover(pinAtPoint(hoverAt));
+      });
+    }, { passive: true });
+    el.addEventListener('mouseleave', function () { hoverAt = null; if (hoverPin !== null) setPinHover(null); });
+  }
+  // MapLibre builds a MapMouseEvent for every mousemove/over/out and computes its lngLat eagerly:
+  // with terrain that is another readPixels per move (measured 0.46 s per 3 s pan at 4x), even
+  // when nothing listens. Moves are dispatched only when a 'mousemove'/'mouseover'/'mouseout'
+  // listener exists; clicks and presses are untouched (one readback per click is fine).
+  function quietMapMouseEvents() {
+    var hs = map.handlers && map.handlers._handlersById, h = hs && hs.mapEvent;
+    if (!h || h.__kairosQuiet) return;
+    ['mousemove', 'mouseover', 'mouseout'].forEach(function (t) {
+      var orig = h[t];
+      if (typeof orig !== 'function') return;
+      h[t] = function () { return map.listens(t) ? orig.apply(this, arguments) : undefined; };
+    });
+    h.__kairosQuiet = true;
+  }
+  // The first notch of a mouse wheel after a pause waited 40 ms in MapLibre's wheel/trackpad
+  // guess (measured: wheel zoom started ~55 ms after the notch vs ~8 ms for a drag). Windows
+  // reports a notched wheel as wheelDelta ±120 multiples with deltaY ±100 multiples (deltaMode 0);
+  // such an event starts the zoom at once with the same 'wheel' easing MapLibre picks 40 ms later.
+  // Touchpads (fractional / small deltas, pinch = ctrlKey) keep the original detection.
+  function isWheelNotch(e) {
+    if (!e || e.ctrlKey || e.deltaX || e.deltaMode !== 0) return false;
+    var w = e.wheelDeltaY, d = e.deltaY;
+    return !!w && w % 120 === 0 && Math.abs(d) >= 50 && Math.abs(d % 50) < 1e-6;
+  }
+  function installWheelNotch() {
+    var sz = map.scrollZoom;
+    if (!sz || typeof sz.wheel !== 'function' || sz.__kairosNotch) return;
+    var orig = sz.wheel;
+    sz.wheel = function (e) {
+      var r = orig.apply(this, arguments);
+      if (this._timeout && this._type === null && isWheelNotch(e) && typeof this._onTimeout === 'function') {
+        clearTimeout(this._timeout);
+        this._timeout = null;
+        this._onTimeout(e);
+      }
+      return r;
+    };
+    sz.__kairosNotch = true;
   }
   var hoverPin = null;
   function setPinHover(id) {
@@ -2154,11 +2674,13 @@
     spring = { sprites: sprites, t0: t0, last: t0, raf: 0, frames: 0, maxOvershoot: 0 };
     var run = spring;
     function glOpacity(k, kt) {              // k: fresh pins fade in, kt: merge targets appear
-      return ['case', ['==', ['get', 'stay'], 1], 1,
-              ['==', ['get', 'anim'], 1], 0,
-              ['==', ['get', 'anim'], 2], +kt.toFixed(3), +k.toFixed(3)];
+      setPinOps('pins', pinOps.ids, function (f) {
+        var p = f.properties;
+        return p.stay === 1 ? null : p.anim === 1 ? 0 : p.anim === 2 ? kt : k;
+      }, pinGeo.features);
     }
-    map.setPaintProperty('pins', 'icon-opacity', glOpacity(0, 0));
+    clearPinOps('pins', pinOps.ids);
+    glOpacity(0, 0);
     function step(now) {
       if (spring !== run || !map || !map.getLayer('pins')) return;
       var dt = Math.min(1 / 30, Math.max(0, (now - run.last) / 1000));
@@ -2195,7 +2717,7 @@
       var kt = anyMerge ? Math.max(0, Math.min(1, (mergeU - 0.55) / 0.4)) : 1;
       if ((all && k >= 1) || el > SPRING_TIMEOUT_MS) { springStats.last = { frames: run.frames, ms: Math.round(el),
         sprites: run.sprites.length, overshoot: +run.maxOvershoot.toFixed(3) }; stopSpring(); return; }
-      map.setPaintProperty('pins', 'icon-opacity', glOpacity(e, kt));
+      glOpacity(e, kt);
       run.raf = requestAnimationFrame(step);
     }
     run.raf = requestAnimationFrame(step);
@@ -2206,7 +2728,7 @@
     cancelAnimationFrame(spring.raf);
     spring = null;
     if (spriteHost) spriteHost.textContent = '';
-    if (map && map.getLayer('pins')) map.setPaintProperty('pins', 'icon-opacity', 1);
+    if (map && map.getLayer('pins')) clearPinOps('pins', pinOps.ids);
   }
   window.getPinSpring = function () {        // tests / bench
     if (!spring) return { active: false, last: springStats.last };
@@ -2234,13 +2756,12 @@
     });
     return Object.keys(before).map(function (k) { return before[k]; });
   }
-  function pinOpacity(v) { return ['case', ['==', ['get', 'stay'], 1], 1, v]; }
   function crossFadePins(leaving) {
     if (!map || !map.getLayer('pins')) return;
     var fresh = pinGeo.features.some(function (f) { return !f.properties.stay; });
     if (pinFade) { cancelAnimationFrame(pinFade.raf); pinFade = null; }
+    clearPinOps('pins', pinOps.ids);
     if (reduceMotion || journey.active || (!fresh && !leaving.length)) {
-      map.setPaintProperty('pins', 'icon-opacity', 1);
       if (map.getLayer('pins-out')) map.setLayoutProperty('pins-out', 'visibility', 'none');
       return;
     }
@@ -2253,21 +2774,24 @@
                      layout: { 'icon-image': ['get', 'img'], 'icon-allow-overlap': true, 'icon-ignore-placement': true,
                                'icon-pitch-alignment': 'viewport', 'icon-rotation-alignment': 'viewport',
                                'symbol-sort-key': ['get', 'count'] },
-                     paint: { 'icon-opacity': 1, 'icon-opacity-transition': { duration: 0 } } }, 'pins-halo');
+                     paint: { 'icon-opacity': PIN_OUT_OPACITY, 'icon-opacity-transition': { duration: 0 } } }, 'pins-halo');
     } else {
+      clearPinOps('pins-out', pinOps.outIds);
       map.getSource('pins-out').setData(out);
       map.setLayoutProperty('pins-out', 'visibility', 'visible');
     }
-    map.setPaintProperty('pins', 'icon-opacity-transition', { duration: 0, delay: 0 });
     pinFade = { out: out, t0: performance.now(), raf: 0 };
     var fade = pinFade;
+    function fresh0(f) { return f.properties.stay === 1 ? null : 0; }
     (function step(now) {
       if (pinFade !== fade || !map.getLayer('pins')) return;
       var k = Math.min(1, Math.max(0, (now - fade.t0) / PIN_FADE_MS)), e = 1 - Math.pow(1 - k, 3);
-      map.setPaintProperty('pins', 'icon-opacity', k >= 1 ? 1 : pinOpacity(+e.toFixed(3)));
-      if (map.getLayer('pins-out')) map.setPaintProperty('pins-out', 'icon-opacity', +(1 - e).toFixed(3));
+      if (k >= 1) clearPinOps('pins', pinOps.ids);
+      else setPinOps('pins', pinOps.ids, e ? function (f) { return f.properties.stay === 1 ? null : e; } : fresh0, pinGeo.features);
+      setPinOps('pins-out', pinOps.outIds, function () { return 1 - e; }, out.features);
       if (k < 1) { fade.raf = requestAnimationFrame(step); return; }
       if (map.getLayer('pins-out')) map.setLayoutProperty('pins-out', 'visibility', 'none');
+      clearPinOps('pins-out', pinOps.outIds);
       pinFade = null;
     })(fade.t0);
   }
@@ -4732,11 +5256,65 @@
 
 
   // ── Velikost stránky ────────────────────────────────────────────────────────
+  // Only a real size change resizes: map.resize() re-allocates the canvas (a cleared frame) and
+  // fires move/moveend (pin recluster) – it used to run on every return to the map tab.
+  var lastSize = '';
   function onResize() {
     if (!map) { createMap(); return; }      // záložka se poprvé zobrazila
-    map.resize();
+    var size = mapEl.clientWidth + 'x' + mapEl.clientHeight + '@' + window.devicePixelRatio;
+    if (size !== lastSize) { lastSize = size; map.resize(); }
     initialView(); render();
   }
+
+  // ── Seamless hand-off with map_host.py ──
+  // Before the host lets Chromium go cold (minimized, long on another tab) it asks for 'hold': a
+  // copy of the last map frame above the canvas and under every control. The first frame after
+  // the resume therefore equals the host's still; 'release' (the host saw a presented frame)
+  // fades it out once the map has settled, 180 ms ease-out.
+  var veil = null, veilToken = 0, veilTimer = 0;
+  function dropVeil() {
+    clearTimeout(veilTimer);
+    if (veil && veil.parentNode) veil.parentNode.removeChild(veil);
+    if (veil) { veil.width = 0; veil.height = 0; }
+  }
+  window.__kairosHandoff = function (what) {
+    if (!map) return false;
+    var token = ++veilToken;
+    if (what === 'hold') {
+      var asked = performance.now();
+      map.once('render', function () {
+        // a frame long after the request belongs to the resume, not to the hold
+        if (token !== veilToken || performance.now() - asked > 1000) return;
+        var c = map.getCanvas(), box = c.parentNode;
+        if (!veil) { veil = document.createElement('canvas'); veil.id = 'handoff-veil'; }
+        veil.width = c.width; veil.height = c.height;
+        veil.style.transition = 'none'; veil.style.opacity = '1';
+        try { veil.getContext('2d').drawImage(c, 0, 0); } catch (e) { dropVeil(); return; }
+        box.parentNode.insertBefore(veil, box.nextSibling);
+      });
+      map.triggerRepaint();
+      return true;
+    }
+    if (!veil || !veil.parentNode) return false;
+    clearTimeout(veilTimer);
+    var faded = false;
+    function fade() {
+      if (faded || token !== veilToken) return;
+      faded = true;
+      veil.style.transition = 'opacity 180ms cubic-bezier(0, 0, .2, 1)';
+      veil.style.opacity = '0';
+      veilTimer = setTimeout(dropVeil, 240);
+    }
+    if (map.loaded()) requestAnimationFrame(fade);
+    else { map.once('idle', fade); veilTimer = setTimeout(fade, 350); }
+    return true;
+  };
+  ['pointerdown', 'wheel'].forEach(function (t) {           // the user acts: live map, at once
+    mapEl.addEventListener(t, function () { if (veil && veil.parentNode) { veilToken++; dropVeil(); } }, true);
+  });
+  var loadingTimer = setTimeout(function () {             // only a slow load shows the spinner
+    if (!(map && map.loaded())) document.getElementById('maploading').classList.add('on');
+  }, 350);
   if (window.ResizeObserver) new ResizeObserver(onResize).observe(mapEl);
   window.addEventListener('resize', onResize);
   setBaseLayer('standard');

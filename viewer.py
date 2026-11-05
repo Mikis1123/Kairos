@@ -890,7 +890,7 @@ class MediaViewerWidget(QWidget):
         self._preload_timer.stop()
         self._preloaded_path = None
         self._preload_ready = False
-        for player in self._players:
+        for player in self._players + [p for p in (getattr(self, "_live_audio", None),) if p is not None]:
             player.setSource(QUrl())
 
     def open_google_maps(self):
@@ -1202,6 +1202,8 @@ class MediaViewerWidget(QWidget):
             self.player.play()
         elif self._is_live:
             self.player.setSource(QUrl.fromLocalFile(item[4]))
+            self.player.setAudioTrackEnabled(False)     # motion at the clip's own cadence…
+            self._prepare_live_audio(item[4])           # …and its sound from a companion player
             self.player.setPlaybackRate(1.0)
 
     @staticmethod
@@ -1392,6 +1394,9 @@ class MediaViewerWidget(QWidget):
         self._awaiting_first_video_frame = False
         if self.player:
             self.player.stop()
+        live_audio = getattr(self, "_live_audio", None)
+        if live_audio is not None:
+            live_audio.stop()
         governor.get().set_active("video", False)
         self.canvas.show_video(False)
         self.btn_live.setChecked(False)
@@ -1409,13 +1414,47 @@ class MediaViewerWidget(QWidget):
             self.btn_live.setChecked(True)
             self.player.setPosition(0)
             self.player.play()
+            self._play_live_audio()
 
-    def stop_live_smoothly(self):
+    def stop_live_smoothly(self, natural=False):
+        """natural=True: the motion reached its end – its sound may ring out (it is the same
+        length, but the audio device lags by its buffer); any other stop silences it."""
         self.is_live_playing = False
         self._awaiting_first_video_frame = False
         self.canvas.show_video(False)
         self.btn_live.setChecked(False)
         self.player.pause()
+        if not natural:
+            self._stop_live_audio()
+
+    # ── Live Photo sound ──
+    # Qt 6.11 (FFmpeg backend) holds video back to its audio clock: the Live motion played at
+    # ~27 fps instead of 30, with uneven 35-40 ms frames (eval: audio on 37.5 ms median,
+    # audio off 33.4 ms = the source). The video player therefore runs the clip without its
+    # audio track and this audio-only player (no video decode) plays the sound alongside. Both
+    # run at true speed, and a Live clip is ~3 s, so there is nothing to drift apart.
+    def _prepare_live_audio(self, path):
+        player = getattr(self, "_live_audio", None)
+        if player is None:
+            player = self._live_audio = media_engine.ThreadedPlayer(self, volume=self.audio_output.volume())
+        url = QUrl.fromLocalFile(path)
+        if player.source() != url:
+            player.setSource(url)
+            player.setVideoTrackEnabled(False)
+
+    def _play_live_audio(self):
+        player = getattr(self, "_live_audio", None)
+        if player is None or player.source().isEmpty():
+            return
+        player.audio.setVolume(self.audio_output.volume())
+        player.audio.setMuted(self.audio_output.isMuted())
+        player.setPosition(0)
+        player.play()
+
+    def _stop_live_audio(self):
+        player = getattr(self, "_live_audio", None)
+        if player is not None and player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            player.pause()
 
     def toggle_play_pause(self):
         # Jen play()/pause() na stávající relaci – žádný nový zdroj ani pipeline
@@ -1515,7 +1554,14 @@ class MediaViewerWidget(QWidget):
     def toggle_mute(self):
         muted = not self.audio_output.isMuted()
         self.audio_output.setMuted(muted)
+        self._sync_live_audio_level()
         self.btn_mute.set_icon("mute" if muted else "volume")
+
+    def _sync_live_audio_level(self):
+        player = getattr(self, "_live_audio", None)
+        if player is not None:
+            player.audio.setVolume(self.audio_output.volume())
+            player.audio.setMuted(self.audio_output.isMuted())
 
     def on_volume_changed(self, val):
         self.audio_output.setVolume(val / 100.0)
@@ -1524,6 +1570,7 @@ class MediaViewerWidget(QWidget):
         else:
             self.audio_output.setMuted(False)
             self.btn_mute.set_icon("volume")
+        self._sync_live_audio_level()
 
     def cycle_playback_speed(self):
         self.current_speed_idx = (self.current_speed_idx + 1) % len(self.playback_speeds)
@@ -1580,7 +1627,7 @@ class MediaViewerWidget(QWidget):
         if dur > 0:
             # U Live Photo přepneme zpět na statickou fotku 75 ms před koncem, aby neproblikla černá
             if self.is_live_playing and pos >= dur - 75:
-                self.stop_live_smoothly()
+                self.stop_live_smoothly(natural=True)
                 return
             # U běžného videa zastavíme na posledním snímku (50 ms před koncem), aby obrazovka na konci nezčernala
             elif self._is_video and pos >= dur - 50 and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -1602,7 +1649,7 @@ class MediaViewerWidget(QWidget):
     def on_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
             if self.is_live_playing:
-                self.stop_live_smoothly()
+                self.stop_live_smoothly(natural=True)
             self._sync_play_icon()
 
     def show_prev(self):

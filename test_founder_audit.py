@@ -602,11 +602,12 @@ def test_pin_clusters_cross_fade(mappage):
       var leaving = markStaying(oldG, newG);
       return { leaving: leaving.map(function (x) { return x.properties.img; }),
                stay: newG.features.map(function (x) { return x.properties.stay; }),
-               expr: pinOpacity(0.5) };
+               expr: PIN_OPACITY };
     })()""")
     assert res["leaving"] == ["b"]
     assert res["stay"] == [1, 0, 0]
-    assert res["expr"] == ["case", ["==", ["get", "stay"], 1], 1, 0.5]
+    # staying pins at 1, fresh ones fade through per-feature state (constant paint, no re-layout)
+    assert res["expr"] == ["case", ["==", ["get", "stay"], 1], 1, ["coalesce", ["feature-state", "op"], 1]]
     assert "crossFadePins(leaving)" in _read("map_vault.html")
 
 

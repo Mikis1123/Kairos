@@ -105,7 +105,11 @@ class TileStore:
             fetched REAL NOT NULL, used REAL NOT NULL, size INTEGER NOT NULL)""")
         conn.execute("CREATE INDEX IF NOT EXISTS tiles_used ON tiles(used)")
         conn.commit()
-        self.bytes = conn.execute("SELECT COALESCE(SUM(size), 0) FROM tiles").fetchone()[0]
+        # Store size is counted by the writer thread (_open_writer), not here: `size` sits after
+        # the BLOB, so SUM(size) without an index walks every tile's overflow pages – measured
+        # 5.5 s for a 238 MB store, on the GUI thread, each time the map was built.
+        self.bytes = 0
+        self.ready = threading.Event()
         self._writer = threading.Thread(target=self._write_loop, name="tile-store-writer", daemon=True)
         self._writer.start()
 
@@ -205,9 +209,24 @@ class TileStore:
         self._writes.put(("clear", done))
         done.wait(10)
 
-    def _write_loop(self):
+    def _open_writer(self):
+        """Writer connection + covering indexes, so size bookkeeping never reads tile data.
+        The first run on an existing store builds them once (one pass), later runs are instant."""
         conn = sqlite3.connect(self.path, timeout=30)
         conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS tiles_used_size ON tiles(used, size, key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS tiles_key_size ON tiles(key, size)")
+            conn.commit()
+            self.bytes = conn.execute("SELECT COALESCE(SUM(size), 0) FROM tiles INDEXED BY tiles_used_size"
+                                      ).fetchone()[0]
+        except sqlite3.Error as e:
+            print(f"[TileStore] index: {e}")
+        self.ready.set()
+        return conn
+
+    def _write_loop(self):
+        conn = self._open_writer()
         while True:
             item = self._writes.get()
             if item is None:
@@ -228,7 +247,8 @@ class TileStore:
                     kind = op[0]
                     if kind == "put":
                         _, key, data, ctype, enc, now = op
-                        old = conn.execute("SELECT size FROM tiles WHERE key = ?", (key,)).fetchone()
+                        old = conn.execute("SELECT size FROM tiles INDEXED BY tiles_key_size WHERE key = ?",
+                                           (key,)).fetchone()
                         conn.execute("INSERT OR REPLACE INTO tiles(key, data, ctype, enc, fetched, used, size) "
                                      "VALUES (?, ?, ?, ?, ?, ?, ?)", (key, data, ctype, enc, now, now, len(data)))
                         self.bytes += len(data) - (old[0] if old else 0)
@@ -260,7 +280,8 @@ class TileStore:
     def _evict(self, conn):
         target = int(self.budget * EVICT_TO)
         while self.bytes > target:
-            rows = conn.execute("SELECT key, size FROM tiles ORDER BY used LIMIT 500").fetchall()
+            rows = conn.execute("SELECT key, size FROM tiles INDEXED BY tiles_used_size ORDER BY used LIMIT 500"
+                                ).fetchall()
             if not rows:
                 self.bytes = 0
                 break
