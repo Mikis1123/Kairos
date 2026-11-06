@@ -7,7 +7,7 @@ Contract tests: `test_ios_sync.py` writes `KairosCore/Tests/KairosCoreTests/Fixt
 
 - HTTPS (TLS ≥ 1.2) on port **52790** across the whole LAN. The bridge is opt-in: it starts only when `sync_server_enabled` is set in config, or when you run `python sync_server.py`.
 - Certificate: self-signed EC P-256, made on first start in `%APPDATA%/Kairos/sync/`. The client pins the **SHA-256 of the DER certificate**. It does no CA check and no hostname check.
-- Pairing QR / link: `kairos://pair?h=<lan ip>&p=<port>&fp=<sha256 hex>&lib=<library id>&pin=<6 digits>&v=1`
+- Pairing QR / link: `kairos://pair?h=<lan ip>&p=<port>&fp=<sha256 hex>&lib=<library id>&pin=<6 digits>&v=1`. The desktop shows it in Settings › Advanced › iPhone sync › Pair iPhone… (`phone_pairing.py`; QR from the dependency-free `qr_code.py`). Closing that sheet cancels the PIN.
 - The PIN is single-use, valid for 120 s and allows 5 guesses. A correct PIN returns a 256-bit bearer token. The desktop stores only its SHA-256 (`sync/devices.json`). The phone keeps the token in the Keychain (`AfterFirstUnlockThisDeviceOnly`).
 - Every endpoint except `hello` and `pair` requires `Authorization: Bearer <token>`.
 - Capacity: 8 HTTP requests in flight plus 4 WebSockets. Beyond that the server answers `503 busy` with `Retry-After: 2`.
@@ -73,7 +73,9 @@ Client loop:
 
 - Unknown keys are preserved on both sides.
 - Pixel math: `EditMath.swift` ports `quick_edit.py`. Fixtures pin the LUTs (±1 level) and the inverse warp.
-- Conflicts: a local edit not yet uploaded (`dirty`) wins over an incoming one. After upload, the desktop's canonical answer replaces it. Otherwise the last writer wins (protocol 1).
+- Conflicts: a local edit not yet uploaded (`dirty`) wins over an incoming one. After upload, the desktop's canonical answer replaces it, but only if the row still holds exactly what was uploaded (compare-and-swap). A newer edit saved while the PUT was in flight stays dirty and goes up next. Otherwise the last writer wins (protocol 1).
+- Saving on the phone writes the replica row first (dirty), then uploads in the background. Offline edits stay queued until the next successful sync. The phone re-bakes its own micro preview from the edited rendering, so the grid matches at once.
+- Phone writes reach the desktop GUI through `sync_server.set_remote_change_handler`. main.py routes them to the same grid refresh as a local Quick Edit or favourite.
 - Thumbnails and originals are served unedited, and the client applies the edit. Micro previews are the exception: the desktop bakes the edit into them.
 
 ## Power and idle behaviour

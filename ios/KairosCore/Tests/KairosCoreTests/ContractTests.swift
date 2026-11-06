@@ -58,7 +58,7 @@ final class ContractTests: XCTestCase {
         try store.apply(try JSONDecoder().decode(ChangePage.self, from: Data(later.utf8)))
         XCTAssertEqual(store.edit(for: 1)?.contrast, 40)            // the unsent local edit survives
         XCTAssertNil(store.media(2))
-        XCTAssertEqual(store.dirtyEdits().map { $0.0 }, [1])
+        XCTAssertEqual(store.dirtyEdits().map(\.id), [1])
         XCTAssertEqual(store.cursor, 99)
     }
 

@@ -269,22 +269,47 @@ public final class LibraryStore: @unchecked Sendable {
                    [.int(id), .text(params)])
     }
 
-    public func dirtyEdits() -> [(MediaID, Adjustments)] {
+    /// One queued phone edit. `stored` is the exact params text in the replica: the upload
+    /// answer may replace the row only while it still holds that text (see editUploaded).
+    public struct PendingEdit: Sendable {
+        public let id: MediaID
+        public let adjustments: Adjustments
+        public let stored: String
+    }
+
+    public func dirtyEdits() -> [PendingEdit] {
         ((try? db.query("SELECT media_id, params FROM media_edits WHERE dirty = 1")) ?? []).compactMap { r in
             guard let id = r.int("media_id"), let text = r.string("params"),
                   let dict = try? decoder.decode([String: JSONValue].self, from: Data(text.utf8)) else { return nil }
-            return (id, Adjustments(dict: dict))
+            return PendingEdit(id: id, adjustments: Adjustments(dict: dict), stored: text)
         }
     }
 
-    /// The desktop's canonical answer to an upload (nil params = the edit was cleared).
-    public func editUploaded(_ id: MediaID, canonical: EditRecord?) throws {
-        if let canonical {
-            try db.run("INSERT OR REPLACE INTO media_edits (media_id, params, updated_at, dirty) VALUES (?, ?, ?, 0)",
-                       [.int(id), .text(try json(canonical.params)), .init(canonical.updatedAt)])
-        } else {
-            try db.run("DELETE FROM media_edits WHERE media_id = ?", [.int(id)])
+    public var pendingEditCount: Int {
+        Int((try? db.scalarInt("SELECT COUNT(*) FROM media_edits WHERE dirty = 1")) ?? 0)
+    }
+
+    /// The desktop's canonical answer to an upload (nil = the edit was cleared). Compare-and-swap:
+    /// it lands only if the row still holds what was uploaded. A newer local edit, saved while the
+    /// request was in flight, stays dirty and goes up on the next push. Before this check, the
+    /// late answer overwrote the newer edit and marked it clean, and the edit was lost.
+    /// Returns false when a newer edit won.
+    @discardableResult
+    public func editUploaded(_ id: MediaID, canonical: EditRecord?, uploaded: String) throws -> Bool {
+        var landed = false
+        try db.transaction {
+            let still = try db.query("SELECT 1 FROM media_edits WHERE media_id = ? AND dirty = 1 AND params = ?",
+                                     [.int(id), .text(uploaded)]).first != nil
+            guard still else { return }
+            if let canonical {
+                try db.run("INSERT OR REPLACE INTO media_edits (media_id, params, updated_at, dirty) VALUES (?, ?, ?, 0)",
+                           [.int(id), .text(try json(canonical.params)), .init(canonical.updatedAt)])
+            } else {
+                try db.run("DELETE FROM media_edits WHERE media_id = ?", [.int(id)])
+            }
+            landed = true
         }
+        return landed
     }
 
     // ── queries for the UI ──

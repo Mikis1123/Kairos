@@ -20,6 +20,8 @@ __pycache__/
 *.exe
 exiftool_files/
 models/
+# ...but not the iOS Swift model sources (Windows matches "models/" case-insensitively)
+!ios/KairosCore/Sources/KairosCore/Models/
 *.onnx
 
 # Diagnostika výkonu (frametime logy)

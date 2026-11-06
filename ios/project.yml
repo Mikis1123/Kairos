@@ -40,6 +40,10 @@ targets:
         # ATS still applies to every other host.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        # Phase 2: offline maps. Documents (with Documents/Maps for desktop downloads) is visible
+        # in the Files app and in Finder over USB, so users can drop their own .mbtiles packs in.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
 schemes:
   Kairos:
     build:

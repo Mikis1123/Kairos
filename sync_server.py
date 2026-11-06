@@ -668,6 +668,7 @@ class SyncServer:
                 is_ws = parts == ["v1", "events"]
                 gate = server._sockets if is_ws else server._slots
                 if not gate.acquire(blocking=False):
+                    # i18n-ok: HTTP header name, not UI text
                     return self._error(_HttpError(503, "busy", {"Retry-After": "2"}))
                 try:
                     server._route(self, method, parts)
@@ -1091,18 +1092,33 @@ def _id_list(text, cap):
 
 _service = None
 _service_lock = threading.Lock()
+_remote_handler = None          # desktop GUI hook, survives stop/start (set_remote_change_handler)
+last_error = None               # why the last start() failed, for the Settings status line
+
+
+def set_remote_change_handler(fn):
+    """fn(kind, media_id), called on a request thread after the phone wrote an edit or a
+    favourite. Applies to the running service and to every later start()."""
+    global _remote_handler
+    _remote_handler = fn
+    srv = _service
+    if srv is not None:
+        srv.on_remote_change = fn
 
 
 def start(port=DEFAULT_PORT, host="0.0.0.0"):
     """Starts the bridge (idempotent). None when it cannot start (port taken, DB locked)."""
-    global _service
+    global _service, last_error
     with _service_lock:
         if _service is None:
             try:
                 _service = SyncServer(host=host, port=port)
             except Exception as e:                    # noqa: BLE001
+                last_error = e
                 print(f"[Sync] cannot start the LAN bridge: {e}")
                 return None
+            last_error = None
+            _service.on_remote_change = _remote_handler
     return _service
 
 
@@ -1125,6 +1141,24 @@ def stop():
         srv, _service = _service, None
     if srv is not None:
         srv.shutdown()
+
+
+def _credentials(state_dir=None):
+    srv = _service
+    if srv is not None and state_dir is None:
+        return srv.credentials                        # the live copy: no stale file read
+    return Credentials(state_dir or os.path.join(paths.DATA_DIR, "sync"))
+
+
+def paired_devices(state_dir=None):
+    """[{id, name, paired_at}] for the Settings list. Token hashes never leave this module."""
+    return [{"id": d.get("id", ""), "name": d.get("name", ""), "paired_at": d.get("paired_at", "")}
+            for d in _credentials(state_dir).devices]
+
+
+def forget_device(device_id, state_dir=None):
+    """Revokes a phone's token. It must pair again to sync."""
+    return _credentials(state_dir).revoke(device_id)
 
 
 def main(argv=None):

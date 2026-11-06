@@ -4404,6 +4404,11 @@ class FrameStatsOverlay(QLabel):
 DOWNLOAD_INTERRUPTED = "interrupted"   # stavový kód stahování (ne text pro uživatele)
 
 
+class _SyncBridge(QObject):
+    """sync_server request thread -> GUI thread (AutoConnection queues across threads)."""
+    changed = pyqtSignal(str, int)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4411,8 +4416,10 @@ class MainWindow(QMainWindow):
         i18n.notifier().changed.connect(self._on_language_changed)   # Gate 1: přepnutí jazyka za běhu
         # Sprint 2: kurátorská data i do XMP sidecarů (zápis na pozadí, vypínatelné v Předvolbách)
         xmp_sync.install(get_connection, lambda: bool(self.config.get("xmp_sidecars", True)))
+        self._sync_bridge = None
         if self.config.get("sync_server_enabled", False):
             import sync_server              # iOS Phase 1: schema, certificate and bind on a worker thread
+            self._install_sync_bridge()
             sync_server.start_async()
         self.setWindowTitle(brand.APP_NAME)
         self.setMinimumSize(1100, 700)
@@ -5267,6 +5274,34 @@ class MainWindow(QMainWindow):
             edits = {}
         EDITS.clear()
         EDITS.update(edits)
+
+    # ── iPhone LAN bridge -> grid (iOS Phase 2) ──
+    def _install_sync_bridge(self):
+        """Edits and favourites written by the phone (sync_server request threads) reach the grid
+        through a queued Qt signal, the same refresh the viewer's own save uses. Installed when
+        the bridge module is loaded: at startup (enabled) or after Settings switched it on."""
+        if self._sync_bridge is not None or "sync_server" not in sys.modules:
+            return
+        bridge = _SyncBridge(self)
+        bridge.changed.connect(self._on_remote_change)
+        self._sync_bridge = bridge
+        sys.modules["sync_server"].set_remote_change_handler(bridge.changed.emit)
+
+    def _on_remote_change(self, kind, media_id):
+        if kind == "edit":
+            self._on_edit_saved(media_id)
+        elif kind == "favorite":
+            try:
+                conn = get_connection()
+                try:
+                    row = conn.execute("SELECT is_favorite FROM media_items WHERE id = ?", (int(media_id),)).fetchone()
+                finally:
+                    conn.close()
+            except Exception as e:
+                print(f"[Sync] {e}")
+                return
+            if row is not None:
+                self._on_favorite_changed(int(media_id), int(row[0] or 0))
 
     def _on_edit_saved(self, media_id):
         """The viewer saved / reverted a Quick Edit: refresh that tile in every grid."""
@@ -7932,6 +7967,7 @@ class MainWindow(QMainWindow):
         old_prefetch = bool(self.config.get("map_prefetch", True))
         dlg = SettingsDialog(self, as_sheet=True)     # Founder audit: list v okně, ne okno Win32
         accepted = dlg.exec()
+        self._install_sync_bridge()            # iOS Phase 2: the iPhone switch acts live in Settings
         if dlg.trash_emptied:                  # proběhlo i při Zrušit – knihovna musí sedět s DB
             self._on_library_changed()
         if getattr(dlg, "hidden_requested", False) is True:   # Předvolby › Skryté › Otevřít

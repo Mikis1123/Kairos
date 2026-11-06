@@ -212,6 +212,8 @@ class SettingsDialog(QDialog):
         hned, odjezd listu animovaně; list pak smaže i tento widget."""
         if getattr(self, "_map_timer", None) is not None:
             self._map_timer.stop()          # the offline-map job keeps running; only polling stops
+        if getattr(self, "_sync_timer", None) is not None:
+            self._sync_timer.stop()
         if self._sheet is None:
             return super().done(r)
         if self._sheet_done:
@@ -602,6 +604,7 @@ class SettingsDialog(QDialog):
         self._update_cache_dir_label()
 
         self._build_map_offline_group(layout)
+        self._build_mobile_sync_group(layout)
 
         # Fáze 1: adaptivní škálování a proxy videí (rozhodnutí C: limit úložiště v Předvolbách)
         g = self._group(layout, tr("settings-perf-video"))
@@ -752,6 +755,116 @@ class SettingsDialog(QDialog):
         self._map_timer.start()
         self._update_region_estimate()
         self.refresh_map_offline()
+
+    # ── Synchronizace s iPhonem (iOS Phase 2) ──
+    def _build_mobile_sync_group(self, layout):
+        """LAN bridge for Kairos on iPhone. The switch acts at once, like Wi-Fi: it starts or stops
+        sync_server and persists `sync_server_enabled` immediately, because pairing needs the
+        bridge running while this sheet is still open. Binding runs on sync_server's worker
+        thread; this page only reads its state from a timer."""
+        import sync_server
+        self._sync = sync_server
+        g = self._group(layout, tr("settings-mobile-sync"), info=tr("settings-mobile-sync-hint"))
+        self.chk_sync = ToggleSwitch(tr("settings-mobile-sync-toggle"))
+        self.chk_sync.setChecked(bool(self.config.get("sync_server_enabled", False)))
+        self.chk_sync.toggled.connect(self.set_sync_enabled)
+        self._row(g, stacked=self.chk_sync)
+        self.lbl_sync_status = _hint("")
+        self._row(g, stacked=self.lbl_sync_status)
+        self.btn_pair_phone = KButton(tr("settings-mobile-pair"), compact=True)
+        self.btn_pair_phone.clicked.connect(self.pair_phone)
+        self._row(g, tr("settings-mobile-pair-row"), self.btn_pair_phone)
+        self.lbl_sync_devices = QLabel()
+        self.list_sync_devices = QListWidget()
+        self.list_sync_devices.setMaximumHeight(72)
+        self.btn_sync_forget = KButton(tr("settings-mobile-forget"), compact=True)
+        self.btn_sync_forget.clicked.connect(self.forget_phone)
+        forget_row = QHBoxLayout()
+        forget_row.addWidget(self.btn_sync_forget)
+        forget_row.addStretch()
+        self._row(g, tr("settings-mobile-devices"), value=self.lbl_sync_devices, stacked=self.list_sync_devices)
+        self._sync_forget_row = self._row(g, stacked=forget_row)
+        self._sync_starting = False
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(MAP_JOB_POLL_MS)
+        self._sync_timer.timeout.connect(self.refresh_sync_status)
+        self._sync_timer.start()
+        self.refresh_sync_devices()
+        self.refresh_sync_status()
+
+    def set_sync_enabled(self, on):
+        on = bool(on)
+        cfg = load_config()                     # persist just this key: it took effect already
+        cfg["sync_server_enabled"] = on
+        save_config(cfg)
+        self.config["sync_server_enabled"] = on
+        if on:
+            if self._sync.service() is None:
+                self._sync_starting = True
+                self._sync.start_async(on_ready=self._on_sync_ready)
+        else:
+            self._sync_starting = False
+            self._sync.stop()
+        self.refresh_sync_status()
+
+    def _on_sync_ready(self, _srv):             # worker thread: only a flag; the timer redraws
+        self._sync_starting = False
+
+    def refresh_sync_status(self):
+        srv = self._sync.service()
+        if srv is not None:
+            from phone_pairing import address_of
+            addr = address_of(f"kairos://pair?h={self._sync.lan_address()}&p={srv.port}")
+            text = tr("settings-mobile-status-on", address=addr)
+        elif self._sync_starting:
+            text = tr("settings-mobile-status-starting")
+        elif self.chk_sync.isChecked() and self._sync.last_error is not None:
+            text = tr("settings-mobile-status-failed", port=str(self._sync.DEFAULT_PORT))
+        else:
+            text = tr("settings-mobile-status-off")
+        if self.lbl_sync_status.text() != text:
+            self.lbl_sync_status.setText(text)
+
+    def refresh_sync_devices(self):
+        try:
+            devices = self._sync.paired_devices()
+        except Exception as e:                  # noqa: BLE001 – a broken devices.json must not break Settings
+            print(f"[Sync] {e}")
+            devices = []
+        self.list_sync_devices.clear()
+        for d in devices:
+            when = (d.get("paired_at") or "")[:10]
+            name = d.get("name") or tr("pair-device-fallback")
+            item = QListWidgetItem(f"{name}  ·  {when}" if when else name)
+            item.setData(Qt.ItemDataRole.UserRole, d.get("id"))
+            self.list_sync_devices.addItem(item)
+        self.lbl_sync_devices.setText(fmt_number(len(devices)) if devices else tr("settings-mobile-devices-none"))
+        self.list_sync_devices.setVisible(bool(devices))
+        self._sync_forget_row.setVisible(bool(devices))
+
+    def pair_phone(self):
+        """Pairing needs the bridge: the switch turns on (and persists) first."""
+        if not self.chk_sync.isChecked():
+            self.chk_sync.setChecked(True)      # -> set_sync_enabled(True)
+        from phone_pairing import PairPhoneDialog
+        dlg = PairPhoneDialog(self)
+        dlg.exec()
+        self.refresh_sync_devices()
+        self.refresh_sync_status()
+
+    def forget_phone(self):
+        item = self.list_sync_devices.currentItem()
+        if item is None and self.list_sync_devices.count() == 1:
+            item = self.list_sync_devices.item(0)
+        if item is None:
+            return
+        name = item.text().split("  ·  ")[0]
+        ok, _ = self._confirm(tr("settings-mobile-forget-title", device=name),
+                              tr("settings-mobile-forget-body"), action_text=tr("settings-mobile-forget"))
+        if not ok:
+            return
+        self._sync.forget_device(item.data(Qt.ItemDataRole.UserRole))
+        self.refresh_sync_devices()
 
     def _map_budget_mb(self):
         return int(round(self.slider_map_mb.value() / MAP_MB_STEP) * MAP_MB_STEP)

@@ -20,6 +20,8 @@ public actor SyncEngine {
     private var onStatus: (@Sendable (Status) -> Void)?
     private var onChange: (@Sendable (LibraryStore.Applied) -> Void)?
     private var runTask: Task<Void, Never>?
+    private var pushing = false
+    private var pushAgain = false
 
     public init(store: LibraryStore, client: SyncClient) {
         self.store = store
@@ -74,21 +76,35 @@ public actor SyncEngine {
         }
     }
 
-    /// Uploads phone-side edits; the desktop's canonical answer replaces the local copy.
+    /// Uploads phone-side edits. The desktop's canonical answer replaces the local copy unless a
+    /// newer local edit was saved meanwhile (LibraryStore.editUploaded compare-and-swap).
     public func pushEdits() async throws {
-        for (id, adj) in store.dirtyEdits() {
-            do {
-                let canonical = try await client.putEdit(id, adj)
-                try store.editUploaded(id, canonical: canonical)
-            } catch SyncError.server(404, _) {
-                try store.editUploaded(id, canonical: nil)   // the photo is gone or now hidden on the desktop
-            }
+        guard !pushing else {
+            pushAgain = true                           // a save during an upload: one more round
+            return
         }
+        pushing = true
+        defer { pushing = false }
+        repeat {
+            pushAgain = false
+            for e in store.dirtyEdits() {
+                do {
+                    let canonical = try await client.putEdit(e.id, e.adjustments)
+                    try store.editUploaded(e.id, canonical: canonical, uploaded: e.stored)
+                } catch SyncError.server(404, _) {
+                    // the photo is gone or now hidden on the desktop: drop the queued edit
+                    try store.editUploaded(e.id, canonical: nil, uploaded: e.stored)
+                }
+            }
+        } while pushAgain
     }
 
-    public func saveEdit(_ id: MediaID, _ adj: Adjustments) async {
-        try? store.saveLocalEdit(id, adj)
-        try? await pushEdits()                         // offline: stays dirty, retried next cycle
+    /// Saves a phone-side edit: the replica row is written (dirty) before this returns, so the
+    /// grid and viewer show it at once, offline or not. The upload runs detached. Offline, the
+    /// edit stays queued and the sync loop uploads it after the next pull.
+    public func saveEdit(_ id: MediaID, _ adj: Adjustments) throws {
+        try store.saveLocalEdit(id, adj)
+        Task { try? await self.pushEdits() }
     }
 
     public func setFavorite(_ id: MediaID, _ value: Bool) async throws {

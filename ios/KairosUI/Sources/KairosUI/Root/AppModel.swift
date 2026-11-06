@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import KairosCore
 import Observation
@@ -94,15 +95,23 @@ public final class AppModel {
         revision += 1
     }
 
-    public func saveEdit(_ id: MediaID, _ adj: Adjustments) async {
+    /// Saves an edit: the replica row is written (dirty = queued for the desktop) before this
+    /// returns, so every grid and the viewer show it at once. The upload runs detached in the
+    /// engine, and offline it waits for the next sync. `rendered` (the editor's final preview)
+    /// re-bakes the grid's LQIP immediately.
+    public func saveEdit(_ id: MediaID, _ adj: Adjustments, rendered: CGImage? = nil) async {
         images.invalidate([id])
         if let engine {
-            await engine.saveEdit(id, adj)
+            try? await engine.saveEdit(id, adj)
         } else {
             try? store?.saveLocalEdit(id, adj)
         }
+        if let rendered { images.rebakeMicro(id, from: rendered) }
         revision += 1
     }
+
+    /// Phone edits not yet acknowledged by the desktop.
+    public var pendingEdits: Int { _ = revision; return store?.pendingEditCount ?? 0 }
 
     public func toggleFavorite(_ id: MediaID) async {
         guard let item = store?.media(id) else { return }
