@@ -1,0 +1,127 @@
+# Kairos for iPhone: cloud build without a Mac.
+#   1. KairosCore contract tests (fixtures shared with the desktop's test_ios_*.py) on an iOS Simulator
+#   2. XcodeGen -> Kairos.xcodeproj
+#   3. Unsigned Release build for real devices (generic/platform=iOS)
+#   4. Payload/Kairos.app zipped as Kairos-unsigned.ipa, uploaded as a workflow artifact
+# Install on the iPhone from Windows with Sideloadly, which re-signs the .ipa with your Apple ID.
+name: iOS
+
+on:
+  push:
+    branches: [main]
+    paths: ["ios/**", ".github/workflows/ios.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["ios/**", ".github/workflows/ios.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode version
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Cache Swift packages (MapLibre)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/build/SourcePackages
+            ios/.build
+          key: spm-${{ runner.os }}-${{ hashFiles('ios/Package.swift', 'ios/Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Pick an iPhone simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devs = json.load(sys.stdin)["devices"]
+          ios = sorted((k for k in devs if "iOS" in k), key=lambda k: [int(x) for x in k.rsplit("iOS-", 1)[-1].split("-")])
+          for runtime in reversed(ios):
+              for d in devs[runtime]:
+                  if d["name"].startswith("iPhone"):
+                      print(d["udid"]); sys.exit(0)
+          sys.exit("no iPhone simulator")')
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      # The package's auto-generated scheme, tested on the platform the app ships on. (A plain
+      # `swift test` would build every target for macOS, including the iOS-only UI layer.)
+      - name: KairosCore contract tests
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild test \
+            -scheme Kairos-Package \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -only-testing:KairosCoreTests \
+            -derivedDataPath build \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            -resultBundlePath build/KairosCoreTests.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee build/test.log | grep -E "Test Suite|Test Case.*(passed|failed)|error:|\*\* TEST" || true
+          grep -q "\*\* TEST SUCCEEDED \*\*" build/test.log
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned app (generic iOS device)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project Kairos.xcodeproj \
+            -scheme Kairos \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | tee build/build.log | grep -E "error:|warning: .*deprecated|\*\* BUILD" || true
+          grep -q "\*\* BUILD SUCCEEDED \*\*" build/build.log
+
+      - name: Package .ipa
+        run: |
+          APP=build/Build/Products/Release-iphoneos/Kairos.app
+          test -d "$APP"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && zip -qry ../Kairos-unsigned.ipa Payload)
+          ls -lh build/Kairos-unsigned.ipa
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Info.plist")
+          echo "Kairos $VERSION ($(git rev-parse --short HEAD)) unsigned .ipa" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kairos-unsigned-ipa
+          path: ios/build/Kairos-unsigned.ipa
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs
+          path: |
+            ios/build/*.log
+            ios/build/KairosCoreTests.xcresult
+          retention-days: 7
+          if-no-files-found: ignore

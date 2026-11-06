@@ -9,6 +9,7 @@ public struct RootTabView: View {
 
     @Environment(AppModel.self) private var model
     @State private var tab: Tab = .library
+    @Environment(\.scenePhase) private var scenePhase
 
     public init() {}
 
@@ -33,6 +34,10 @@ public struct RootTabView: View {
         .tint(Kairos.Palette.accent)
         .background(Kairos.Palette.background.ignoresSafeArea())
         .preferredColorScheme(.dark)
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { model.vault.lock() }        // Hidden folder: auto-lock on leaving
+            if phase == .active { model.sendImports() }       // resume a batch interrupted in the background
+        }
         .sheet(isPresented: .constant(model.status == .needsPairing && model.store != nil)) {
             PairingView()
                 .interactiveDismissDisabled()

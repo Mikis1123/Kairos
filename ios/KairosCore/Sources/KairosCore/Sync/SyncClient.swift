@@ -209,6 +209,40 @@ public final class SyncClient: @unchecked Sendable {
         _ = try await send(try request("/v1/media/\(id)/favorite", method: "PUT", json: ["value": value]))
     }
 
+    /// Result of a camera-roll upload. `duplicate` = the desktop already has these exact bytes.
+    public enum ImportOutcome: String, Sendable { case imported, duplicate }
+
+    /// True when the desktop already holds a file with this SHA-256 (cheap pre-check, so a
+    /// re-picked video is not sent twice).
+    public func importPresent(sha256: String) async throws -> Bool {
+        struct Answer: Decodable { let status: String }
+        let a: Answer = try await get("/v1/import/\(sha256)")
+        return a.status == "present"
+    }
+
+    /// Streams one photo or video from disk into the desktop's inbox (Pictures/Kairos iPhone).
+    /// The desktop verifies `sha256` before the file becomes visible, so a dropped connection
+    /// never leaves half a file; retrying is safe.
+    public func uploadImport(file: URL, name: String, sha256: String) async throws -> ImportOutcome {
+        var r = try request("/v1/import", method: "POST", query: ["name": name, "sha256": sha256],
+                            headers: ["Content-Type": "application/octet-stream"])
+        r.timeoutInterval = 300                         // per-packet idle limit, not the whole transfer
+        let (data, resp) = try await session.upload(for: r, fromFile: file)
+        guard let http = resp as? HTTPURLResponse else { throw SyncError.badResponse }
+        switch http.statusCode {
+        case 200...299:
+            struct Answer: Decodable { let status: String }
+            let a = try decoder.decode(Answer.self, from: data)
+            return ImportOutcome(rawValue: a.status) ?? .imported
+        case 401: throw SyncError.unauthorized
+        case 503:
+            throw SyncError.deferred(retryAfter: Int(http.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 30)
+        default:
+            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? String ?? ""
+            throw SyncError.server(http.statusCode, code)
+        }
+    }
+
     // ── push: change notifications over WebSocket ──
 
     /// Yields the desktop's journal cursor whenever it moves. Ends when the socket drops; the

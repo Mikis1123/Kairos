@@ -74,6 +74,10 @@ RETRY_AFTER_S = 300
 SOCKET_TIMEOUT_S = 30.0
 SCHEMA_VERSION = 1                 # sync_log + triggers; bump = triggers are recreated
 MICRO_MAGIC = b"KMP1"
+# Phone -> desktop import: the formats scanner.SUPPORTED_EXTS indexes (a test pins the subset).
+IMPORT_EXTS = frozenset({".heic", ".jpg", ".jpeg", ".png", ".dng", ".mov", ".mp4"})
+IMPORT_MAX_BYTES = 8 * 1024 ** 3   # one 4K ProRes clip fits; anything bigger is a client bug
+INBOX_FOLDER_NAME = "Kairos iPhone"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # ── what is synced ────────────────────────────────────────────────────────────
@@ -376,6 +380,31 @@ def _write_json(path, data):
     fs_atomic.replace(tmp, path)
 
 
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                 *(f"LPT{i}" for i in range(1, 10))}
+
+
+def safe_import_name(name):
+    """The phone's file name made safe for the inbox: base name only, no path or control
+    characters, no Windows-reserved stem, a supported extension. "" = refuse."""
+    name = os.path.basename((name or "").replace("\\", "/")).strip()
+    name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", name).lstrip(". ")
+    stem, ext = os.path.splitext(name)
+    ext = ext.lower()
+    if ext not in IMPORT_EXTS:
+        return ""
+    stem = stem.rstrip(". ")[:100] or "IMG"
+    if stem.upper() in _WIN_RESERVED:
+        stem = "_" + stem
+    return stem + ext
+
+
+def default_inbox_dir():
+    """Where phone imports land: Pictures/Kairos iPhone/<YYYY-MM>/. The desktop adds it to the
+    library as a watched folder on the first import, so it behaves like any other folder."""
+    return os.path.join(os.path.expanduser("~"), "Pictures", INBOX_FOLDER_NAME)
+
+
 def ensure_certificate(state_dir):
     """(cert_path, key_path, sha256 fingerprint of the DER certificate as hex)."""
     from cryptography import x509
@@ -536,10 +565,12 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 class SyncServer:
     def __init__(self, host="0.0.0.0", port=DEFAULT_PORT, db_path=None, state_dir=None,
-                 packs_dir=None, micro_source=None, use_tls=True, name=None):
+                 packs_dir=None, micro_source=None, use_tls=True, name=None, inbox_dir=None):
         self.db_path = db_path or database.DB_PATH
         self.state_dir = state_dir or os.path.join(paths.DATA_DIR, "sync")
         self.packs_dir = packs_dir or paths.MAP_PACKS_DIR
+        self.inbox_dir = inbox_dir or default_inbox_dir()
+        self._import_lock = threading.Lock()
         self.micro_source = micro_source          # callable(ids) -> [(id, bytes)]; None = micro store
         self.name = name or socket.gethostname()
         os.makedirs(self.state_dir, exist_ok=True)
@@ -765,6 +796,11 @@ class SyncServer:
             return h.send_json({"packs": self.list_packs()})
         if len(parts) == 3 and parts[:2] == ["v1", "packs"] and method in ("GET", "HEAD"):
             return self._pack(h, parts[2])
+        if parts == ["v1", "import"] and method == "POST":
+            return h.send_json(self._import(h, dev))
+        if len(parts) == 3 and parts[:2] == ["v1", "import"] and method == "GET":
+            rel = self._imported(_sha_param(parts[2]))
+            return h.send_json({"status": "present" if rel else "absent", "name": rel})
         raise _HttpError(404, "not_found")
 
     # ── media ──
@@ -883,6 +919,93 @@ class SyncServer:
             return out
         finally:
             conn.close()
+
+    # ── phone -> desktop import ──
+    def _imports_db(self):
+        conn = sqlite3.connect(os.path.join(self.state_dir, "imports.sqlite"), timeout=30)
+        conn.execute("CREATE TABLE IF NOT EXISTS imports (sha256 TEXT PRIMARY KEY, rel_path TEXT NOT NULL, "
+                     "device_id TEXT, imported_at TEXT)")
+        return conn
+
+    def _imported(self, digest):
+        """Inbox-relative path of an earlier import with these bytes, or None. An entry whose
+        file the user has since moved or deleted no longer counts: the phone may send it again."""
+        with self._import_lock:
+            conn = self._imports_db()
+            try:
+                row = conn.execute("SELECT rel_path FROM imports WHERE sha256 = ?", (digest,)).fetchone()
+            finally:
+                conn.close()
+        if row and os.path.isfile(os.path.join(self.inbox_dir, row[0])):
+            return row[0].replace(os.sep, "/")
+        return None
+
+    def _import(self, h, dev):
+        """POST /v1/import?name=<file name>&sha256=<hex>, raw bytes as the body. Streams into
+        the inbox through a .partial file, verifies the SHA-256 and only then renames it into
+        place, so the desktop's scanner never sees half a file. Idempotent by content: a retry
+        after a dropped connection, or the same photo picked twice, answers "duplicate"."""
+        name = safe_import_name(h.query.get("name", ""))
+        if not name:
+            raise _HttpError(415, "unsupported_type")
+        digest = _sha_param(h.query.get("sha256", ""))
+        try:
+            size = int(h.headers.get("Content-Length") or -1)
+        except ValueError:
+            size = -1
+        if size <= 0:
+            raise _HttpError(411, "length_required")
+        if size > IMPORT_MAX_BYTES:
+            h.close_connection = True
+            raise _HttpError(413, "too_large")
+        partial = os.path.join(self.inbox_dir, ".partial")
+        os.makedirs(partial, exist_ok=True)
+        tmp = os.path.join(partial, uuid.uuid4().hex + ".part")
+        hasher = hashlib.sha256()
+        rel = None
+        try:
+            with open(tmp, "wb") as fh:
+                left = size
+                while left > 0:
+                    buf = h.rfile.read(min(CHUNK, left))
+                    if not buf:                          # the phone dropped off Wi-Fi mid-upload
+                        h.close_connection = True
+                        raise _HttpError(400, "short_body")
+                    hasher.update(buf)
+                    fh.write(buf)
+                    left -= len(buf)
+            if hasher.hexdigest() != digest:
+                raise _HttpError(422, "sha_mismatch")
+            known = self._imported(digest)
+            if known:
+                return {"status": "duplicate", "name": known}
+            with self._import_lock:
+                month = _dt.datetime.now().strftime("%Y-%m")
+                folder = os.path.join(self.inbox_dir, month)
+                os.makedirs(folder, exist_ok=True)
+                stem, ext = os.path.splitext(name)
+                final, n = os.path.join(folder, name), 2
+                while os.path.exists(final):
+                    final = os.path.join(folder, f"{stem} ({n}){ext}")
+                    n += 1
+                os.replace(tmp, final)
+                rel = os.path.relpath(final, self.inbox_dir)
+                conn = self._imports_db()
+                try:
+                    with conn:
+                        conn.execute("INSERT OR REPLACE INTO imports VALUES (?, ?, ?, ?)",
+                                     (digest, rel, dev.get("id", ""),
+                                      _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")))
+                finally:
+                    conn.close()
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        self._notify_gui("import", 0)
+        return {"status": "imported", "name": rel.replace(os.sep, "/")}
 
     # ── map packs ──
     def list_packs(self):
@@ -1071,6 +1194,13 @@ def _ws_recv(sock, cap=64 * 1024):
     return op, bytes(b ^ mask[i % 4] for i, b in enumerate(data))
 
 
+def _sha_param(text):
+    text = (text or "").strip().lower()
+    if len(text) != 64 or any(c not in "0123456789abcdef" for c in text):
+        raise _HttpError(400, "bad_sha256")
+    return text
+
+
 def _int(v, default=0):
     try:
         return int(v)
@@ -1098,7 +1228,8 @@ last_error = None               # why the last start() failed, for the Settings 
 
 def set_remote_change_handler(fn):
     """fn(kind, media_id), called on a request thread after the phone wrote an edit or a
-    favourite. Applies to the running service and to every later start()."""
+    favourite, or ("import", 0) after a camera-roll upload landed in the inbox.
+    Applies to the running service and to every later start()."""
     global _remote_handler
     _remote_handler = fn
     srv = _service

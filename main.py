@@ -5288,7 +5288,9 @@ class MainWindow(QMainWindow):
         sys.modules["sync_server"].set_remote_change_handler(bridge.changed.emit)
 
     def _on_remote_change(self, kind, media_id):
-        if kind == "edit":
+        if kind == "import":
+            self._on_phone_import()
+        elif kind == "edit":
             self._on_edit_saved(media_id)
         elif kind == "favorite":
             try:
@@ -5302,6 +5304,28 @@ class MainWindow(QMainWindow):
                 return
             if row is not None:
                 self._on_favorite_changed(int(media_id), int(row[0] or 0))
+
+    def _on_phone_import(self):
+        """Camera-roll uploads from the phone landed in the inbox (Pictures/Kairos iPhone). A
+        batch arrives as many quick uploads, so they are coalesced into one incremental scan.
+        The first import makes the inbox a watched library folder; from then on it is an
+        ordinary folder, and the new media reach the phone through the journal like any other."""
+        timer = getattr(self, "_phone_import_timer", None)
+        if timer is None:
+            timer = self._phone_import_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(1500)
+            timer.timeout.connect(self._scan_phone_inbox)
+        timer.start()
+
+    def _scan_phone_inbox(self):
+        srv = sys.modules["sync_server"].service() if "sync_server" in sys.modules else None
+        if srv is None or not os.path.isdir(srv.inbox_dir):
+            return
+        inbox = srv.inbox_dir
+        if not self._is_watched(inbox):
+            self.watch_folders([inbox])
+        self._enqueue_background_import([inbox], skip_running=False)
 
     def _on_edit_saved(self, media_id):
         """The viewer saved / reverted a Quick Edit: refresh that tile in every grid."""

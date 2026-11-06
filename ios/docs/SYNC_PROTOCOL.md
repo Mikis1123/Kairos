@@ -37,6 +37,8 @@ Contract tests: `test_ios_sync.py` writes `KairosCore/Tests/KairosCoreTests/Fixt
 | GET | `/v1/face/{id}/crop` | face crop JPEG |
 | GET | `/v1/packs` | offline MBTiles region packs `{id, file, size, mtime, title, format, source, bounds, minzoom, maxzoom}` |
 | GET | `/v1/packs/{id}` | pack bytes with Range (resumable) |
+| GET | `/v1/import/{sha256}` | `{status: present|absent, name}`: pre-check before sending a camera-roll file |
+| POST | `/v1/import?name=&sha256=` | raw file bytes (Content-Length required, ≤ 8 GB). See below |
 
 ## Incremental sync
 
@@ -78,6 +80,15 @@ Client loop:
 - Phone writes reach the desktop GUI through `sync_server.set_remote_change_handler`. main.py routes them to the same grid refresh as a local Quick Edit or favourite.
 - Thumbnails and originals are served unedited, and the client applies the edit. Micro previews are the exception: the desktop bakes the edit into them.
 
+## Phone → desktop import
+
+- The phone picks photos/videos with `PHPickerViewController` (no Photos permission, originals as shot) and queues them in an on-disk outbox (`ImportQueue`). One upload at a time; offline items wait until sync is live again.
+- `POST /v1/import` streams into `Pictures/Kairos iPhone/.partial/`, verifies the SHA-256 and only then renames the file into `Pictures/Kairos iPhone/<YYYY-MM>/<name>`. A name clash with different bytes gets ` (2)`.
+- Idempotent by content (`sync/imports.sqlite`): the same bytes answer `{"status":"duplicate"}`. An entry whose file was moved or deleted no longer counts.
+- Accepted: `.heic .jpg .jpeg .png .dng .mov .mp4` (a subset of `scanner.SUPPORTED_EXTS`, pinned by `test_ios_import.py`); others get 415. Bad hash → 422, the phone resends (5 tries).
+- Each landed file calls `on_remote_change("import", 0)`. The desktop coalesces a batch (1.5 s), makes the inbox a watched library folder on first use and runs an incremental scan. The new media then reach the phone through the journal like any other.
+- Live Photos arrive as the still only: the motion half needs PhotoKit library access, which the permission-free picker avoids.
+
 ## Power and idle behaviour
 
 - Everything runs on daemon threads. Nothing touches the Qt GUI thread. Writes call `on_remote_change(kind, media_id)` so the desktop can refresh.
@@ -86,4 +97,4 @@ Client loop:
 
 ## Planned for protocol 2
 
-`/v1/search` (CLIP/SigLIP on the desktop), Journey film manifests, Hidden-folder sync with its own key exchange, Bonjour discovery, phone → desktop import, and push through a relay when the PC is asleep.
+`/v1/search` (CLIP/SigLIP on the desktop), Journey film manifests, Hidden-folder sync with its own key exchange, Bonjour discovery, and push through a relay when the PC is asleep.

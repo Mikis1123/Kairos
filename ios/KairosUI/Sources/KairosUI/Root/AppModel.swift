@@ -16,6 +16,11 @@ public final class AppModel {
     public private(set) var revision = 0
     public private(set) var storeError: String?
     public let images = ImageLoader()
+    /// Camera-roll uploads waiting for (or on their way to) the desktop.
+    public private(set) var importProgress = ImportQueue.Progress()
+    /// Face ID / passcode session for the Hidden folder.
+    public let vault: VaultAuth
+    private var imports: ImportQueue?
     private var engine: SyncEngine?
 
     private static let endpointKey = "kairos.desktop.endpoint"
@@ -27,6 +32,7 @@ public final class AppModel {
     }
 
     public init() {
+        vault = VaultAuth()
         do {
             let dir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                                   appropriateFor: nil, create: true)
@@ -35,6 +41,16 @@ public final class AppModel {
             storeError = String(describing: error)
         }
         images.store = store
+        if let dir = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                  appropriateFor: nil, create: true),
+           let q = try? ImportQueue(directory: dir.appendingPathComponent("Kairos/Outbox")) {
+            imports = q
+            Task {
+                await q.observe { [weak self] p in
+                    Task { @MainActor in self?.importProgress = p }
+                }
+            }
+        }
         if let data = UserDefaults.standard.data(forKey: Self.endpointKey),
            let ep = try? JSONDecoder().decode(DesktopEndpoint.self, from: data),
            let token = Keychain.load(account: ep.deviceId) {
@@ -56,7 +72,10 @@ public final class AppModel {
         engine = e
         Task {
             await e.observe(status: { [weak self] s in
-                Task { @MainActor in self?.status = s }
+                Task { @MainActor in
+                    self?.status = s
+                    if s == .live { self?.sendImports() }   // desktop reachable: flush the outbox
+                }
             }, changes: { [weak self] applied in
                 Task { @MainActor in
                     self?.images.invalidate(applied.editsChanged)
@@ -85,6 +104,8 @@ public final class AppModel {
         if let engine { await engine.stop() }
         try? await client?.unpair()
         if let ep = endpoint { Keychain.delete(account: ep.deviceId) }
+        await imports?.removeAll()
+        vault.lock()
         UserDefaults.standard.removeObject(forKey: Self.endpointKey)
         try? store?.reset()
         engine = nil
@@ -108,6 +129,26 @@ public final class AppModel {
         }
         if let rendered { images.rebakeMicro(id, from: rendered) }
         revision += 1
+    }
+
+    /// Queues picked camera-roll files (already staged in tmp) and starts sending them. Offline,
+    /// they wait in the outbox until the desktop is reachable again.
+    public func importPicked(_ files: [(file: URL, name: String)]) async {
+        guard let imports else { return }
+        for f in files {
+            do {
+                try await imports.enqueue(moving: f.file, name: f.name)
+            } catch {
+                try? FileManager.default.removeItem(at: f.file)
+            }
+        }
+        sendImports()
+    }
+
+    /// Starts draining the outbox if paired; a no-op while a drain is already running.
+    public func sendImports() {
+        guard let imports, let client else { return }
+        Task.detached(priority: .utility) { await imports.drain(using: client) }
     }
 
     /// Phone edits not yet acknowledged by the desktop.

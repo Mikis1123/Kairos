@@ -30,6 +30,13 @@ enum Haptics {
         #endif
     }
 
+    /// A scan or an unlock went through.
+    static func success() {
+        #if os(iOS)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        #endif
+    }
+
     static func prepare() {
         #if os(iOS)
         selection.prepare()

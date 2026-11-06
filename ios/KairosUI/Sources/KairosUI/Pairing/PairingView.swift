@@ -12,6 +12,7 @@ struct PairingView: View {
     @State private var link = ""
     @State private var busy = false
     @State private var error: String?
+    @State private var scanning = false
 
     var body: some View {
         VStack(spacing: Kairos.Space.xl) {
@@ -26,13 +27,13 @@ struct PairingView: View {
                     .foregroundStyle(Kairos.Palette.textSecondary)
                     .multilineTextAlignment(.center)
             }
-            Button {} label: {
+            Button { scanning = true } label: {
                 Label("Scan pairing code", systemImage: "qrcode.viewfinder").frame(maxWidth: .infinity)
                     .padding(.vertical, Kairos.Space.sm)
             }
             .buttonStyle(.borderedProminent)
             .tint(Kairos.Palette.accentFill)
-            .disabled(true)                     // VisionKit DataScanner: next batch
+            .disabled(busy || !Self.canScan)
             VStack(alignment: .leading, spacing: Kairos.Space.sm) {
                 TextField("kairos://pair?…", text: $link, axis: .vertical)
                     .font(.system(.footnote, design: .monospaced))
@@ -59,6 +60,24 @@ struct PairingView: View {
         .padding(Kairos.Space.xl)
         .background(Kairos.Palette.background.ignoresSafeArea())
         .preferredColorScheme(.dark)
+        #if os(iOS)
+        .fullScreenCover(isPresented: $scanning) {
+            QRScannerView { uri in
+                // the scanner only hands over codes that parse as a kairos://pair offer
+                link = uri
+                Task { await pair() }
+            }
+        }
+        #endif
+    }
+
+    /// The simulator and camera-less devices fall back to pasting the link.
+    private static var canScan: Bool {
+        #if os(iOS) && !targetEnvironment(simulator)
+        return true
+        #else
+        return false
+        #endif
     }
 
     private func pair() async {

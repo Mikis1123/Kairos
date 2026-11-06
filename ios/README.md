@@ -39,6 +39,17 @@ brew install xcodegen && xcodegen  # -> Kairos.xcodeproj
 open Kairos.xcodeproj              # run the "Kairos" scheme on an iPhone (iOS 17+)
 ```
 
+## Build without a Mac (GitHub Actions + Sideloadly)
+
+`.github/workflows/ios.yml` runs on a GitHub macOS runner for every push or PR to `main` that touches `ios/**`, and on demand (Actions › iOS › Run workflow). It runs the KairosCore contract tests on an iOS Simulator, generates the project with XcodeGen, builds an unsigned Release app for real devices and uploads `Kairos-unsigned.ipa` as the run's artifact (kept 14 days).
+
+1. Push to GitHub, open the finished run under Actions › iOS and download **Kairos-unsigned-ipa** (a zip holding the .ipa).
+2. On Windows, install iTunes (or the Apple Devices app) and [Sideloadly](https://sideloadly.io). Connect the iPhone by USB and trust the computer.
+3. Drag the .ipa into Sideloadly, sign in with your Apple ID and start. Sideloadly re-signs the app with your own certificate.
+4. On the iPhone: Settings › General › VPN & Device Management › trust your Apple ID. iOS 16+ also needs Settings › Privacy & Security › Developer Mode on (one restart).
+
+A free Apple ID signs for 7 days (re-sideload weekly, max 3 apps); a paid developer account signs for a year. The bundle id `app.kairos.ios` may be rewritten by Sideloadly; the app does not depend on it.
+
 ## Try it against your desktop library
 
 ```sh

@@ -11,6 +11,9 @@ struct LibraryGridView: View {
     @State private var favoritesOnly = false
     @State private var items: [LibraryStore.TimelineEntry] = []
     @State private var viewer: ViewerRoute?
+    @State private var picking = false
+    @State private var showHidden = false
+    @State private var importNote: String?
 
     private static let minColumns = 3, maxColumns = 7
 
@@ -28,11 +31,17 @@ struct LibraryGridView: View {
             .navigationTitle("Library")
             .toolbar {
                 ToolbarItem(placement: .principal) { SyncBadge() }
+                #if os(iOS)
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { picking = true } label: { Image(systemName: "plus") }
+                        .disabled(!model.isPaired)
+                        .accessibilityLabel("Send photos from iPhone to your computer")
+                }
+                #endif
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
                         Toggle("Favourites only", isOn: $favoritesOnly)
-                        Button("Hidden folder", systemImage: "lock") {}
-                            .disabled(true)            // Phase 2: vault key exchange
+                        Button("Hidden folder", systemImage: "lock") { showHidden = true }
                         if model.isPaired {
                             Button("Unpair this iPhone", systemImage: "link.badge.plus", role: .destructive) {
                                 Task { await model.unpair() }
@@ -43,12 +52,52 @@ struct LibraryGridView: View {
             }
             .kairosNavigationChrome()
             .background(Kairos.Palette.background)
+            .safeAreaInset(edge: .bottom) { importPill }
         }
+        #if os(iOS)
+        .sheet(isPresented: $picking) {
+            PhotoPicker(onPicked: { picked, skipped in
+                importNote = skipped > 0 ? "\(skipped) item(s) couldn't be read" : nil
+                Task { await model.importPicked(picked.map { (file: $0.file, name: $0.name) }) }
+            }, close: { picking = false })
+            .ignoresSafeArea()
+        }
+        #endif
+        .sheet(isPresented: $showHidden) { HiddenFolderView() }
         .task(id: TaskKey(revision: model.revision, favorites: favoritesOnly)) {
             items = model.store?.timeline(favoritesOnly: favoritesOnly) ?? []
         }
         .fullScreenCoverCompat(item: $viewer) { route in
             ViewerView(ids: route.ids, start: route.start)
+        }
+    }
+
+    /// "Sending 3 to DESKTOP…" while camera-roll uploads are queued; hidden otherwise.
+    @ViewBuilder
+    private var importPill: some View {
+        let p = model.importProgress
+        if p.pending > 0 || importNote != nil || !p.rejected.isEmpty {
+            HStack(spacing: Kairos.Space.sm) {
+                if p.pending > 0 {
+                    if p.uploading != nil { ProgressView().controlSize(.small) }
+                    else { Image(systemName: "icloud.and.arrow.up") }
+                    Text(p.uploading != nil ? "Sending \(p.pending) to \(model.endpoint?.name ?? "your computer")…"
+                                            : "\(p.pending) waiting for your computer")
+                } else if !p.rejected.isEmpty {
+                    Image(systemName: "exclamationmark.triangle")
+                    Text("\(p.rejected.count) not sent (unsupported format)")
+                } else if let importNote {
+                    Image(systemName: "exclamationmark.triangle")
+                    Text(importNote)
+                }
+            }
+            .font(Kairos.Typography.caption)
+            .foregroundStyle(Kairos.Palette.text)
+            .padding(.horizontal, Kairos.Space.md)
+            .padding(.vertical, Kairos.Space.sm)
+            .background(.ultraThinMaterial, in: Capsule())
+            .padding(.bottom, Kairos.Space.sm)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }
 
