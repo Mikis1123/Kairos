@@ -6,6 +6,7 @@
  * OpenFreeMap "liberty" style through the same pure transforms defined here:
  *   localize (labels in the app language, null-safe numeric filters)
  *   guardBuildings (null building heights)
+ *   flatBuildings (low-spec GPUs: 3D extrusions -> flat footprints)
  *   pastelize (soft parks / woods so photos and routes stand out)
  * Pure functions only – no map, no DOM – so both pages (and tests) can call them.
  */
@@ -79,6 +80,26 @@
     return style;
   }
 
+  // Low-spec GPUs (Sprint 4, perf_profile map_buildings_3d = false): 3D extrusions are the most
+  // expensive layer at street zoom (a depth pass, side walls, under terrain a render-to-texture
+  // of every building). They become flat footprints in the same colour: a plain fill, one pass.
+  function flatBuildings(style) {
+    style.layers = style.layers.map(function (l) {
+      if (l.type !== 'fill-extrusion') return l;
+      var p = l.paint || {}, op = p['fill-extrusion-opacity'];
+      var flat = { id: l.id, type: 'fill', source: l.source, paint: {
+        'fill-color': p['fill-extrusion-color'] !== undefined ? p['fill-extrusion-color'] : '#D9D0C9',
+        'fill-opacity': typeof op === 'number' ? Math.min(1, op) : 0.8,
+        'fill-antialias': false } };
+      ['source-layer', 'minzoom', 'maxzoom', 'filter', 'metadata'].forEach(function (k) {
+        if (l[k] !== undefined) flat[k] = l[k];
+      });
+      if (l.layout && l.layout.visibility) flat.layout = { visibility: l.layout.visibility };
+      return flat;
+    });
+    return style;
+  }
+
   // The Standard base map exactly as the main map draws it (minus globe / relief / underlay)
   function standard(style, nameExpr) {
     return pastelize(guardBuildings(localize(style, nameExpr)));
@@ -106,7 +127,8 @@
   root.KairosMapStyle = {
     STYLE_URL: STYLE_URL, STYLE_CACHE_KEY: STYLE_CACHE_KEY,
     clone: clone, nameField: nameField, isNameField: isNameField, guardNumericFilter: guardNumericFilter,
-    localize: localize, pastelize: pastelize, guardBuildings: guardBuildings, standard: standard,
+    localize: localize, pastelize: pastelize, guardBuildings: guardBuildings, flatBuildings: flatBuildings,
+    standard: standard,
     validStyle: validStyle, storeUrl: storeUrl, makeStore: makeStore
   };
 })(typeof window !== 'undefined' ? window : this);

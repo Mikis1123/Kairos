@@ -37,6 +37,8 @@ def test_vblank_ticks_at_the_display_rate():
     wait = kinetic_scroll._VBlank.open()
     if wait is None:
         pytest.skip("no D3DKMT vblank on this platform")
+    if not wait():
+        pytest.skip("vblank wait fails: the display is asleep / off (the tickers fall back)")
     ts = []
     for _ in range(30):
         assert wait()
@@ -61,9 +63,59 @@ def test_vsync_ticker_coalesces_and_stops():
     time.sleep(0.05)                  # GUI thread busy: no events processed
     _app.processEvents()
     assert len(calls) == 1, "ticks coalesce while the GUI thread is busy (no backlog)"
+    th = t._thread
     t.stop()
     time.sleep(0.01)
-    assert not t._thread.is_alive(), "thread ends when the glide settles"
+    assert th.is_alive(), "lingers briefly: the next fling of a burst reuses it"
+    th.join(kinetic_scroll._VsyncTicker.LINGER_S + 1.0)
+    assert not th.is_alive() and t._thread is None, "thread ends after the linger"
+
+
+def test_vsync_ticker_keeps_gliding_when_the_vblank_is_lost():
+    """D3DKMT wait failing (display asleep, dock / undock) used to end the glide after one frame."""
+    import time
+    import kinetic_scroll
+    calls, opens = [], []
+
+    def dead():
+        return False
+
+    def alive():
+        time.sleep(0.004)
+        return True
+    t = kinetic_scroll._VsyncTicker(lambda: calls.append(1), dead, reopen=lambda: opens.append(1) or alive)
+    t.REOPEN_S = 0.05
+    t.start()
+    end = time.perf_counter() + 0.25
+    while time.perf_counter() < end:
+        _app.processEvents()
+        time.sleep(0.005)
+    assert t.running() and len(calls) > 5, len(calls)
+    assert opens and t._wait is alive, "the adapter is re-opened"
+    t.stop()
+
+
+def test_vsync_ticker_stop_start_never_runs_two_threads():
+    """stop() + start() within one vblank used to leave the old loop alive AND start a new one."""
+    import threading
+    import time
+    import kinetic_scroll
+
+    def wait():
+        time.sleep(0.004)
+        return True
+    before = set(threading.enumerate())          # earlier tests' tickers may still linger
+    t = kinetic_scroll._VsyncTicker(lambda: None, wait)
+    for _ in range(40):
+        t.start()
+        t.stop()
+        t.start()
+    time.sleep(0.02)
+    vs = [th for th in threading.enumerate() if th.name == "kairos-vsync" and th not in before]
+    assert len(vs) == 1, vs
+    t.stop()
+    vs[0].join(kinetic_scroll._VsyncTicker.LINGER_S + 1.0)
+    assert not vs[0].is_alive()
 
 
 def test_frame_ticker_follows_the_screen_refresh():
@@ -215,3 +267,61 @@ def test_loading_tiles_blit_a_cached_placeholder():
     b = deleg._placeholder_tile(QSize(195, 195), 13.65, 2.0)
     assert a is b and a.width() == 390
     view.deleteLater()
+
+
+def test_a_raising_decode_is_retried_then_marked_unavailable(monkeypatch):
+    """Torture test 2026-11-06: an exception inside the decode used to leave the id in flight
+    for the session (never re-requested: a permanent placeholder tile)."""
+    import main
+    model = main.ApplePhotoModel()
+    rec = (9, "b.jpg", "C:/x/b.jpg", "photo", None, "C:/x/tb.jpg", "2026-01-01 10:00:00", 0)
+    model.set_records([rec])
+    calls = []
+
+    def boom(self):
+        calls.append(self.item_id)
+        raise MemoryError("decode under pressure")
+    monkeypatch.setattr(main.ThumbnailWorker, "_decode", boom)
+    monkeypatch.setattr("builtins.print", lambda *a, **k: None)
+    for attempt in range(main.THUMB_ABORT_RETRIES + 1):
+        model.loading_ids.add(9)
+        model._queued.add(9)
+        w = main.ThumbnailWorker(9, rec[5], rec[2], 200, model._signals)
+        w.run()                                       # inline: queue None -> its own decode
+        _app.processEvents()
+        if attempt < main.THUMB_ABORT_RETRIES:
+            assert 9 not in model.loading_ids and 9 not in model._queued, "free to be requested again"
+            assert 9 not in model.failed
+    assert model.failed.get(9) == main.THUMB_UNAVAILABLE, "a deterministic error stops retrying"
+    assert len(calls) == main.THUMB_ABORT_RETRIES + 1
+
+
+def test_map_refresh_builds_its_payload_off_the_gui_thread(monkeypatch):
+    """Torture test 2026-11-06: _refresh_map built 20k markers + a 4.8 MB JSON on the GUI thread
+    (2-7 s freeze when the background-warmed map finished loading under a fling)."""
+    import threading
+    import time
+    from unittest import mock
+    import bg_jobs
+    import main
+    monkeypatch.setattr(bg_jobs, "SYNC", False)
+    seen = {}
+
+    def payload():
+        seen["build"] = threading.get_ident()
+        return "window.setMarkers && window.setMarkers([]);", None
+    monkeypatch.setattr(main, "map_refresh_payload", payload)
+    fake = mock.MagicMock()
+    fake.map_view = mock.MagicMock()
+    fake._map_loaded = True
+    bg = bg_jobs.BackgroundLoads()
+    fake._bg_loads = lambda: bg
+    fake._send_map_payload = main.MainWindow._send_map_payload.__get__(fake)
+    main.MainWindow._refresh_map(fake)
+    t0 = time.perf_counter()
+    while not fake.map_view.page().runJavaScript.called and time.perf_counter() - t0 < 3:
+        _app.processEvents()
+        time.sleep(0.005)
+    assert seen["build"] != threading.get_ident(), "payload built on a worker thread"
+    fake.map_view.page().runJavaScript.assert_called_once_with("window.setMarkers && window.setMarkers([]);")
+

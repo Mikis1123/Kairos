@@ -1341,7 +1341,12 @@ class _SlideLoader(QRunnable):
         self.signals = _SlideSignals()
 
     def run(self):
-        self.signals.ready.emit(self.token, self.index, load_slide_image(self.record, self.max_size))
+        try:
+            img = load_slide_image(self.record, self.max_size)
+        except Exception as e:                       # noqa: BLE001 – a slide never stays "loading"
+            print(f"[Slideshow] {e}")
+            img = QImage()
+        self.signals.ready.emit(self.token, self.index, img)
 
 
 class SlideshowView(QWidget):

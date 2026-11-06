@@ -15,7 +15,12 @@ What it does
   * MapJobs (one background job at a time, plain threads, the GUI only polls state()):
       - precache: the plan above, through TileServer.resolve on PRECACHE_WORKERS threads in the
         "background" upstream lane (BACKGROUND_PER_HOST per server), EcoQoS threads
-      - region: a bulk download of a REGIONS bounding box into a new MBTiles pack
+      - region: a bulk download of a REGIONS region (a country / territory or a continent, one
+        or more boxes from the world_regions catalogue) into a new MBTiles pack, z0 to the chosen
+        detail; refused above tile_store.MAX_REGION_TILES
+      - world base (Sprint 4): before the photo plan, the whole world z0..WORLD_ZMAX goes into its
+        own pack (tile_store.WORLD_PACK) once, so the globe is never blank offline. A pack is
+        outside the LRU budget: a full store can never evict the overview.
       - clear: empties the store (DELETE + VACUUM on the store's writer thread)
     Each worker checks before every tile: the user is interacting (governor busy) -> wait;
     metered connection -> wait; on battery (automatic runs, policy not "full") -> wait;
@@ -406,11 +411,12 @@ class MapJobs:
 
     # ── precache ──
     def start_precache(self, manual=False, layer="standard", dpr=1.0, hidpi_raster=False,
-                       budget_mb=tile_store.DEFAULT_BUDGET_MB, policy=power.DEFAULT_POLICY, places=None):
+                       budget_mb=tile_store.DEFAULT_BUDGET_MB, policy=power.DEFAULT_POLICY, places=None,
+                       world=False):
         """Photo places -> tile store. places: tests pass them in, otherwise read from the DB
-        inside the job thread."""
+        inside the job thread. world: first build the world-base pack when it is missing."""
         opts = dict(manual=manual, layer=layer, dpr=dpr, hidpi_raster=hidpi_raster, budget_mb=budget_mb,
-                    policy=policy, places=places)
+                    policy=policy, places=places, world=world)
         return self._start("precache", lambda: self._precache(**opts), manual=bool(manual))
 
     def _read_places(self):
@@ -433,11 +439,17 @@ class MapJobs:
             data = zlib.decompress(data, 47)
         return json.loads(data.decode("utf-8"))
 
-    def _precache(self, manual, layer, dpr, hidpi_raster, budget_mb, policy, places):
+    def _precache(self, manual, layer, dpr, hidpi_raster, budget_mb, policy, places, world=False):
         srv = self._service_factory(budget_mb)
         if srv is None:
             raise RuntimeError("tile store unavailable")
         srv.store.ready.wait(30)
+        if world and not world_base_installed(srv):
+            if not self._world_base(srv, manual, policy):
+                return                          # offline / cancelled: the next run tries again
+            with self._lock:                    # the pack step ended DONE; the job goes on
+                self._state.update(stage="photos", done=0, skipped=0, failed=0, bytes=0, total=0,
+                                   phase=PREPARING, pack="")
         if places is None:
             places = self._read_places()
         self._set(places=len(places))
@@ -468,6 +480,11 @@ class MapJobs:
         fails = [0]
         cap = srv.store.budget * PRECACHE_BUDGET_SHARE
         end = threading.Event()
+        # store.bytes is counted by the store's writer thread, after the fact: four workers would
+        # overshoot the cap by the queue's lag. Count our own fetched bytes too (upper bound).
+        base = srv.store.bytes
+        fetched = [0]
+        fetched_lock = threading.Lock()
 
         def worker():
             power.set_thread_eco(True)                 # efficiency cores, lower clock (Windows 11)
@@ -481,7 +498,7 @@ class MapJobs:
                 if srv.has_tile(key):
                     self._bump(skipped=1)
                     continue
-                if srv.store.bytes >= cap:
+                if max(srv.store.bytes, base + fetched[0]) >= cap:
                     self._set(phase=BUDGET)
                     end.set()
                     return
@@ -491,6 +508,8 @@ class MapJobs:
                     status, data = 599, b""
                 if status == 200:
                     fails[0] = 0
+                    with fetched_lock:
+                        fetched[0] += len(data or b"")
                     self._bump(done=1, bytes=len(data or b""))
                 elif status in (502, 504, 599):
                     fails[0] += 1
@@ -513,27 +532,40 @@ class MapJobs:
 
     # ── region packs ──
     def start_region(self, region, zmax=tile_store.REGION_ZMAX, title="", budget_mb=tile_store.DEFAULT_BUDGET_MB):
-        bbox = tile_store.REGIONS.get(region)
-        if bbox is None:
+        """A REGIONS id -> one MBTiles pack z0..zmax. False: unknown, or above MAX_REGION_TILES."""
+        boxes = tile_store.region_boxes(tile_store.REGIONS.get(region))
+        if not boxes or not tile_store.region_fits(boxes, zmax):
             return False
-        tiles, size = tile_store.estimate_region(bbox, zmax)
-        return self._start("region", lambda: self._region(region, bbox, zmax, title or region, budget_mb),
+        tiles, size = tile_store.estimate_region(boxes, zmax)
+        return self._start("region", lambda: self._region(region, boxes, zmax, title or region, budget_mb),
                            region=region, total=tiles, estimate=size)
 
     def _region(self, region, bbox, zmax, title, budget_mb):
         srv = self._service_factory(budget_mb)
         if srv is None:
             raise RuntimeError("tile store unavailable")
-        if not self._gate(True, "full"):
-            return
+        self._build_pack(srv, f"region-{region}", bbox, zmax, title, True, "full")
+
+    def _world_base(self, srv, manual, policy):
+        """The world z0..WORLD_ZMAX into tile_store.WORLD_PACK. True when it is in place."""
+        total, size = tile_store.estimate_region(tile_store.WORLD_BOX, tile_store.WORLD_ZMAX)
+        self._set(stage="world", total=total, estimate=size)
+        return self._build_pack(srv, tile_store.WORLD_PACK, tile_store.WORLD_BOX, tile_store.WORLD_ZMAX,
+                                "World", manual, policy)
+
+    def _build_pack(self, srv, name, bbox, zmax, title, manual, policy):
+        """Downloads a region (one box or a list) z0..zmax into packs/<name>.mbtiles. The pack
+        appears only when complete (staging file + rename). True = done."""
+        if not self._gate(manual, policy):
+            return False
         try:
             vec = vector_source(self._vector_tilejson(srv))
         except (OSError, ValueError) as e:
             self._set(phase=OFFLINE, reason=str(e))
-            return
+            return False
         if vec is None:
             self._set(phase=FAILED, reason="no vector source")
-            return
+            return False
         self._set(phase=RUNNING)
         fails = [0]
         offline = threading.Event()
@@ -554,7 +586,7 @@ class MapJobs:
             todo = tile_store.region_tiles(bbox, 0, min(zmax, vec.maxz))
             with ThreadPoolExecutor(REGION_WORKERS, thread_name_prefix="map-region-fetch") as pool:
                 while True:
-                    if not self._gate(True, "full"):         # waits while the user interacts
+                    if not self._gate(manual, policy):       # waits while the user interacts
                         raise InterruptedError("stopped")
                     chunk = [t for _, t in zip(range(REGION_CHUNK), todo)]
                     if not chunk:
@@ -573,19 +605,20 @@ class MapJobs:
 
         packs = srv.packs if srv.packs is not None else tile_store.PackManager()
         os.makedirs(packs.dir, exist_ok=True)
-        name = f"region-{region}"
         path = os.path.join(packs.dir, name + tile_store.PACK_SUFFIX)
         staging = path + ".new"             # not *.mbtiles: never picked up half-written
         try:
-            tile_store.write_pack(staging, "openmaptiles", "pbf", tiles(), title=title, bounds=bbox,
+            tile_store.write_pack(staging, "openmaptiles", "pbf", tiles(), title=title,
+                                  bounds=tile_store.region_bounds(bbox),
                                   minzoom=0, maxzoom=min(zmax, vec.maxz), should_stop=self._stop.is_set)
         except InterruptedError:
             self._set(phase=OFFLINE if offline.is_set() else CANCELLED)
-            return
+            return False
         packs.remove(name)                  # an older copy is open for reading: close it first
         os.replace(staging, path)
         packs.scan()
         self._set(phase=DONE, pack=os.path.basename(path))
+        return True
 
     def remove_pack(self, name):
         srv = tile_store.service()
@@ -615,6 +648,19 @@ class MapJobs:
                 raise RuntimeError("clear timed out")
             self._set(phase=DONE)
         return self._start("clear", run)
+
+
+def world_base_installed(srv=None):
+    """The world-base pack is on disk (GUI-thread safe). With a live service the pack must also
+    reach WORLD_ZMAX: an older, shallower world pack (z0-5) is rebuilt once at the new depth."""
+    packs = getattr(srv, "packs", None) if srv is not None else None
+    folder = packs.dir if packs is not None else tile_store.packs_dir()
+    if not os.path.isfile(os.path.join(folder, tile_store.WORLD_PACK + tile_store.PACK_SUFFIX)):
+        return False
+    if packs is None:
+        return True
+    info = [p for p in packs.list() if p["name"] == tile_store.WORLD_PACK]
+    return bool(info) and int(info[0].get("maxzoom") or 0) >= tile_store.WORLD_ZMAX
 
 
 def tile_store_source_imagery(offset):

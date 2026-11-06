@@ -43,6 +43,11 @@
   @keyframes maploading-spin { to { transform: rotate(360deg); } }
   .glass { background: var(--glass); border: 1px solid var(--hair); box-shadow: 0 8px 28px rgba(0,0,0,0.45);
            backdrop-filter: blur(18px) saturate(1.4); -webkit-backdrop-filter: blur(18px) saturate(1.4); }
+  /* Low-spec GPU (perf_profile map_lite_ui): a backdrop blur over the WebGL canvas re-blurs the
+     panel's area on every map frame and soft shadows add a pass each; solid panels instead */
+  body.lite-gpu .glass, body.lite-gpu .maplibregl-ctrl-group {
+    backdrop-filter: none !important; -webkit-backdrop-filter: none !important;
+    background: rgba(24,25,30,0.94) !important; box-shadow: none !important; }
   button { font: inherit; }
   button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
@@ -682,8 +687,9 @@
 
   window.buildVectorStyle = function (name) {      // i pro testy: výsledný styl podkladu (bez zeměkoule)
     if (!vectorStyle) return null;
-    return name === 'satellite' ? satelliteStyle(vectorStyle)
-                                : pastelize(guardBuildings(localizeStyle(vectorStyle)));
+    if (name === 'satellite') return satelliteStyle(vectorStyle);
+    var s = pastelize(guardBuildings(localizeStyle(vectorStyle)));
+    return PERF.map_buildings_3d === false ? MS.flatBuildings(s) : s;   // low-spec GPU (perf_profile)
   };
 
   function rasterStyle(name) {
@@ -1213,7 +1219,9 @@
       map = new maplibregl.Map({
         container: mapEl, style: built.style, center: [15.5, 49.8], zoom: GLOBE_ZOOM,
         maxZoom: BASE_LAYERS[baseName].maxZoom, maxPitch: MAX_PITCH, attributionControl: { compact: true },
-        fadeDuration: 180, canvasContextAttributes: { antialias: true }, transformRequest: transformRequest,
+        // MSAA off on a low-spec GPU (perf_profile map_lite_ui): a 4x multisampled framebuffer and
+        // its resolve every frame cost an Intel UHD more than the whole vector layer stack
+        fadeDuration: 180, canvasContextAttributes: { antialias: !PERF.map_lite_ui }, transformRequest: transformRequest,
         maxTileCacheZoomLevels: TILE_CACHE_ZOOM_LEVELS
       });
     } catch (e) {
@@ -1899,7 +1907,14 @@
   // grafice), v klidu se vrátí na plnou ostrost. LOD dlaždic a terén podle úrovně stroje.
   var PERF = { tier: 'high', refresh_hz: 60, map_pixel_ratio_max: 0, map_pixel_ratio_min: 1.25,
                map_lod_levels: TILE_LOD_ZOOM_LEVELS, map_lod_ratio: TILE_LOD_RATIO, map_terrain: true,
-               map_terrain_exaggeration: TERRAIN_EXAGGERATION, map_hillshade: true, map_hidpi_raster: false };
+               map_terrain_exaggeration: TERRAIN_EXAGGERATION, map_hillshade: true, map_hidpi_raster: false,
+               // Sprint 4 low-spec GPU (perf_profile.classify_gpu): flat buildings, no glass blur / shadows
+               map_buildings_3d: true, map_lite_ui: false, gpu: '' };
+  (function (boot) {                  // main.py init script: the profile before the map exists
+    if (!boot || typeof boot !== 'object') return;
+    Object.keys(PERF).forEach(function (k) { if (boot[k] !== undefined) PERF[k] = boot[k]; });
+    if (document.body) document.body.classList.toggle('lite-gpu', !!PERF.map_lite_ui);
+  })(window.KAIROS_PERF_BOOT);
   var RES_STEP = 0.25, RES_SLOW = 1.35, RES_FAST = 0.9, RES_HOLD_MS = 900, RES_REST_MS = 220;
   var res = { ratio: 0, ema: 0, lastFrame: 0, slowSince: 0, fastSince: 0, changedAt: 0, restTimer: 0 };
   function nativeRatio() { return window.devicePixelRatio || 1; }
@@ -2430,9 +2445,13 @@
 
   window.setPerfProfile = function (p) {
     if (!p || typeof p !== 'object') return PERF.tier;
-    var hidpi = PERF.map_hidpi_raster;
+    var hidpi = PERF.map_hidpi_raster, b3d = PERF.map_buildings_3d !== false;
     Object.keys(PERF).forEach(function (k) { if (p[k] !== undefined) PERF[k] = p[k]; });
-    if (map && styleReady && !!hidpi !== !!PERF.map_hidpi_raster) {
+    document.body.classList.toggle('lite-gpu', !!PERF.map_lite_ui);
+    if (map && styleReady && b3d !== (PERF.map_buildings_3d !== false)) {
+      if (baseName === 'standard' && engine !== 'raster') applyStyle();   // buildings live in Standard
+      else styleDirty = true;
+    } else if (map && styleReady && !!hidpi !== !!PERF.map_hidpi_raster) {
       // raster tile size lives in the Outdoor / Satellite groups: rebuild now if one is on screen,
       // otherwise at the next switch (Standard is vector – no flash for a setting it doesn't use)
       if (baseName !== 'standard' || engine === 'raster') applyStyle();

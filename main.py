@@ -110,7 +110,7 @@ from ui_nav import NavigationController, DetailPage
 from ui_toast import ToastManager, show_toast
 from viewer_hud import SlideshowView, load_image_file, MediaWarmUp, ImagePipeline
 from events_view import (EventCard, BentoLayout, fetch_event_cards, split_event_title, COVER_MAX_EDGE,
-                         AmbientCycler, AmbientFramesJob)
+                         AmbientCycler, AmbientFramesJob, CoverVirtualizer)
 import preview_cache
 import theme
 import tokens
@@ -377,6 +377,28 @@ def build_map_markers(geo_rows):
             "thumb": get_local_thumb_url(thumb),
         })
     return markers
+
+
+def map_refresh_payload():
+    """(setMarkers JS, setJourneys JS) for the map page; any thread (own DB connections). A part
+    that fails is None (logged), the other is still sent."""
+    markers_js = trips_js = None
+    try:
+        markers = build_map_markers(query_geo_bounds(-90, 90, -180, 180))
+        markers_js = f"window.setMarkers && window.setMarkers({json.dumps(markers)});"
+    except Exception as e:
+        print(f"[Map] {e}")
+        return None, None
+    try:
+        conn = get_connection()
+        try:
+            trips = journey.list_journeys(conn)
+        finally:
+            conn.close()
+        trips_js = f"window.setJourneys && window.setJourneys({json.dumps(trips)});"
+    except Exception as e:
+        print(f"[Map] Cesty: {e}")
+    return markers_js, trips_js
 
 
 # Jediné povolené vzdálené zdroje webových stránek aplikace (mapa; minimapa prohlížeče je od Sprintu 3 nativní – mini_map.py):
@@ -721,10 +743,14 @@ def compose_tile_image(img, w_px, h_px, radius, dpr, shade):
     return out
 
 
+THUMB_ABORT_RETRIES = 2              # decode exceptions retried before a tile shows "unavailable"
+
+
 class ThumbnailWorkerSignals(QObject):
     loaded = pyqtSignal(int, QImage, QImage)     # id, thumbnail (tier), pre-rendered tile (or null)
     failed = pyqtSignal(int, str)
     source_short = pyqtSignal(int, int)      # kratší strana zdroje (víc z něj nevytěžíme)
+    aborted = pyqtSignal(int)                # an exception in the decode: retry later (bounded)
 
 
 class ThumbnailWorker(QRunnable):
@@ -766,12 +792,23 @@ class ThumbnailWorker(QRunnable):
         best NOW (nearest the viewport centre, then ahead of the scroll), which may be another
         item's; jobs for rows that scrolled away were already dropped from the queue."""
         q = self.queue
-        if q is None:
-            self._decode()
-            return
-        job = q.pop()
+        job = self if q is None else q.pop()
         if job is not None:
-            job._decode()
+            job._safe_decode()
+
+    def _safe_decode(self):
+        """Torture test 2026-11-06: an exception in _decode (MemoryError on a huge source under
+        pressure, a locked micro-preview store, a bad edit) emitted neither loaded nor failed:
+        the id stayed in loading_ids for the session and the tile was never requested again (a
+        permanent placeholder). Now the model hears `aborted` and retries it later, bounded."""
+        try:
+            self._decode()
+        except Exception as e:                         # noqa: BLE001
+            print(f"[Thumb] {self.item_id}: {type(e).__name__}: {e}")
+            try:
+                self.signals.aborted.emit(self.item_id)
+            except RuntimeError:                        # the model went away meanwhile
+                pass
 
     def _decode(self):
         if self.started_ids is not None:
@@ -906,6 +943,8 @@ class ApplePhotoModel(QAbstractListModel):
         self._signals.source_short.connect(self._on_source_short)
         self._signals.loaded.connect(self._on_thumb_loaded)
         self._signals.failed.connect(self._on_thumb_failed)
+        self._signals.aborted.connect(self._on_thumb_aborted)
+        self._aborts = {}         # item_id -> decode exceptions so far (THUMB_ABORT_RETRIES)
         self.loading_ids = set()
         self.failed = {}          # item_id -> THUMB_MISSING_FILE | THUMB_UNAVAILABLE
         self._meta = {}           # řádek -> slovník MetaRole (delegát ho čte při každém snímku)
@@ -1093,9 +1132,22 @@ class ApplePhotoModel(QAbstractListModel):
 
     def set_records(self, db_records, possible=()):
         """possible = id položek z pásma „možné shody“ hledání (kreslí se tlumeně)."""
+        records = list(db_records)
+        possible = {int(i) for i in possible}
+        if records == self.records and possible == self.possible:
+            # Torture test 2026-11-06: daemon refreshes mostly change nothing, yet each one reset
+            # the 20k-row model on the GUI thread (50-160 ms), dropped the viewport's queued
+            # decodes mid-fling and re-decoded in-flight tiles. Unchanged = keep everything;
+            # only retry the failed tiles (a drive may have come back), as the reset did.
+            if self.failed:
+                retry = list(self.failed)
+                self.failed.clear()
+                for item_id in retry:
+                    self._emit_row_changed(item_id, [self.ThumbRole, self.StateRole])
+            return
         self.beginResetModel()
-        self.records = list(db_records)
-        self.possible = {int(i) for i in possible}
+        self.records = records
+        self.possible = possible
         self._meta = {}
         self.id_to_row = {int(r[0]): i for i, r in enumerate(self.records)}
         self.loading_ids.clear()
@@ -1220,6 +1272,19 @@ class ApplePhotoModel(QAbstractListModel):
             self._keep_pretile(item_id, tile)
         self.loading_ids.discard(item_id)
         self.failed.pop(item_id, None)
+        self._emit_row_changed(item_id, [self.ThumbRole, self.StateRole])
+
+    def _on_thumb_aborted(self, item_id: int):
+        """A decode raised: forget it was in flight so the next paint requests it again; after
+        THUMB_ABORT_RETRIES it is marked unavailable (a deterministic error never loops)."""
+        n = self._aborts.get(item_id, 0) + 1
+        self._aborts[item_id] = n
+        if n > THUMB_ABORT_RETRIES:
+            self._on_thumb_failed(item_id, THUMB_UNAVAILABLE)
+            return
+        self._queued.discard(item_id)
+        self._started.discard(item_id)
+        self.loading_ids.discard(item_id)
         self._emit_row_changed(item_id, [self.ThumbRole, self.StateRole])
 
     def _on_thumb_failed(self, item_id: int, state: str):
@@ -2030,7 +2095,13 @@ class AppleGridView(QListView):
         frame_meter.tick("grid")            # Fáze 0: doba snímku mřížky (Ctrl+Shift+F)
         if self._first_frame_pending and self.visible_tiles_ready():
             self._first_frame_pending = False
-            QTimer.singleShot(0, self.firstFrameRendered.emit)     # až po dokončení tohoto snímku
+            QTimer.singleShot(0, self._emit_first_frame)     # až po dokončení tohoto snímku
+
+    def _emit_first_frame(self):
+        # A method (not the bound signal) as the slot: PyQt drops the queued call when this view
+        # is destroyed first. The bound signal raised AttributeError in a Qt slot (qFatal) when a
+        # detail / album grid closed right after its first paint.
+        self.firstFrameRendered.emit()
 
     def _paint_dirty_rows(self, event):
         """Sprint 2: QListView repaints every item inside the BOUNDING rect of the dirty region.
@@ -4306,7 +4377,8 @@ class FrameStatsOverlay(QLabel):
             view.page().runJavaScript("window.getFrameStats ? window.getFrameStats() : null", self._on_map_stats)
         prof = perf_profile.current()
         lines = [f'Kairos · {prof.tier} · {fmt_number(prof.refresh_hz, 0)} Hz (budget {fmt_number(prof.frame_budget_ms, 1)} ms)'
-                 f' · map {getattr(self._window, "map_host_kind", "?")}']
+                 f' · map {getattr(self._window, "map_host_kind", "?")}',
+                 f'GPU {prof.gpu_name or "?"} · {prof.gpu_class}' + (' · lite map' if prof.gpu_lite else '')]
         lines += [frame_meter.format_stats(s) for s in frame_meter.all_stats()]
         held = governor.get().reasons()
         state = ("paused (" + ", ".join(held) + ")" if held else ("idle" if not governor.get().busy() else "waiting for idle"))
@@ -4341,7 +4413,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 700)
         self.resize(1280, 800)
         # Adaptivní škálování: profil stroje (strop kvality, zátěž pozadí, meze mapy)
-        self.perf = perf_profile.detect(self.config.get("performance_tier"))
+        self.perf = perf_profile.detect(self.config.get("performance_tier"), self.config.get("gpu_profile"))
         governor.get().set_item_pause(self.perf.bg_item_pause_s)
 
         # State
@@ -4463,7 +4535,9 @@ class MainWindow(QMainWindow):
             hidpi = False
         return {"layer": LEGACY_MAP_LAYERS.get(layer, layer), "dpr": dpr, "hidpi_raster": hidpi,
                 "budget_mb": int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)),
-                "policy": self.config.get("battery_policy", power.DEFAULT_POLICY)}
+                "policy": self.config.get("battery_policy", power.DEFAULT_POLICY),
+                # Sprint 4: the world z0-6 overview pack first (once), so the globe is never blank offline
+                "world": bool(self.config.get("map_world_base", True))}
 
     def _start_photo_precache(self, manual=False):
         """Sprint 3 item 3: the library's photo places into the tile store (map_precache).
@@ -4851,6 +4925,8 @@ class MainWindow(QMainWindow):
         self._events_gen = 0
         self._ambient = AmbientCycler(self._events_scroll.viewport(), lambda: self.event_cards,
                                       self._event_images.request, self)
+        self._event_covers = CoverVirtualizer(self._events_scroll, lambda: self.event_cards,
+                                              self._event_images.request, self)
         return page
 
     def _build_map_page(self):
@@ -4896,6 +4972,9 @@ class MainWindow(QMainWindow):
         srv = tile_store.start(int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB)))
         if srv is not None:                  # C7e: like install_tile_store, before the page's scripts
             view.add_init_script(f"window.TILE_STORE_CONFIG = {json.dumps(srv.config())};")
+        # Sprint 4: the machine profile before the page's scripts – a low-spec GPU's map is created
+        # without MSAA (a WebGL context attribute, fixed at creation) and with flat buildings
+        view.add_init_script(f"window.KAIROS_PERF_BOOT = {json.dumps(self.perf.for_map())};")
         names = map_host.bridge_slot_names(MapBridge)
         view.add_init_script(map_host.BRIDGE_JS % json.dumps(names))
         self._map_messages = map_host.WebMessageBridge(self.map_bridge, names, view)
@@ -5200,7 +5279,11 @@ class MainWindow(QMainWindow):
             EDITS.pop(int(media_id), None)
         else:
             EDITS[int(media_id)] = adj
+        from PyQt6 import sip
         for model in list(_LIVE_MODELS):
+            if sip.isdeleted(model):               # its view (and C++ model) closed: the weak
+                _LIVE_MODELS.discard(model)        # wrapper outlived it -> RuntimeError in a slot
+                continue
             model.refresh_items([int(media_id)])
 
     def _load_photos_async(self, *_):
@@ -5489,12 +5572,8 @@ class MainWindow(QMainWindow):
             card = EventCard(ev, self._events_grid)
             card.clicked.connect(self._open_event)
             card.journey_requested.connect(self._request_journey)
-            cover = ev.get("cover") or {}
-            full = self._event_images.request(cover.get("path")) if cover.get("path") else None
-            if full is not None:
-                card.set_cover(QPixmap.fromImage(full), full_res=True)
-            elif cover.get("thumb") and os.path.exists(cover["thumb"]):
-                card.set_cover(QPixmap(cover["thumb"]))       # hned náhled, ostrá obálka dorazí
+            # covers load only near the viewport of a visible Events page (CoverVirtualizer):
+            # each card holding its 1600 px cover cost ~1 GB at 138 events, from start-up on
             self._events_layout.addWidget(card)
             self.event_cards.append(card)
         n = len(cards)
@@ -5503,6 +5582,7 @@ class MainWindow(QMainWindow):
         self._events_scroll.setVisible(n > 0)
         self._events_scroll.setVisible(n > 0)
         self._events_gen += 1
+        self._event_covers.schedule()
         if cards and self._ambient.animations:
             job = AmbientFramesJob(cards, get_connection)
             job.signals.done.connect(lambda frames, gen=self._events_gen: self._on_ambient_frames(gen, frames))
@@ -6196,20 +6276,24 @@ class MainWindow(QMainWindow):
         power" from the user) caps the map at 60; plain battery keeps the panel rate – the founder's
         bar is a fluid map on battery, and the panel already drops itself to 60 Hz there on most
         laptops. CPU pressure is handled in the page (even-cadence pacing governor), not here.
-        Battery policy "full" never caps; config "map_fps_cap" overrides everything."""
+        Sprint 4: a low-spec GPU (perf_profile.map_fps_cap) holds a steady 60 on a faster panel –
+        an even 60 looks smoother than a 120 Hz target that drops every other frame.
+        Battery policy "full" lifts only the battery cap; config "map_fps_cap" overrides everything."""
         try:
             cap = int(self.config.get("map_fps_cap", 0) or 0)
         except (TypeError, ValueError):
             cap = 0
         if cap > 0:
             return cap
+        gpu_cap = getattr(getattr(self, "perf", None), "map_fps_cap", 0)
+        gpu_cap = gpu_cap if isinstance(gpu_cap, int) and gpu_cap > 0 else 0
         if self.config.get("battery_policy", power.DEFAULT_POLICY) == "full":
-            return 0
+            return gpu_cap
         try:
             st = power.get().state()
-            return 60 if (st.on_battery and st.saver) else 0
+            return 60 if (st.on_battery and st.saver) else gpu_cap
         except Exception:
-            return 0
+            return gpu_cap
 
     def _map_warm_allowed(self):
         """Background tile warm-up (fidelity pass): on unless config "map_prefetch" is off;
@@ -6516,23 +6600,22 @@ class MainWindow(QMainWindow):
         """Pošle do mapy všechny viditelné fotky s polohou (R*Tree index přes query_geo_bounds)."""
         if getattr(self, "map_view", None) is None or not self._map_loaded:
             return   # stránka ještě není načtená -> data pošle _on_map_loaded
-        try:
-            markers = build_map_markers(query_geo_bounds(-90, 90, -180, 180))
-        except Exception as e:
-            print(f"[Map] {e}")
+        # Torture test 2026-11-06: at 20k items this ran on the GUI thread (geo query, 20k file
+        # stats + URLs, a 4.8 MB json.dumps, the journeys) and froze the grid 2-7 s mid-fling
+        # when the background-warmed map finished loading. The payload is built on bg_jobs'
+        # pool (latest wins: a burst of refreshes sends one); only runJavaScript stays here.
+        self._bg_loads().run("map-markers", map_refresh_payload, self._send_map_payload,
+                             lambda e: print(f"[Map] {e}"))
+
+    def _send_map_payload(self, payload):
+        view = getattr(self, "map_view", None)
+        if view is None or not self._map_loaded:
             return
-        self.map_view.page().runJavaScript(
-            f"window.setMarkers && window.setMarkers({json.dumps(markers)});")
-        try:
-            conn = get_connection()
-            try:
-                trips = journey.list_journeys(conn)
-            finally:
-                conn.close()
-        except Exception as e:
-            print(f"[Map] Cesty: {e}")
-            return
-        self.map_view.page().runJavaScript(f"window.setJourneys && window.setJourneys({json.dumps(trips)});")
+        markers_js, trips_js = payload
+        if markers_js is not None:
+            view.page().runJavaScript(markers_js)
+        if trips_js is not None:
+            view.page().runJavaScript(trips_js)
 
     def open_viewer_for_ids(self, ids):
         """Prohlížeč nad konkrétními fotkami (shluk z mapy), seřazenými podle data."""

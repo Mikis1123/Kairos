@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QFrame, QTabWidget, QWidget, QListWidget, QListWidgetItem,
     QCheckBox, QComboBox, QScrollArea, QProgressBar
 )
-from PyQt6.QtCore import QEventLoop, Qt, QTimer
+from PyQt6.QtCore import QCollator, QEventLoop, Qt, QTimer
 from ui_controls import AccentPicker, InfoDot, KButton, SegmentedControl, ToggleSwitch, guard_wheel
 from config import load_config, save_config, DEFAULT_CONFIG
 from paths import THUMB_DIR, FACE_DIR
@@ -46,7 +46,22 @@ PROXY_MB_STEP = 512
 MAP_MB_RANGE = (256, 8192)
 MAP_MB_STEP = 256
 MAP_JOB_POLL_MS = 400
-MAP_REGIONS = ("cz", "sk", "at", "de", "pl", "ch", "hu", "si", "hr")
+# Sprint 4: every continent and country / territory (tile_store.REGIONS, world_regions catalogue)
+MAP_CONTINENTS, MAP_COUNTRIES = tile_store.region_ids()
+MAP_REGIONS = MAP_CONTINENTS + MAP_COUNTRIES
+MAP_DETAILS = ((8, "settings-map-detail-overview"), (11, "settings-map-detail-roads"),
+               (14, "settings-map-detail-streets"))
+MAP_DEFAULT_REGION = "cz"
+
+
+def default_map_region():
+    """The system's own country when it is in the catalogue, else Czechia."""
+    try:
+        from PyQt6.QtCore import QLocale
+        code = QLocale.territoryToCode(QLocale.system().territory()).lower()
+    except Exception:
+        code = ""
+    return code if code in tile_store.REGIONS else MAP_DEFAULT_REGION
 # Gate 0: AI na pozadí při napájení z baterie (power.py)
 BATTERY_CHOICES = [(N_("battery-throttle"), "throttle"), (N_("battery-pause"), "pause"), (N_("battery-full"), "full")]
 PERF_CHOICES = [(N_("perf-auto"), "auto"), (N_("perf-high"), "high"), (N_("perf-standard"), "standard"),
@@ -685,13 +700,27 @@ class SettingsDialog(QDialog):
         self._row(g, stacked=self.lbl_map_job)
 
         self.combo_map_region = QComboBox()
-        for rid in MAP_REGIONS:
-            self.combo_map_region.addItem(tr(f"offline-region-{rid}"), rid)
-        self.combo_map_region.currentIndexChanged.connect(self._update_region_estimate)
+        self.combo_map_region.setMaxVisibleItems(18)
+        lang = i18n.current()
+        collator = QCollator(i18n.qlocale())
+        for rid in sorted(MAP_CONTINENTS, key=lambda r: collator.sortKey(tile_store.region_name(r, lang))):
+            self.combo_map_region.addItem(tile_store.region_name(rid, lang), rid)
+        self.combo_map_region.insertSeparator(self.combo_map_region.count())
+        for rid in sorted(MAP_COUNTRIES, key=lambda r: collator.sortKey(tile_store.region_name(r, lang))):
+            self.combo_map_region.addItem(tile_store.region_name(rid, lang), rid)
+        self.combo_map_region.setCurrentIndex(self.combo_map_region.findData(default_map_region()))
+        self.combo_map_detail = QComboBox()
+        for z, key in MAP_DETAILS:
+            self.combo_map_detail.addItem(tr(key), z)
+        self.combo_map_detail.setCurrentIndex(len(MAP_DETAILS) - 1)
+        self.combo_map_detail.setToolTip(tr("settings-map-detail"))
+        self.combo_map_region.currentIndexChanged.connect(self._on_map_region_changed)
+        self.combo_map_detail.currentIndexChanged.connect(self._update_region_estimate)
         self.btn_map_region = KButton(tr("settings-map-region-download"), compact=True)
         self.btn_map_region.clicked.connect(self.download_region_pack)
         line = QHBoxLayout()
-        line.addWidget(self.combo_map_region, 1)
+        line.addWidget(self.combo_map_region, 3)
+        line.addWidget(self.combo_map_detail, 2)
         line.addWidget(self.btn_map_region)
         self._row(g, tr("settings-map-regions"), info=tr("settings-map-regions-hint"), stacked=line)
         self.lbl_map_region = _hint("")
@@ -740,16 +769,20 @@ class SettingsDialog(QDialog):
         """Pack list from the running store (metadata read off-thread), else names and sizes
         from the folder (a directory listing, no SQLite)."""
         if u.get("live"):
-            return [(p["name"], p["title"], p["bytes"]) for p in u["packs"]]
+            return [(p["name"], self._pack_title(p["name"], p["title"]), p["bytes"]) for p in u["packs"]]
         out = []
         try:
             for n in sorted(os.listdir(tile_store.packs_dir())):
                 if n.lower().endswith(tile_store.PACK_SUFFIX):
                     name = os.path.splitext(n)[0]
-                    out.append((name, name, os.path.getsize(os.path.join(tile_store.packs_dir(), n))))
+                    out.append((name, self._pack_title(name, name), os.path.getsize(os.path.join(tile_store.packs_dir(), n))))
         except OSError:
             pass
         return out
+
+    @staticmethod
+    def _pack_title(name, title):
+        return tr("settings-map-world-pack") if name == tile_store.WORLD_PACK else title
 
     def refresh_map_offline(self):
         u = self._update_map_usage()
@@ -775,7 +808,7 @@ class SettingsDialog(QDialog):
         self.btn_map_precache.setEnabled(precaching or not busy)
         regioning = busy and st.get("kind") == "region"
         self.btn_map_region.setText(tr("settings-map-stop") if regioning else tr("settings-map-region-download"))
-        self.btn_map_region.setEnabled(regioning or not busy)
+        self.btn_map_region.setEnabled(regioning or (not busy and self._region_fits()))
         for b in (self.btn_map_import, self.btn_map_clear):
             b.setEnabled(not busy)
         self.btn_map_remove.setEnabled(not busy and bool(packs))
@@ -806,6 +839,9 @@ class SettingsDialog(QDialog):
             return tr({"busy": "settings-map-wait-busy", "metered": "settings-map-wait-metered",
                        "battery": "settings-map-wait-battery"}.get(st.get("reason"), "settings-map-wait-busy"))
         done = (st.get("done") or 0) + (st.get("skipped") or 0) + (st.get("failed") or 0)
+        if phase == map_precache.RUNNING and st.get("stage") == "world":
+            return tr("settings-map-world-progress", done=fmt_number(done, 0),
+                      total=fmt_number(st.get("total") or 0, 0), mb=mb)
         if phase == map_precache.RUNNING:
             return tr("settings-map-progress", done=fmt_number(done, 0), total=fmt_number(st.get("total") or 0, 0), mb=mb)
         if phase == map_precache.DONE:
@@ -832,19 +868,44 @@ class SettingsDialog(QDialog):
             mj.start_precache(manual=True, **self._precache_options())
         self.refresh_map_offline()
 
+    def _on_map_region_changed(self, *_):
+        """A new region: the detail drops to the deepest level whose pack stays within
+        tile_store.MAX_REGION_TILES (a continent at street level is a planet download)."""
+        rid = self.combo_map_region.currentData()
+        if rid in tile_store.REGIONS:
+            best = tile_store.region_max_detail(tile_store.REGIONS[rid], tuple(z for z, _k in MAP_DETAILS))
+            want = self.combo_map_detail.currentData()
+            if best is not None and (want is None or want > best):
+                self.combo_map_detail.blockSignals(True)
+                self.combo_map_detail.setCurrentIndex(self.combo_map_detail.findData(best))
+                self.combo_map_detail.blockSignals(False)
+        self._update_region_estimate()
+
+    def _region_fits(self):
+        rid = self.combo_map_region.currentData()
+        zmax = self.combo_map_detail.currentData()
+        return rid in tile_store.REGIONS and zmax is not None and tile_store.region_fits(tile_store.REGIONS[rid], zmax)
+
     def _update_region_estimate(self, *_):
         rid = self.combo_map_region.currentData()
-        tiles, size = tile_store.estimate_region(tile_store.REGIONS[rid]) if rid in tile_store.REGIONS else (0, 0)
-        self.lbl_map_region.setText(tr("settings-map-region-estimate", tiles=fmt_number(tiles, 0),
-                                       mb=fmt_number(size / 2 ** 20, 0)))
+        zmax = self.combo_map_detail.currentData() or tile_store.REGION_ZMAX
+        tiles, size = tile_store.estimate_region(tile_store.REGIONS[rid], zmax) if rid in tile_store.REGIONS else (0, 0)
+        if rid in tile_store.REGIONS and not self._region_fits():
+            self.lbl_map_region.setText(tr("settings-map-region-too-large", tiles=fmt_number(tiles, 0)))
+        else:
+            self.lbl_map_region.setText(tr("settings-map-region-estimate", tiles=fmt_number(tiles, 0),
+                                           mb=fmt_number(size / 2 ** 20, 0)))
+        if hasattr(self, "list_map_packs"):           # not during construction
+            self.refresh_map_offline()
 
     def download_region_pack(self):
         mj = map_precache.jobs()
         if mj.running():
             mj.cancel()
-        else:
+        elif self._region_fits():
             rid = self.combo_map_region.currentData()
-            mj.start_region(rid, title=self.combo_map_region.currentText(), budget_mb=self._map_budget_mb())
+            mj.start_region(rid, zmax=self.combo_map_detail.currentData(), title=self.combo_map_region.currentText(),
+                            budget_mb=self._map_budget_mb())
         self.refresh_map_offline()
 
     def import_map_pack(self, path=None):

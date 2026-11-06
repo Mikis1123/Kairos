@@ -1269,6 +1269,14 @@ class ActivityStatus(QWidget):
 
 
 # ── Founder audit: kolečko myši nesmí „ukrást“ posouvání stránky ─────────────────────────────────
+def _qobject_dead(obj):
+    try:
+        from PyQt6 import sip
+        return sip.isdeleted(obj)
+    except Exception:
+        return False
+
+
 class _WheelGuard(QObject):
     """Pole se seznamem / posuvník / číselník pod kurzorem při posouvání stránky nemění hodnotu:
     dokud nemá fokus (klik / Tab), kolečko se předá rodiči – a po řetězci rodičů dojde do
@@ -1319,7 +1327,7 @@ def guard_wheel(root):
     Vrací počet chráněných prvků."""
     from PyQt6.QtWidgets import QAbstractSlider, QAbstractSpinBox, QComboBox, QScrollBar
     global _wheel_guard
-    if _wheel_guard is None:
+    if _wheel_guard is None or _qobject_dead(_wheel_guard):     # Qt deletes it with its QApplication
         _wheel_guard = _WheelGuard()
     n = 0
     for w in root.findChildren(QWidget):

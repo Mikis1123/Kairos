@@ -395,18 +395,36 @@ SOURCE_PATTERNS = (
 PACK_FORMATS = {"pbf": "application/x-protobuf", "png": "image/png", "jpg": "image/jpeg",
                 "jpeg": "image/jpeg", "webp": "image/webp"}
 PACK_SUFFIX = ".mbtiles"
-# Built-in regions for build_region_pack(): (west, south, east, north), WGS84
-REGIONS = {
-    "cz": (12.09, 48.55, 18.87, 51.06),
-    "sk": (16.83, 47.73, 22.57, 49.61),
-    "at": (9.53, 46.37, 17.16, 49.02),
-    "de": (5.87, 47.27, 15.04, 55.06),
-    "pl": (14.12, 49.00, 24.15, 54.84),
-    "ch": (5.96, 45.82, 10.49, 47.81),
-    "hu": (16.11, 45.74, 22.90, 48.59),
-    "si": (13.38, 45.42, 16.61, 46.88),
-    "hr": (13.49, 42.39, 19.45, 46.56),
-}
+# Region packs for every country / territory and continent (Sprint 4: universal selection).
+# world_regions.py is generated (tools/gen_world_regions.py) from GeoNames populated places and
+# CLDR names; a region is a list of (west, south, east, north) boxes in WGS84, west > east never
+# (parts across the antimeridian are two boxes). Ids: ISO 3166 alpha-2 ("cz", "us") and
+# "continent-<id>" ("continent-europe"). A single 4-tuple is accepted too (tests, custom boxes).
+CONTINENT_PREFIX = "continent-"
+
+
+def _build_regions():
+    import world_regions
+    out = {cc: [tuple(b) for b in boxes] for cc, (_cont, boxes, _names) in world_regions.COUNTRIES.items()}
+    for cid in world_regions.CONTINENTS:
+        out[CONTINENT_PREFIX + cid] = [tuple(b) for _cc, (cont, boxes, _n) in world_regions.COUNTRIES.items()
+                                       if cont == cid for b in boxes]
+    return out
+
+
+REGIONS = _build_regions()
+# The whole world at low zoom (Sprint 4): built once into its own pack (WORLD_PACK) so the globe
+# is never blank offline from high altitude. Measured 2026-11-05 on the OpenFreeMap planet (bytes
+# as stored, gzip): z0-5 = 1365 tiles, 53.5 MB (z2 6.4, z3 8.6, z4 12.2, z5 25.8 MB); z6 would add
+# 4096 tiles, ~48 MB (sampled), so z0-6 ~100 MB. Founder decision 2026-11-06: z0-6 (5461 tiles,
+# ~100 MB) - highways, ranges and regional towns from altitude; z6 overzooms cleanly to ~7-8.
+WORLD_BOX = (-180.0, -85.05112878, 180.0, 85.05112878)
+WORLD_PACK = "world-base"
+WORLD_ZMAX = 6
+# One pack at most this many tiles: OpenFreeMap is a free service, a continent at street level
+# (tens of millions of tiles) is a planet download, not a region. Larger -> lower detail.
+MAX_REGION_TILES = 1_500_000
+DETAIL_ZOOMS = (8, 11, 14)          # overview / roads / streets (the settings' detail choice)
 REGION_ZMAX = 14                    # OpenMapTiles' deepest level (MapLibre overzooms beyond)
 # Average stored tile size in KB per zoom (measured 2026-11-05 on the real store, OpenFreeMap
 # planet), used for size estimates before a download
@@ -445,24 +463,97 @@ def bbox_tiles(bbox, z):
     return lon2tile(w, z), lat2tile(n, z), lon2tile(e, z), lat2tile(s, z)
 
 
-def region_tiles(bbox, zmin=0, zmax=REGION_ZMAX):
-    """(z, x, y) of a box, parents first."""
-    for z in range(zmin, zmax + 1):
-        x0, y0, x1, y1 = bbox_tiles(bbox, z)
+def region_boxes(region):
+    """A REGIONS value (one (w, s, e, n) box or a list of them) -> list of boxes."""
+    if not region:
+        return []
+    if len(region) == 4 and all(isinstance(v, (int, float)) for v in region):
+        return [tuple(float(v) for v in region)]
+    return [tuple(float(v) for v in b) for b in region]
+
+
+def region_bounds(region):
+    """One (w, s, e, n) box around all parts (MBTiles "bounds" metadata)."""
+    boxes = region_boxes(region)
+    if not boxes:
+        return None
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def _zoom_tiles(boxes, z):
+    """Distinct (x, y) at zoom z covered by the boxes (several boxes may share tiles)."""
+    if len(boxes) == 1:
+        x0, y0, x1, y1 = bbox_tiles(boxes[0], z)
+        return ((x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1))
+    seen = set()
+    for b in boxes:
+        x0, y0, x1, y1 = bbox_tiles(b, z)
         for y in range(y0, y1 + 1):
             for x in range(x0, x1 + 1):
-                yield z, x, y
+                seen.add((x, y))
+    return sorted(seen, key=lambda t: (t[1], t[0]))
+
+
+def _zoom_count(boxes, z):
+    """Distinct tiles of the boxes at zoom z, exact, without enumerating them: a sweep over the
+    rows where the set of boxes changes, times the union length of their column ranges."""
+    rects = [bbox_tiles(b, z) for b in boxes]
+    if len(rects) == 1:
+        x0, y0, x1, y1 = rects[0]
+        return (x1 - x0 + 1) * (y1 - y0 + 1)
+    edges = sorted({r[1] for r in rects} | {r[3] + 1 for r in rects})
+    total = 0
+    for top, bottom in zip(edges, edges[1:]):
+        spans = sorted((x0, x1) for x0, y0, x1, y1 in rects if y0 <= top and y1 >= bottom - 1)
+        width, end = 0, -1
+        for x0, x1 in spans:
+            if x1 > end:
+                width += x1 - max(x0, end + 1) + 1
+                end = x1
+        total += width * (bottom - top)
+    return total
+
+
+def region_tiles(bbox, zmin=0, zmax=REGION_ZMAX):
+    """(z, x, y) of a region (one box or a list), parents first, each tile once."""
+    boxes = region_boxes(bbox)
+    for z in range(zmin, zmax + 1):
+        for x, y in _zoom_tiles(boxes, z):
+            yield z, x, y
 
 
 def estimate_region(bbox, zmax=REGION_ZMAX):
-    """(tiles, bytes) of a vector region pack z0..zmax (pure math, safe on the GUI thread)."""
+    """(tiles, bytes) of a vector region pack z0..zmax (pure math, safe on the GUI thread).
+    Bytes are an upper estimate: the averages are land tiles, open sea is ~100 bytes a tile."""
+    boxes = region_boxes(bbox)
     tiles = size = 0
     for z in range(0, zmax + 1):
-        x0, y0, x1, y1 = bbox_tiles(bbox, z)
-        n = (x1 - x0 + 1) * (y1 - y0 + 1)
+        n = _zoom_count(boxes, z)
         tiles += n
         size += n * VECTOR_AVG_KB.get(z, 11) * 1024
     return tiles, size
+
+
+def region_fits(bbox, zmax, cap=None):
+    """True when the region's pack z0..zmax stays within MAX_REGION_TILES."""
+    cap = MAX_REGION_TILES if cap is None else cap
+    tiles = 0
+    boxes = region_boxes(bbox)
+    for z in range(0, zmax + 1):
+        tiles += _zoom_count(boxes, z)
+        if tiles > cap:
+            return False
+    return True
+
+
+def region_max_detail(bbox, choices=DETAIL_ZOOMS, cap=None):
+    """Deepest zoom among choices whose pack fits the tile cap (None if not even the first)."""
+    best = None
+    for z in sorted(choices):
+        if not region_fits(bbox, z, cap):
+            break
+        best = z
+    return best
 
 
 def packs_dir():
@@ -684,8 +775,8 @@ def write_pack(path, source, fmt, tiles, title="", bounds=None, minzoom=None, ma
                 "kairos:source": source, "kairos:title": title, "type": "baselayer",
                 "minzoom": str(minzoom if minzoom is not None else (zmin if n else 0)),
                 "maxzoom": str(maxzoom if maxzoom is not None else (zmax if n else 0))}
-        if bounds:
-            meta["bounds"] = ",".join(f"{v:.5f}" for v in bounds)
+        if bounds:                      # one box, or a region's list of boxes (their outline)
+            meta["bounds"] = ",".join(f"{v:.5f}" for v in region_bounds(bounds))
         conn.executemany("INSERT INTO metadata VALUES (?, ?)", list(meta.items()))
         conn.commit()
         conn.close()
@@ -1088,3 +1179,22 @@ def stop():
         srv.store.close()
         if srv.packs is not None:
             srv.packs.close()
+
+
+def region_name(region, lang="en"):
+    """Display name of a REGIONS id in the UI language (CLDR names from world_regions)."""
+    import world_regions
+    lang = lang if lang in ("cs", "de", "en", "es", "fr", "ja", "zh-CN") else "en"
+    if region == WORLD_PACK:
+        return None
+    if region.startswith(CONTINENT_PREFIX):
+        names = world_regions.CONTINENTS.get(region[len(CONTINENT_PREFIX):])
+    else:
+        names = (world_regions.COUNTRIES.get(region) or (None, None, None))[2]
+    return (names or {}).get(lang) or (names or {}).get("en") or region
+
+
+def region_ids():
+    """(continent ids, country ids) of the built-in regions."""
+    conts = tuple(r for r in REGIONS if r.startswith(CONTINENT_PREFIX))
+    return conts, tuple(r for r in REGIONS if not r.startswith(CONTINENT_PREFIX))

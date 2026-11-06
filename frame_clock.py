@@ -110,6 +110,9 @@ def _timer_period(fine):
         pass
 
 
+REOPEN_S = 2.0
+
+
 class FrameClock(QObject):
     """Shared per-frame pulse. subscribe(key, cb) -> cb(frame_time_s) once per display frame."""
 
@@ -126,6 +129,11 @@ class FrameClock(QObject):
         super().__init__()
         self._subs = collections.OrderedDict()
         self._wait = _open_vblank() if wait == "auto" else wait
+        # vblank lost (display asleep, dock / undock, mode change, driver reset): the clock falls
+        # back to the timer and re-opens the vblank at most every REOPEN_S when an animation
+        # starts. Before, one failure meant timer pacing (15.6 ms quanta) until the app restarted.
+        self._can_reopen = wait == "auto" and self._wait is not None
+        self._reopen_at = 0.0
         self._active = threading.Event()
         self._pending = threading.Event()
         self._stamp = time.perf_counter()        # vblank time of the newest tick
@@ -190,6 +198,14 @@ class FrameClock(QObject):
     def _ensure_running(self):
         if self._dead:
             return
+        if self._wait is None and self._can_reopen and time.monotonic() >= self._reopen_at:
+            self._reopen_at = time.monotonic() + REOPEN_S
+            w = _open_vblank()
+            if w is not None and (self._thread is None or not self._thread.is_alive()):
+                if self._timer is not None and self._timer.isActive():
+                    self._timer.stop()
+                    _timer_period(False)
+                self._wait = w                    # a new failure falls back again (same path)
         if self._wait is not None:
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(target=self._loop, name="kairos-frame-clock", daemon=True)
@@ -243,9 +259,10 @@ class FrameClock(QObject):
         self._deliver()
 
     def _deliver(self):
-        if self._wait is None and self._timer is None:          # vblank died mid-run
-            self._make_timer()
-            if self._subs:
+        if self._wait is None and (self._timer is None or not self._timer.isActive()):
+            if self._timer is None:                              # vblank died mid-run
+                self._make_timer()
+            if self._subs:                                       # (again, after a failed re-open)
                 self._ensure_running()
         if not self._pending.is_set():
             return

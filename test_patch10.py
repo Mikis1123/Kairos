@@ -583,7 +583,13 @@ class TestEventsPage(TempEnv):
         card = w.event_cards[0]
         self.assertEqual((card.kicker, card.display_title), ("Výlet", "Šumava"))
         self.assertEqual(card.subtitle(), "Sušice · 1.–3. 7. 2026")
-        w._event_images.wait()
+        from PyQt6.QtTest import QTest
+        import time as _t
+        t0 = _t.perf_counter()            # covers are requested near the shown viewport (CoverVirtualizer)
+        while not card.full_res and _t.perf_counter() - t0 < 5:
+            w._event_covers.sync()
+            w._event_images.wait()
+            QTest.qWait(20)
         self.assertTrue(card.full_res, "obálka v plném rozlišení (náhled hned, ostrá z pozadí)")
         card.clicked.emit(ev)
         page = w.stack.currentWidget()

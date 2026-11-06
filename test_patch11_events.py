@@ -306,3 +306,61 @@ class TestAmbientWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAS_QT, "PyQt6 není k dispozici")
+class TestCoverVirtualizer(unittest.TestCase):
+    """Torture test 2026-11-06: every event card held its 1600 px cover from start-up (~1 GB at
+    138 events). Covers now load near the viewport of a visible page and are released far away."""
+
+    def setUp(self):
+        from PyQt6.QtWidgets import QVBoxLayout
+        from events_view import CoverVirtualizer, EventCard
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        host = QWidget()
+        lay = QVBoxLayout(host)
+        self.cards = []
+        for i in range(40):
+            ev = {"id": i, "title": f"Výlet: Místo {i}", "count": 3, "start": "2026-07-01 08:00",
+                  "end": "2026-07-02 08:00", "cover": {"path": f"C:/x/cover{i}.jpg"}}
+            card = EventCard(ev)
+            card.setMinimumHeight(200)
+            lay.addWidget(card)
+            self.cards.append(card)
+        self.scroll.setWidget(host)
+        self.scroll.resize(600, 400)
+        self.requested = []
+
+        def image(path):
+            self.requested.append(path)
+            img = QImage(160, 100, QImage.Format.Format_RGB32)
+            img.fill(QColor(90, 120, 150))
+            return img
+        self.cv = CoverVirtualizer(self.scroll, lambda: self.cards, image)
+
+    def tearDown(self):
+        self.scroll.deleteLater()
+
+    def pump(self, ms=80):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    def test_hidden_page_requests_nothing(self):
+        self.cv.sync()
+        self.assertEqual(self.requested, [])
+        self.assertFalse(any(c.holds_images() for c in self.cards))
+
+    def test_only_near_cards_load_and_far_ones_release(self):
+        self.scroll.show()
+        self.pump()
+        held = [c for c in self.cards if c.holds_images()]
+        self.assertTrue(held and len(held) < 12, len(held))          # the viewport ±1 screen, not 40
+        self.assertTrue(self.cards[0].full_res)
+        self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum())
+        self.pump()
+        self.assertFalse(self.cards[0].holds_images(), "far above: released")
+        self.assertFalse(self.cards[0].full_res)
+        self.assertTrue(self.cards[-1].holds_images())
+        self.assertLess(sum(c.holds_images() for c in self.cards), 20, "bounded while scrolling")

@@ -248,6 +248,35 @@ def set_process_high_qos(pid, high):
         k32.CloseHandle(ctypes.c_void_p(h))
 
 
+_PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+
+
+def set_process_timer_resolution_honoured(pid=None):
+    """This process (default) keeps its timer-resolution requests even while none of its windows
+    is visible (Windows 11 otherwise drops them: 4 ms timers tick every 15.6 ms). Execution-speed
+    bits are left as they are. True when applied."""
+    if sys.platform != "win32":
+        return False
+    import os
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x0200 | 0x1000, False, int(os.getpid() if pid is None else pid))
+    if not h:
+        return False
+    try:
+        st = _PROCESS_POWER_THROTTLING_STATE(1, 0, 0)
+        if not k32.GetProcessInformation(ctypes.c_void_p(h), _ProcessPowerThrottling, ctypes.byref(st), ctypes.sizeof(st)):
+            st = _PROCESS_POWER_THROTTLING_STATE(1, 0, 0)
+        st.Version = 1
+        st.ControlMask |= _PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        st.StateMask &= ~_PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        return bool(k32.SetProcessInformation(ctypes.c_void_p(h), _ProcessPowerThrottling, ctypes.byref(st), ctypes.sizeof(st)))
+    except Exception:
+        return False
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
 def process_qos_state(pid):
     """(ControlMask, StateMask) of a process's power throttling, or None (tests / diagnostics)."""
     if sys.platform != "win32":

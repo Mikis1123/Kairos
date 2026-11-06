@@ -383,6 +383,24 @@ class EventCard(QWidget):
         cover = self.event.get("cover") or {}
         return cover.get("path")
 
+    def release_images(self):
+        """Far off-screen (CoverVirtualizer): drop the cover, the ambient frames and the scaled
+        crops. The card paints its placeholder gradient until it comes near again."""
+        if self._pixmap.isNull() and not self._frame_pixmaps and not self._scaled:
+            return
+        if self._fade_anim is not None:
+            self._fade_anim.stop()
+        self._pixmap = QPixmap()
+        self._frame_pixmaps = {}
+        self._scaled = {}
+        self._prev, self._fade, self._fade_anim = None, 1.0, None
+        self.frame_index = 0
+        self._focus = (self.event.get("cover") or {}).get("focus", DEFAULT_FOCUS)
+        self.full_res = False
+
+    def holds_images(self):
+        return not self._pixmap.isNull() or bool(self._frame_pixmaps)
+
     # ── ambientní střídání ──
     def set_frames(self, frames):
         """Snímky pro střídání; obálka je vždy první (karta začíná tím, co už ukazuje)."""
@@ -720,6 +738,56 @@ def system_animations_enabled():
 def ambient_period_ms(event_id):
     """3–4 s podle události – stálé pro kartu, různé mezi kartami."""
     return AMBIENT_PERIOD_MS + (int(event_id) * 397) % 1000
+
+
+class CoverVirtualizer(QObject):
+    """Event covers only near the viewport (torture test 2026-11-06).
+
+    Every card used to decode its 1600 px cover at start-up and keep it: ~7.7 MB per card, about
+    1.07 GB for 138 events, held even when the Events page was never opened, and growing with the
+    library. Now covers are requested only while the page is visible, for cards within NEAR
+    viewport heights of the visible area, and released beyond FAR (hysteresis: no thrash at the
+    edge). The pipeline's own LRU makes coming back instant."""
+
+    NEAR = 1.0
+    FAR = 3.0
+
+    def __init__(self, scroll, cards_fn, image_fn, parent=None):
+        super().__init__(parent)
+        self.scroll, self.cards_fn, self.image_fn = scroll, cards_fn, image_fn
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(30)
+        self._timer.timeout.connect(self.sync)
+        bar = scroll.verticalScrollBar()
+        bar.valueChanged.connect(self.schedule)
+        bar.rangeChanged.connect(self.schedule)
+        scroll.viewport().installEventFilter(self)
+
+    def schedule(self, *_):
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.Type.Show, QEvent.Type.Resize, QEvent.Type.LayoutRequest):
+            self.schedule()
+        return False
+
+    def sync(self):
+        vp = self.scroll.viewport()
+        if not vp.isVisible():
+            return                                # page hidden: request nothing (start-up!)
+        h = max(1, vp.height())
+        for card in self.cards_fn():
+            y0 = card.mapTo(vp, QPoint(0, 0)).y()
+            y1 = y0 + card.height()
+            if y1 >= -self.NEAR * h and y0 <= h + self.NEAR * h:
+                if not card.full_res and card.cover_path():
+                    img = self.image_fn(card.cover_path())      # None = decoding in the background
+                    if img is not None and not img.isNull():
+                        card.set_cover(QPixmap.fromImage(img), full_res=True)
+            elif y1 < -self.FAR * h or y0 > h + self.FAR * h:
+                card.release_images()
 
 
 class AmbientCycler(QObject):

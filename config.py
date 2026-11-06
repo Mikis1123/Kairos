@@ -38,6 +38,10 @@ DEFAULT_CONFIG = {
     "memories_dismissed": "",
     # Fáze 1 – adaptivní škálování: "auto" | "high" | "standard" | "baseline" (perf_profile.py)
     "performance_tier": "auto",
+    # Sprint 4 – mapa na slabé grafice: "auto" (podle adaptéru) | "full" | "lite" (perf_profile.py)
+    "gpu_profile": "auto",
+    # Sprint 4 – přehled celého světa z0–6 jako offline balík (map_precache, jednou)
+    "map_world_base": True,
     # Fáze 1 – 1080p SDR kopie videí 4K / HDR (video_proxy.py), limit na disku v MB
     "proxy_cache_mb": 4096,
     # Cesta 3.0 (C7e) – místní úložiště mapových dlaždic (tile_store.py), limit na disku v MB

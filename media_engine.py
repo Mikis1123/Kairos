@@ -348,6 +348,12 @@ def _dispose_key(key, wait=False):
     if entry is None:
         return
     thread, core = entry
+    from PyQt6 import sip
+    if sip.isdeleted(thread) or sip.isdeleted(core):
+        # torture test 2026-11-06: the core (or its thread) went first (window teardown, a
+        # finished thread): touching it raised RuntimeError inside the destroyed() slot
+        _live.pop(key, None)
+        return
     if thread.isRunning() and not getattr(core, "_disposing", False):
         core._disposing = True
         core.dispose_requested.emit()
@@ -360,6 +366,9 @@ def _join(key):
     if entry is None:
         return
     thread, _core = entry
+    from PyQt6 import sip
+    if sip.isdeleted(thread):
+        return
     if not thread.wait(SHUTDOWN_WAIT_MS):
         thread.quit()
         thread.wait(500)
@@ -367,8 +376,9 @@ def _join(key):
 
 def reap():
     """Odebere z registru vlákna, která už doběhla (volá se průběžně)."""
+    from PyQt6 import sip
     for key, (thread, _core) in list(_live.items()):
-        if thread.isFinished():
+        if sip.isdeleted(thread) or thread.isFinished():
             _live.pop(key, None)
 
 

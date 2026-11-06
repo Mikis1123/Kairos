@@ -150,6 +150,12 @@ def run_scen(cap, todo):
     t_wall = time.perf_counter()
     late0 = len(results["gui_late"])
     js("__probe.start()")
+    if kind.startswith("goto"):                       # goto-alps / goto-prague: reposition, let tiles settle
+        lon, lat, z, pitch = {"goto-alps": (11.85, 46.55, 12.5, 75), "goto-prague": (14.42, 50.087, 15.2, 70),
+                              "goto-globe": (14.4, 50.0, 2.2, 0)}[kind]
+        js(f"__probe.goto({lon}, {lat}, {z}, {pitch})")
+        later(max(ms, 4000), lambda: collect(cap, kind, ms, t_wall, late0, todo))
+        return
     if kind == "dbl":
         js("__probe.dbl()")
         later(1200, lambda: collect(cap, kind, ms, t_wall, late0, todo))

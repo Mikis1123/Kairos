@@ -542,7 +542,12 @@ def test_db_and_network_never_on_the_calling_thread(server):
 
 def test_gui_event_loop_stays_smooth_during_precache(server, qapp):
     """A 4 ms QTimer on the GUI thread keeps ticking while a precache downloads (fake network)."""
-    from PyQt6.QtCore import QElapsedTimer, QEventLoop, QTimer
+    from PyQt6.QtCore import QElapsedTimer, QEventLoop, Qt, QTimer
+    # Windows 11 ignores a process's timer-resolution requests once it owns windows and none is
+    # visible (earlier tests leave hidden widgets): a 4 ms timer then ticks on the 15.6 ms system
+    # clock and the bench measured that quantum, not GUI stalls. Opt out, as a visible app is.
+    import power
+    power.set_process_timer_resolution_honoured()
     srv = server
     srv.upstream.delay = 0.002
     places = [(PRAGUE[0] + i * 0.03, PRAGUE[1] + (i % 7) * 0.02, 1) for i in range(40)]
@@ -559,6 +564,7 @@ def test_gui_event_loop_stays_smooth_during_precache(server, qapp):
             loop.quit()
     loop = QEventLoop()
     timer = QTimer()
+    timer.setTimerType(Qt.TimerType.PreciseTimer)
     timer.setInterval(4)
     timer.timeout.connect(tick)
     timer.start()
@@ -748,7 +754,8 @@ def test_settings_section_shows_usage_and_limit(settings):
     dlg.slider_map_mb.setValue(2048)
     assert "2" in dlg.lbl_map_mb.text()
     assert dlg.lbl_map_region.text()                      # size estimate for the chosen region
-    assert dlg.combo_map_region.count() == len(dlg_regions())
+    combo = dlg.combo_map_region                         # continents, a separator, every country
+    assert sum(1 for i in range(combo.count()) if combo.itemData(i)) == len(dlg_regions())
 
 
 def dlg_regions():

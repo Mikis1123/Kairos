@@ -301,21 +301,51 @@ if HAS_QT:
 
         _tick_signal = pyqtSignal()
 
-        def __init__(self, cb, wait, parent=None):
+        # After a glide stops, the thread keeps waiting on vblanks (no ticks posted) this long
+        # before it exits: the next fling of a burst reuses it instead of paying Thread.start()
+        # (a GIL hand-off and an Event.wait on the GUI thread, ~6 % of fling CPU at 20k items).
+        LINGER_S = 0.5
+        REOPEN_S = 2.0
+
+        def __init__(self, cb, wait, parent=None, reopen=None):
             super().__init__(parent)
             import threading
             self._cb = cb
             self._wait = wait
+            self._reopen = reopen
+            self._reopen_at = 0.0
             self._run = False
             self._pending = threading.Event()
+            self._lock = threading.Lock()
             self._thread = None
             self._tick_signal.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
 
         def _loop(self):
-            while self._run:
+            # One thread at most: start() reuses a live loop (lock-protected hand-off). Before,
+            # stop() + start() within one vblank left the old thread alive AND started a new one.
+            import time as _time
+            idle_since = None
+            while True:
+                with self._lock:
+                    if not self._run:
+                        now = _time.monotonic()
+                        idle_since = idle_since or now
+                        if now - idle_since >= self.LINGER_S:
+                            self._thread = None
+                            return
+                    else:
+                        idle_since = None
                 if not self._wait():
-                    self._run = False
-                    break
+                    # vblank lost (display asleep, dock / undock, mode change): keep gliding on
+                    # a 60 Hz sleep and re-open the adapter every REOPEN_S. Before, the glide
+                    # stopped dead after one frame and every fling moved a single step.
+                    _time.sleep(1 / 60.0)
+                    now = _time.monotonic()
+                    if self._reopen is not None and now >= self._reopen_at:
+                        self._reopen_at = now + self.REOPEN_S
+                        w = self._reopen()
+                        if w is not None:
+                            self._wait = w
                 if self._run and not self._pending.is_set():
                     self._pending.set()
                     self._tick_signal.emit()
@@ -327,15 +357,17 @@ if HAS_QT:
 
         def start(self):
             import threading
-            if self._run and self._thread is not None and self._thread.is_alive():
-                return
-            self._run = True
-            self._pending.clear()
-            self._thread = threading.Thread(target=self._loop, name="kairos-vsync", daemon=True)
-            self._thread.start()
+            with self._lock:
+                self._run = True
+                if self._thread is not None:            # live (gliding or lingering): reuse it
+                    return
+                self._pending.clear()
+                self._thread = threading.Thread(target=self._loop, name="kairos-vsync", daemon=True)
+                self._thread.start()
 
         def stop(self):
-            self._run = False
+            with self._lock:
+                self._run = False
 
         def running(self):
             return self._run
@@ -348,7 +380,7 @@ if HAS_QT:
         import os
         wait = None if os.environ.get("KAIROS_TICKER") == "timer" else _VBlank.open()
         if wait is not None:
-            return _VsyncTicker(cb, wait, parent)
+            return _VsyncTicker(cb, wait, parent, reopen=_VBlank.open)
         return _FrameTicker(cb, area, parent)
 
     class KineticScroller(QObject):

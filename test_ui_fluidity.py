@@ -86,6 +86,34 @@ class TestFrameClock(unittest.TestCase):
         self.assertGreater(len(got), 3)
         self.assertFalse(clk._timer.isActive())
 
+    def test_lost_vblank_falls_back_then_reopens(self):
+        """Display asleep / dock change: the wait fails -> timer; the next animation after
+        REOPEN_S re-opens the vblank (it used to stay on the 15.6 ms timer until restart)."""
+        state = {"ok": False, "opens": 0}
+
+        def wait():
+            time.sleep(0.003)
+            return state["ok"]
+
+        def opener():
+            state["opens"] += 1
+            return wait
+        with mock.patch.object(frame_clock, "_open_vblank", opener),                 mock.patch.object(frame_clock, "REOPEN_S", 0.05):
+            clk = frame_clock.FrameClock()
+            got = []
+            clk.subscribe("a", got.append)
+            pump(80)
+            self.assertEqual(clk.source, "timer")
+            self.assertGreater(len(got), 2, "animations keep running on the timer")
+            clk.unsubscribe("a")
+            state["ok"] = True
+            time.sleep(0.06)
+            clk.subscribe("b", got.append)
+            pump(60)
+            self.assertEqual(clk.source, "vblank")
+            self.assertGreaterEqual(state["opens"], 2)
+            clk.shutdown()
+
     def test_a_raising_subscriber_is_dropped_not_fatal(self):
         clk = frame_clock.FrameClock(wait=None)
 

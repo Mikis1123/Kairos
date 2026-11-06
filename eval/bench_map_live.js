@@ -62,11 +62,21 @@
       } else if (kind === 'wheelin' || kind === 'wheelout') {   // notched mouse wheel: one notch / 90 ms
         var n = Math.floor((t - t0) / 90);
         if (n !== gesture.n) { gesture.n = n; fire('wheel', cx + 60, cy - 40, { deltaY: kind === 'wheelin' ? -100 : 100, deltaMode: 0 }); }
+      } else if (kind === 'layerpan') {        // torture: figure-eight drag + base switch every 400 ms
+        var lx = cx + Math.sin(k * Math.PI * 2) * W * 0.28, ly = cy + Math.sin(k * Math.PI * 4) * H * 0.18;
+        if (!last) { fire('mousedown', cx, cy, { button: 0, buttons: 1 }); last = [cx, cy]; }
+        fire('mousemove', lx, ly, { buttons: 1, movementX: lx - last[0], movementY: ly - last[1] }); last = [lx, ly];
+        var li = Math.floor((t - t0) / 400);
+        if (li !== gesture.li) { gesture.li = li; window.setBaseLayer(['standard', 'outdoor', 'satellite'][li % 3], false); }
+        if (Math.floor((t - t0) / 90) !== gesture.n) { gesture.n = Math.floor((t - t0) / 90);
+          fire('wheel', lx, ly, { deltaY: (gesture.n % 8 < 4) ? -100 : 100, deltaMode: 0 }); }
       } else if (kind === 'trackpad') {                          // smooth trackpad zoom every frame
         fire('wheel', cx, cy, { deltaY: Math.sin(k * Math.PI * 2) * -6, deltaMode: 0, ctrlKey: true });
       }
       if (k < 1) { vraf(step); return; }
-      if (kind === 'pan' || kind === 'orbit') fire('mouseup', last[0], last[1], { button: btn, buttons: 0 });
+      if (kind === 'pan' || kind === 'orbit' || kind === 'layerpan') fire('mouseup', last[0], last[1], { button: btn, buttons: 0 });
+      if (kind === 'layerpan') window.setBaseLayer('standard', false);
+      gesture.li = -1;
       gesture.n = -1;
       done && done();
     }
@@ -87,6 +97,7 @@
       return JSON.stringify(out);
     },
     gesture: function (kind, ms) { window.__gdone = false; gesture(kind, ms, function () { window.__gdone = true; }); return 'ok'; },
+    goto: function (lon, lat, z, pitch) { window.map.jumpTo({ center: [lon, lat], zoom: z, pitch: pitch, bearing: 0 }); return 'ok'; },
     dbl: function () { var c = canvas(); fire('dblclick', c.clientWidth / 2, c.clientHeight / 2, { button: 0 }); return 'ok'; }
   };
   return 'installed';

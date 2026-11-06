@@ -316,7 +316,166 @@ def warm_micro(res):
     micro_previews.reset_for_tests()                  # the app reloads it from disk like a restart
 
 
-def stage_grid(out, passes=3, micro="cold"):
+class BackgroundLoad:
+    """--load: the background work a real session runs while the user flings the grid, all at
+    once: map precache (real TileServer + MapJobs, fake 2 ms network), a search indexer (real
+    search_engine.run_search over a 20k x 512 embedding matrix), an AI/face indexer (thumbnail
+    decode + resize + 512-d projection, like CLIP image indexing) and library refreshes (the
+    daemon's _load_photos_async every 2 s). Counters per worker."""
+
+    def __init__(self, sandbox, window):
+        import threading
+        self.stop = threading.Event()
+        self.counts = {"precache_tiles": 0, "searches": 0, "ai_items": 0, "refreshes": 0, "errors": []}
+        self.window = window
+        self.sandbox = sandbox
+        self.threads = []
+        self.refresh_timer = None
+
+    def _guard(self, name, fn):
+        try:
+            fn()
+        except Exception as e:                           # noqa: BLE001
+            import traceback
+            self.counts["errors"].append(f"{name}: {e!r}")
+            traceback.print_exc()
+
+    def start(self):
+        import threading
+        from PyQt6.QtCore import QTimer
+        for name, fn in (("precache", self._precache), ("search", self._search), ("ai", self._ai)):
+            t = threading.Thread(target=self._guard, args=(name, fn), name=f"load-{name}", daemon=True)
+            t.start()
+            self.threads.append(t)
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self._refresh)
+        self.refresh_timer.start(2000)
+
+    def _refresh(self):
+        try:
+            self.window._load_photos_async()
+            self.counts["refreshes"] += 1
+        except Exception as e:                           # noqa: BLE001
+            self.counts["errors"].append(f"refresh: {e!r}")
+
+    def _precache(self):
+        import gzip as _gz
+        import map_precache
+        import tile_store
+        import types as _t
+
+        class Up:
+            def fetch(self, host, path, lane="map"):
+                time.sleep(0.002)
+                if path == map_precache.OFM_TILEJSON_PATH:
+                    return 200, json.dumps({"tiles": ["https://tiles.openfreemap.org/planet/x/{z}/{x}/{y}.pbf"],
+                                            "minzoom": 0, "maxzoom": 14}).encode(), "application/json", None
+                return 200, _gz.compress(os.urandom(2048) + path.encode()), "application/x-protobuf", "gzip"
+        d = os.path.join(self.sandbox, "load_tiles")
+        os.makedirs(d, exist_ok=True)
+        store = tile_store.TileStore(os.path.join(d, "tiles.sqlite"), budget_mb=512)
+        packs = tile_store.PackManager(os.path.join(d, "packs"))
+        srv = tile_store.TileServer(store, shards=2, packs=packs)
+        srv.upstream = Up()
+        store.ready.wait(10)
+        gov = _t.SimpleNamespace(busy=lambda: False)
+        net = _t.SimpleNamespace(metered=lambda: False)
+        pwr = _t.SimpleNamespace(state=lambda: _t.SimpleNamespace(on_battery=False, saver=False, percent=80))
+        k = 0
+        try:
+            while not self.stop.is_set():
+                mj = map_precache.MapJobs(service_factory=lambda _mb: srv, gov=gov, net=net, power_monitor=pwr)
+                places = [(5 + (k * 37 + i * 1.7) % 20, 42 + (k * 11 + i * 0.9) % 10, 30) for i in range(60)]
+                k += 1
+                mj.start_precache(places=places, manual=True, world=False)
+                while mj.running() and not self.stop.is_set():
+                    time.sleep(0.05)
+                if mj.running():
+                    mj.cancel(wait_s=5)
+                self.counts["precache_tiles"] += int(mj.state().get("done") or 0)
+        finally:
+            srv.shutdown()
+            store.close()
+            packs.close()
+
+    def _search(self):
+        import numpy as np
+        import database
+        import search_engine
+        conn = database.get_connection()
+        try:
+            ids = [r[0] for r in conn.execute("SELECT id FROM media_items")]
+        finally:
+            conn.close()
+        rng = np.random.default_rng(3)
+        mat = rng.standard_normal((len(ids), 512)).astype(np.float32)
+        mat /= np.linalg.norm(mat, axis=1, keepdims=True)
+        emb = {i: mat[j].tobytes() for j, i in enumerate(ids)}
+        row_of = {i: j for j, i in enumerate(ids)}
+        vocab = search_engine.load_vocab()
+
+        def semantic(text, pool, embeddings, face_ids):
+            # as ai_engine ranks: one cached matrix, numpy ops (they release the GIL). A bytes
+            # join of 20k vectors per query held the GIL ~15 ms each and was not the app.
+            q = rng.standard_normal(512).astype(np.float32)
+            idx = np.fromiter((row_of[p] for p in pool), np.int64, len(pool))
+            sc = mat[idx] @ q
+            order = np.argpartition(-sc, 200)[:200]
+            ranked = [pool[i] for i in order[np.argsort(-sc[order])]]
+            return ranked[:60], ranked[60:]
+        queries = ["les u jezera", "Praha 2023", "pes na plazi", "hory v zime", "zapad slunce", "Sumava leto"]
+        n = 0
+        while not self.stop.is_set():
+            search_engine.run_search(queries[n % len(queries)], ids, emb, vocab=vocab, semantic_fn=semantic)
+            n += 1
+            self.counts["searches"] = n
+            time.sleep(0.15)                             # a user typing: a query every ~150 ms
+
+    def _ai(self):
+        import numpy as np
+        import power
+        from PIL import Image
+        power.set_thread_eco(True)                       # as the AI daemon's workers
+        folder = os.path.join(self.sandbox, "pool")
+        pool = sorted(os.path.join(folder, f) for f in os.listdir(folder))
+        proj = np.random.default_rng(5).standard_normal((224 * 224 * 3 // 64, 512)).astype(np.float32)
+        n = 0
+        while not self.stop.is_set():
+            with Image.open(pool[n % len(pool)]) as im:
+                im.draft("RGB", (448, 448))
+                a = np.asarray(im.convert("RGB").resize((224, 224), Image.BICUBIC), np.float32)
+            v = a.reshape(-1, 64).mean(1) @ proj
+            _ = v / (np.linalg.norm(v) + 1e-6)
+            n += 1
+            self.counts["ai_items"] = n
+
+    def finish(self):
+        self.stop.set()
+        if self.refresh_timer is not None:
+            self.refresh_timer.stop()
+        for t in self.threads:
+            t.join(15)
+        self.counts["alive_after_stop"] = [t.name for t in self.threads if t.is_alive()]
+        return dict(self.counts)
+
+
+
+
+def cache_census(grid):
+    """MB held by the grid's bounded caches (thumbnail LRU, pretiles, micro previews)."""
+    out = {}
+    try:
+        m = grid.model()
+        out["thumbs"] = round(m.ram_cache.bytes / 2**20, 1)
+        out["thumbs_n"] = len(m.ram_cache.cache)
+        out["pretiles"] = round(m._pretile_bytes / 2**20, 1)
+        out["micro"] = round(m.micro.nbytes() / 2**20, 1)
+    except Exception as e:                               # noqa: BLE001
+        out["err"] = repr(e)
+    return out
+
+
+def stage_grid(out, passes=3, micro="cold", load=False, sandbox=None):
     from unittest import mock
     from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, QTimer, QElapsedTimer
     from PyQt6.QtGui import QWheelEvent
@@ -341,6 +500,17 @@ def stage_grid(out, passes=3, micro="cold"):
         warm_micro(pre)
     m0 = mem_mb()
     patches = [mock.patch.object(main.MainWindow, "_start_ai_daemon", lambda self: None)]
+    if os.environ.get("BENCH_NO_MAP"):
+        patches.append(mock.patch.object(main.MainWindow, "_ensure_map_view", lambda self: False))
+    for name in filter(None, os.environ.get("BENCH_NOOP", "").split(",")):
+        patches.append(mock.patch.object(main.MainWindow, name, lambda self, *a, **k: None))
+    if os.environ.get("BENCH_NO_DEFERRED"):
+        patches.append(mock.patch.object(main.MainWindow, "_run_deferred_services", lambda self: None))
+    if os.environ.get("BENCH_NO_MICRO"):
+        patches.append(mock.patch.object(main.ApplePhotoModel, "request_micro_backfill", lambda self: 0))
+    if os.environ.get("BENCH_NO_VIEWER_PREWARM"):
+        patches.append(mock.patch.object(main.MainWindow, "_prewarm_viewer", lambda self: None))
+    sys.setswitchinterval(float(os.environ.get("BENCH_SWITCH") or 0.005))
     for p in patches:
         p.start()
     t_open = now_ms()
@@ -356,6 +526,15 @@ def stage_grid(out, passes=3, micro="cold"):
     res = {"records": grid.model().rowCount(), "first_frame_ms": round((first["t"] or now_ms()) - t_open),
            "mem_after_open": mem_mb(), "mem_before": m0, "micro": micro, **pre}
     pump(1500)
+    if os.environ.get("BENCH_IDLE_S"):                   # deferred services settle, no scrolling
+        for k in range(int(os.environ["BENCH_IDLE_S"])):
+            pump(1000)
+        res["mem_idle"] = mem_mb()
+    bg_load = None
+    if load:
+        bg_load = BackgroundLoad(sandbox, w)
+        bg_load.start()
+        pump(1000)
 
     # instrumentation: viewport paints (interval + CPU), blank visible tiles (sampled every 4th
     # frame, outside the timed paint), heartbeat. No tracemalloc while scrolling: it taxes every
@@ -399,7 +578,31 @@ def stage_grid(out, passes=3, micro="cold"):
             tiles.append(tile_census(self))
         frames.append((a, b - a, blank))
     type(grid).paintEvent = paint
+    import power
+    if hasattr(power, "set_process_timer_resolution_honoured"):
+        power.set_process_timer_resolution_honoured()    # a hidden / locked session must not quantise the heartbeat
+    import kinetic_scroll
+    _vb = kinetic_scroll._VBlank.open() if kinetic_scroll.HAS_QT else None
+    res["vblank_ok"] = bool(_vb and _vb())                 # False: session locked / display off -> fps invalid
+    # main-thread stack sampler: while the heartbeat is > 150 ms late, sample the GUI thread
+    import threading as _th
+    import traceback as _tb
+    import collections as _co
+    stall_stacks = _co.Counter()
+    main_id = _th.main_thread().ident
+    sampler_on = [True]
+
+    def _sampler():
+        while sampler_on[0]:
+            time.sleep(0.03)
+            if beats and now_ms() - beats[-1] > 150:
+                f = sys._current_frames().get(main_id)
+                if f is not None:
+                    st = _tb.extract_stack(f)[-7:]
+                    stall_stacks[" <- ".join(f"{os.path.basename(x.filename)}:{x.lineno} {x.name}"
+                                             for x in reversed(st))] += 1
     beats = []
+    _th.Thread(target=_sampler, daemon=True, name="stall-sampler").start()
     hb = QTimer()
     hb.setTimerType(Qt.TimerType.PreciseTimer)
     hb.timeout.connect(lambda: beats.append(now_ms()))
@@ -466,13 +669,44 @@ def stage_grid(out, passes=3, micro="cold"):
             "lowres_tiles_pct": round(100 * sum(t[2] for t in tiles) / max(1, sum(t[0] for t in tiles)), 1),
             "sharp_tiles_pct": round(100 * sum(t[3] for t in tiles) / max(1, sum(t[0] for t in tiles)), 1),
             "stall_max_ms": round(max(gaps or [0]), 1), "stalls_over_50ms": sum(1 for g in gaps if g > 50),
-            "mem": mem_mb(), "py_blocks_growth": sys.getallocatedblocks() - blocks0})
+            "hb_late_p50": pct([g - 4 for g in gaps], 50), "hb_late_p99": pct([g - 4 for g in gaps], 99),
+            "hb_late_over_5ms_pct": round(100 * sum(1 for g in gaps if g - 4 > 5) / max(1, len(gaps)), 2),
+            "gc_objects": len(gc.get_objects()),
+            "mem": mem_mb(), "py_blocks_growth": sys.getallocatedblocks() - blocks0,
+            "caches_mb": cache_census(grid)})
     hb.stop()
+    sampler_on[0] = False
+    res["stall_stacks"] = stall_stacks.most_common(12)
     type(grid).paintEvent = orig_paint
     res["passes"] = passes_out
+    if bg_load is not None:
+        res["load"] = bg_load.finish()
+    try:
+        res["ram_cache_items"] = len(grid.model().ram_cache)
+    except Exception:                                    # noqa: BLE001
+        pass
+    if len(passes_out) >= 4:
+        res["leak_rss_mb_pass2_to_last"] = round(passes_out[-1]["mem"]["rss"] - passes_out[1]["mem"]["rss"], 1)
+        res["leak_private_mb_pass2_to_last"] = round(passes_out[-1]["mem"]["private"] - passes_out[1]["mem"]["private"], 1)
+        res["gc_objects_pass2_to_last"] = passes_out[-1]["gc_objects"] - passes_out[1]["gc_objects"]
     if len(passes_out) >= 3:
         res["leak_rss_mb_pass2_to_3"] = round(passes_out[2]["mem"]["rss"] - passes_out[1]["mem"]["rss"], 1)
         res["leak_private_mb_pass2_to_3"] = round(passes_out[2]["mem"]["private"] - passes_out[1]["mem"]["private"], 1)
+    # what is left when every grid cache is dropped (bounded caches vs anything else)
+    try:
+        m = grid.model()
+        m.ram_cache.clear()
+        m._pretiles.clear()
+        m._pretile_bytes = 0
+        grid.photo_delegate._tiles.clear()
+        grid.photo_delegate._tiles_bytes = 0
+        gc.collect()
+        pump(800)
+        res["mem_after_cache_drop"] = mem_mb()
+        from PyQt6.QtWidgets import QApplication as _QA
+        res["widgets"] = len(_QA.allWidgets())
+    except Exception as e:                               # noqa: BLE001
+        res["cache_drop_err"] = repr(e)
     w.close()
     w.deleteLater()
     pump(500)
@@ -584,6 +818,8 @@ def main_():
     ap.add_argument("--json", default="")
     ap.add_argument("--micro", choices=("cold", "warm"), default="cold",
                     help="warm: micro previews built before the grid opens (returning user)")
+    ap.add_argument("--load", action="store_true",
+                    help="grid passes run with precache + search + AI indexing + library refreshes active")
     ap.add_argument("--_map", nargs=2, help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args._map:                                    # child process: the map stage
@@ -608,7 +844,7 @@ def main_():
         markers = stage_db(out)
         print("db", json.dumps(out["db"], ensure_ascii=False, default=str), flush=True)
         if "grid" in stages:
-            stage_grid(out, args.passes, args.micro)
+            stage_grid(out, args.passes, args.micro, args.load, sandbox)
             print("grid", json.dumps(out["grid"]), flush=True)
         if "map" in stages:
             mk = os.path.join(sandbox, "markers.json")

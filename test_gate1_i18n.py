@@ -19,6 +19,7 @@ NON_UI_MODULES = {
     "search_lexicon.py",                                       # Czech/English search vocabulary
     "i18n.py",                                                 # the engine itself (native language names)
     "regions.py",                                              # place gazetteer: names per language as data
+    "world_regions.py",                                        # generated country catalogue: CLDR names as data
 }
 CZECH = re.compile(r"[áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ„]")   # “ is also English
 DEV_CALLS = {"print", "debug", "info", "warning", "error", "exception", "log", "_log", "_dbg", "critical",
