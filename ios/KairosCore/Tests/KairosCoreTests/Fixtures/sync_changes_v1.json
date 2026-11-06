@@ -1,0 +1,203 @@
+{
+ "changes": [
+  {
+   "data": {
+    "cover_media_id": null,
+    "end_date": "2026-07-03",
+    "id": 1,
+    "item_count": 2,
+    "kind": "journey",
+    "location_name": null,
+    "parent_id": null,
+    "start_date": "2026-07-01",
+    "tint": null,
+    "title": "Šumava"
+   },
+   "entity": "event",
+   "id": 1,
+   "op": "upsert",
+   "seq": 1
+  },
+  {
+   "data": {
+    "id": 1,
+    "is_confirmed": true,
+    "is_favorite": false,
+    "key_face_id": null,
+    "name": "Anna"
+   },
+   "entity": "person",
+   "id": 1,
+   "op": "upsert",
+   "seq": 2
+  },
+  {
+   "data": {
+    "cover_media_id": null,
+    "created_at": null,
+    "filter": null,
+    "id": 1,
+    "items": [
+     1
+    ],
+    "kind": "manual",
+    "name": "Best",
+    "parent_id": null,
+    "position": 0,
+    "query": null,
+    "sort_mode": "date"
+   },
+   "entity": "album",
+   "id": 1,
+   "op": "upsert",
+   "seq": 3
+  },
+  {
+   "data": {
+    "altitude": null,
+    "availability": null,
+    "chapter_id": null,
+    "compass_heading": null,
+    "content_identifier": null,
+    "date_taken": "2026:07:01 10:00:00",
+    "device_make": null,
+    "device_model": null,
+    "event_id": 1,
+    "exposure_time": null,
+    "f_number": null,
+    "file_ext": null,
+    "file_mtime": null,
+    "file_name": "IMG_0001.JPG",
+    "file_size": 10240,
+    "fingerprint": "fp1",
+    "focal_length": null,
+    "focal_length_35mm": null,
+    "gps_source": null,
+    "has_thumb": true,
+    "id": 1,
+    "is_favorite": true,
+    "iso": null,
+    "latitude": 48.97,
+    "lens_model": null,
+    "live": false,
+    "longitude": 13.6,
+    "media_type": "photo",
+    "place_city": null,
+    "place_country": null,
+    "subsec_time": null,
+    "timezone_offset": null
+   },
+   "entity": "media",
+   "id": 1,
+   "op": "upsert",
+   "seq": 4
+  },
+  {
+   "data": {
+    "altitude": null,
+    "availability": null,
+    "chapter_id": null,
+    "compass_heading": null,
+    "content_identifier": null,
+    "date_taken": "2026:07:01 11:00:00",
+    "device_make": null,
+    "device_model": null,
+    "event_id": null,
+    "exposure_time": null,
+    "f_number": null,
+    "file_ext": null,
+    "file_mtime": null,
+    "file_name": "IMG_0002.HEIC",
+    "file_size": null,
+    "fingerprint": null,
+    "focal_length": null,
+    "focal_length_35mm": null,
+    "gps_source": null,
+    "has_thumb": false,
+    "id": 2,
+    "is_favorite": false,
+    "iso": null,
+    "latitude": null,
+    "lens_model": null,
+    "live": true,
+    "longitude": null,
+    "media_type": "photo",
+    "place_city": null,
+    "place_country": null,
+    "subsec_time": null,
+    "timezone_offset": null
+   },
+   "entity": "media",
+   "id": 2,
+   "op": "upsert",
+   "seq": 5
+  },
+  {
+   "entity": "media",
+   "id": 3,
+   "op": "delete",
+   "seq": 6
+  },
+  {
+   "entity": "media",
+   "id": 4,
+   "op": "delete",
+   "seq": 7
+  },
+  {
+   "data": {
+    "bbox": [
+     0.1,
+     0.2,
+     0.3,
+     0.4
+    ],
+    "id": 1,
+    "media_id": 1,
+    "person_id": 1,
+    "quality": 0.9
+   },
+   "entity": "face",
+   "id": 1,
+   "op": "upsert",
+   "seq": 8
+  },
+  {
+   "entity": "face",
+   "id": 2,
+   "op": "delete",
+   "seq": 9
+  },
+  {
+   "data": {
+    "media_id": 1,
+    "params": {
+     "angle": 0.0,
+     "aspect": "free",
+     "contrast": 0.0,
+     "crop": [
+      0.1,
+      0.1,
+      0.8,
+      0.8
+     ],
+     "exposure": 25.0,
+     "highlights": 0.0,
+     "shadows": 0.0,
+     "temperature": 0.0,
+     "v": 1
+    },
+    "updated_at": "2026-11-06 12:00:00"
+   },
+   "entity": "edit",
+   "id": 1,
+   "op": "upsert",
+   "seq": 10
+  }
+ ],
+ "cursor": 10,
+ "library_id": "fixture",
+ "more": false,
+ "protocol": 1,
+ "reset": false
+}

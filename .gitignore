@@ -37,3 +37,10 @@ portable.txt
 
 # Instalátor (Inno Setup) – výstup
 installer/Output/
+
+# iOS (ios/): SwiftPM / Xcode artefacts – the project is generated from project.yml
+ios/.build/
+ios/.swiftpm/
+ios/*.xcodeproj/
+ios/DerivedData/
+ios/KairosApp/Info.plist

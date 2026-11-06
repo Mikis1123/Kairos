@@ -518,6 +518,8 @@ def shutdown_app(app, window):
     icons.clear_cache()                     # Kairos: QPixmap ikon nesmí přežít QApplication
     release_map_profile()
     tile_store.stop()                       # C7e: místní server dlaždic + dopsání fronty zápisů
+    if "sync_server" in sys.modules:
+        sys.modules["sync_server"].stop()   # iOS LAN bridge (only imported when enabled)
     try:
         xmp_sync.uninstall()                # dopsat čekající XMP sidecary
     except Exception as e:
@@ -4409,6 +4411,9 @@ class MainWindow(QMainWindow):
         i18n.notifier().changed.connect(self._on_language_changed)   # Gate 1: přepnutí jazyka za běhu
         # Sprint 2: kurátorská data i do XMP sidecarů (zápis na pozadí, vypínatelné v Předvolbách)
         xmp_sync.install(get_connection, lambda: bool(self.config.get("xmp_sidecars", True)))
+        if self.config.get("sync_server_enabled", False):
+            import sync_server              # iOS Phase 1: schema, certificate and bind on a worker thread
+            sync_server.start_async()
         self.setWindowTitle(brand.APP_NAME)
         self.setMinimumSize(1100, 700)
         self.resize(1280, 800)

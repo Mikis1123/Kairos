@@ -64,6 +64,8 @@ DEFAULT_CONFIG = {
     "show_hidden_folder": True,
     # Gate 0 – AI na pozadí na baterii: "throttle" | "pause" | "full" (power.py)
     "battery_policy": "throttle",
+    # iOS Phase 1: LAN bridge for the iPhone companion (sync_server.py) - opt-in, off by default
+    "sync_server_enabled": False,
     # Gate 0 – vlastní umístění mezipaměti ("" = %LOCALAPPDATA%\\Kairos\\cache; paths.CACHE_ROOT)
     "cache_dir": "",
     # Gate 1 – jazyk rozhraní: "system" (jazyk Windows, jinak angličtina) | en | cs | de | es | fr | ja | zh-CN
