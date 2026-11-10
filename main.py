@@ -5286,6 +5286,24 @@ class MainWindow(QMainWindow):
         bridge.changed.connect(self._on_remote_change)
         self._sync_bridge = bridge
         sys.modules["sync_server"].set_remote_change_handler(bridge.changed.emit)
+        sys.modules["sync_server"].set_search_provider(self._phone_search)
+
+    def _phone_search(self, query, limit):
+        """/v1/search from the iPhone (a sync_server request thread): the same warm search as
+        the desktop's field, over the vectors already in memory. None = not loaded yet, the bridge
+        then loads them itself."""
+        vectors = self._embeddings_cache
+        if not vectors:
+            return None
+        conn = get_connection()
+        try:
+            universe = [r[0] for r in conn.execute(
+                f"SELECT m.id FROM media_items m WHERE {visible_media_sql('m')} "
+                "ORDER BY m.date_taken DESC, m.id DESC")]
+        finally:
+            conn.close()
+        r = search_engine.run_search(query, universe, vectors)
+        return {"ids": r.ids[:limit], "confident": len(r.confident), "semantic": r.semantic, "labels": r.labels}
 
     def _on_remote_change(self, kind, media_id):
         if kind == "import":

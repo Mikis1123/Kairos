@@ -25,6 +25,17 @@ Incremental sync
   or crop versions costs nothing. The current state of the row is serialized at read time: a row
   that is missing or not visible becomes a tombstone ({"op": "delete"}).
 
+Concurrency (Parity sprint, 2026-11-10)
+  One thread per keep-alive connection (HTTP/1.1, TCP_NODELAY). The phone keeps a handful of
+  connections open and reuses them, so a fast scroll costs no TCP or TLS handshakes. Requests are
+  admitted through two lanes instead of a reject-when-full gate: the interactive lane (thumbnails,
+  micro pages, video ranges, search) has INTERACTIVE_SLOTS and the bulk lane (map packs, bulk
+  originals, uploads) has BULK_SLOTS, so a backup never starves browsing. A request that finds its
+  lane full WAITS up to ADMIT_WAIT_S for a slot; 503 "busy" is only the answer to a truly stuck
+  server, never to a fast scroll. Blocking SQLite and file reads are why this stays threaded rather
+  than asyncio: every handler would run in an executor anyway, and with one phone on the LAN the
+  thread count is bounded by MAX_CONNECTIONS.
+
 Off the GUI thread, aware of battery and idle state
   The listener and every request run on daemon threads. Bulk transfers (map packs, and originals
   requested with bulk=1) are refused with 503 + Retry-After when power.py says PAUSE (battery saver
@@ -63,8 +74,16 @@ DEFAULT_PORT = 52790
 CHUNK = 256 * 1024
 PIN_TTL_S = 120
 PIN_MAX_ATTEMPTS = 5
-MAX_CONCURRENT = 8                 # HTTP requests in flight (WebSockets are counted separately)
+INTERACTIVE_SLOTS = 32             # thumbnails, micro pages, video ranges, search: in flight at once
+BULK_SLOTS = 2                     # map packs, bulk originals, camera-roll uploads
+ADMIT_WAIT_S = 20.0                # a full lane queues the request this long before 503 "busy"
+MAX_CONNECTIONS = 64               # keep-alive connections (threads); more are refused at accept
 MAX_SOCKETS = 4                    # WebSocket change feeds
+MATCH_MAX = 400                    # /v1/match: hashes per request
+MATCH_HASH_BUDGET = 1024 ** 3      # /v1/match: bytes hashed per request when a file is not cached yet
+SEARCH_LIMIT = 500
+SEARCH_VECTOR_TTL_S = 120.0
+FEATURES = ("search", "match", "journey", "lanes")
 PAGE_DEFAULT, PAGE_MAX = 500, 2000
 MICRO_BATCH_MAX = 500
 WS_KEEPALIVE_S = 20.0
@@ -554,7 +573,26 @@ class _HttpError(Exception):
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = False
-    request_queue_size = 32
+    request_queue_size = 64
+    block_on_close = False
+
+    def __init__(self, *a, **kw):
+        self._conns = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*a, **kw)
+
+    def process_request(self, request, client_address):
+        # at the cap, accepting pauses: further connects wait in the kernel backlog, and only a
+        # client that keeps leaking connections for ADMIT_WAIT_S is refused
+        if not self._conns.acquire(timeout=ADMIT_WAIT_S):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conns.release()
 
     def handle_error(self, request, client_address):
         import sys
@@ -594,8 +632,13 @@ class SyncServer:
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx.load_cert_chain(cert, key)
             self._ctx = ctx
-        self._slots = threading.BoundedSemaphore(MAX_CONCURRENT)
+        self._lanes = {"interactive": threading.BoundedSemaphore(INTERACTIVE_SLOTS),
+                       "bulk": threading.BoundedSemaphore(BULK_SLOTS)}
         self._sockets = threading.BoundedSemaphore(MAX_SOCKETS)
+        self.search_fn = None                     # callable(query, limit) -> dict; None = _search_default
+        self._vectors = (0.0, None)               # (loaded at, {id: vector}) for the default search
+        self._vectors_lock = threading.Lock()
+        self.stats = {"admitted": 0, "waited": 0, "busy": 0}
         self._seq_cond = threading.Condition()
         self._top_seq = self._read_top()
         self._stop = threading.Event()
@@ -668,6 +711,10 @@ class SyncServer:
 
             def setup(self):
                 self.request.settimeout(SOCKET_TIMEOUT_S)
+                try:                                # headers and body are separate writes: without
+                    self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # this, Nagle +
+                except OSError:                     # delayed ACK stall every keep-alive reply ~40 ms
+                    pass
                 if server._ctx is not None:
                     # handshake on the request thread, never on the accept loop
                     self.request = server._ctx.wrap_socket(self.request, server_side=True)
@@ -697,10 +744,15 @@ class SyncServer:
                 self.query = {k: v[-1] for k, v in parse_qs(url.query).items()}
                 parts = [p for p in url.path.split("/") if p]
                 is_ws = parts == ["v1", "events"]
-                gate = server._sockets if is_ws else server._slots
+                gate = server._sockets if is_ws else server._lanes[server.lane(method, parts, self.query)]
                 if not gate.acquire(blocking=False):
-                    # i18n-ok: HTTP header name, not UI text
-                    return self._error(_HttpError(503, "busy", {"Retry-After": "2"}))
+                    server.stats["waited"] += 1
+                    # a full lane queues the request (a fast scroll); only a stuck server says busy
+                    if is_ws or not gate.acquire(timeout=ADMIT_WAIT_S):
+                        server.stats["busy"] += 1
+                        # i18n-ok: HTTP header name, not UI text
+                        return self._error(_HttpError(503, "busy", {"Retry-After": "1"}))
+                server.stats["admitted"] += 1
                 try:
                     server._route(self, method, parts)
                 except _HttpError as e:
@@ -757,12 +809,24 @@ class SyncServer:
 
         return Handler
 
+    @staticmethod
+    def lane(method, parts, query):
+        """'bulk' for transfers that may take minutes (packs, bulk originals, uploads), else
+        'interactive'. Separate lanes: a camera-roll backup never delays a thumbnail."""
+        if len(parts) == 3 and parts[:2] == ["v1", "packs"]:
+            return "bulk"
+        if parts == ["v1", "import"] and method == "POST":
+            return "bulk"
+        if query.get("bulk") == "1":
+            return "bulk"
+        return "interactive"
+
     def _route(self, h, method, parts):
         if parts == ["v1", "hello"] and method in ("GET", "HEAD"):
             state, bulk_ok = _power_state()
             return h.send_json({"app": "Kairos", "protocol": PROTOCOL, "name": self.name,
                                 "library_id": self.library_id, "pairing": self.credentials.pairing_active(),
-                                "power": state, "bulk_ok": bulk_ok})
+                                "power": state, "bulk_ok": bulk_ok, "features": list(FEATURES)})
         if parts == ["v1", "pair"] and method == "POST":
             body = h.body_json()
             try:
@@ -801,7 +865,222 @@ class SyncServer:
         if len(parts) == 3 and parts[:2] == ["v1", "import"] and method == "GET":
             rel = self._imported(_sha_param(parts[2]))
             return h.send_json({"status": "present" if rel else "absent", "name": rel})
+        if parts == ["v1", "search"] and method == "GET":
+            return h.send_json(self.search(h.query.get("q", ""), _int(h.query.get("limit"), SEARCH_LIMIT)))
+        if parts == ["v1", "match"] and method == "POST":
+            return h.send_json(self.match(h.body_json(cap=1024 * 1024)))
+        if len(parts) == 3 and parts[:2] == ["v1", "journey"] and parts[2].isdigit() and method == "GET":
+            return h.send_json(self.journey(int(parts[2])))
         raise _HttpError(404, "not_found")
+
+    # ── semantic search (the desktop's CLIP / SigLIP index; embeddings never leave the PC) ──
+    def search(self, query, limit=SEARCH_LIMIT):
+        """{"ids": [...best first], "confident": n, "semantic": bool, "labels": [...]}. Only
+        visible items. The desktop app installs its own warm search (set_search_provider), so a
+        query from the phone costs the same ~20 ms as one typed on the PC."""
+        query = str(query or "").strip()[:200]
+        limit = max(1, min(int(limit or SEARCH_LIMIT), 2000))
+        if not query:
+            return {"query": "", "ids": [], "confident": 0, "semantic": False, "labels": []}
+        fn = self.search_fn or _search_provider or self._search_default
+        try:
+            res = fn(query, limit)
+            if res is None:                           # the desktop's index isn't warm yet
+                res = self._search_default(query, limit)
+        except Exception as e:                        # noqa: BLE001 – a model error = no results
+            print(f"[Sync] search: {e!r}")
+            res = {"ids": [], "confident": 0, "semantic": False, "labels": []}
+        conn = self.connect_ro()
+        try:
+            visible = _visible_ids(conn, [int(i) for i in res.get("ids", [])])
+        finally:
+            conn.close()
+        ids = [int(i) for i in res.get("ids", []) if int(i) in visible][:limit]
+        return {"query": query, "ids": ids, "confident": min(int(res.get("confident", 0)), len(ids)),
+                "semantic": bool(res.get("semantic")), "labels": list(res.get("labels", []))}
+
+    def _search_default(self, query, limit):
+        import search_engine
+        conn = self.connect_ro()
+        try:
+            universe = [r[0] for r in conn.execute(
+                f"SELECT m.id FROM media_items m WHERE {database.visible_media_sql('m')} "
+                "ORDER BY m.date_taken DESC, m.id DESC")]
+        finally:
+            conn.close()
+        with self._vectors_lock:
+            at, vectors = self._vectors
+            if vectors is None or time.monotonic() - at > SEARCH_VECTOR_TTL_S:
+                vectors = database.get_search_vectors()
+                self._vectors = (time.monotonic(), vectors)
+        r = search_engine.run_search(query, universe, vectors)
+        return {"ids": r.ids[:limit], "confident": len(r.confident), "semantic": r.semantic, "labels": r.labels}
+
+    # ── three-state sync: which phone assets does the desktop already hold? ──
+    def _hashes_db(self):
+        conn = sqlite3.connect(os.path.join(self.state_dir, "hashes.sqlite"), timeout=30)
+        conn.execute("CREATE TABLE IF NOT EXISTS hashes (path TEXT PRIMARY KEY, size INTEGER, mtime REAL, "
+                     "sha256 TEXT)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hashes_sha ON hashes (sha256)")
+        return conn
+
+    @staticmethod
+    def _norm(p):
+        return os.path.normcase(os.path.normpath(p or ""))
+
+    def _file_sha(self, path, budget):
+        """SHA-256 of a desktop file, cached by (path, size, mtime). (hex or None, bytes hashed)."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None, 0
+        hconn = self._hashes_db()
+        try:
+            row = hconn.execute("SELECT size, mtime, sha256 FROM hashes WHERE path = ?", (self._norm(path),)).fetchone()
+            if row and row[0] == st.st_size and abs((row[1] or 0) - st.st_mtime) < 1e-3:
+                return row[2], 0
+            if st.st_size > budget:
+                return None, 0
+            import cloud_files
+            if not cloud_files.local_ok(path):            # never pull a OneDrive file down to hash it
+                return None, 0
+            hasher = hashlib.sha256()
+            with open(path, "rb") as fh:
+                while buf := fh.read(1 << 20):
+                    hasher.update(buf)
+            digest = hasher.hexdigest()
+            with hconn:
+                hconn.execute("INSERT OR REPLACE INTO hashes VALUES (?, ?, ?, ?)",
+                              (self._norm(path), st.st_size, st.st_mtime, digest))
+            return digest, st.st_size
+        finally:
+            hconn.close()
+
+    def match(self, body):
+        """POST /v1/match {"assets": [{"sha256": hex, "size": n, "name": "IMG_0042.HEIC"}, ...]}
+        -> {"matches": {sha256: media_id}}. Proof by content, not by name: a hash is resolved
+        through the camera-roll import journal first (bytes the phone sent), then by hashing the
+        desktop files of the same size (cached in sync/hashes.sqlite, budgeted per request). A Live
+        Photo's motion half resolves to its still's media id."""
+        assets = body.get("assets") if isinstance(body, dict) else None
+        if not isinstance(assets, list):
+            raise _HttpError(400, "bad_body")
+        wanted = {}
+        for a in assets[:MATCH_MAX]:
+            if not isinstance(a, dict):
+                continue
+            try:
+                digest = _sha_param(str(a.get("sha256", "")))
+            except _HttpError:
+                continue
+            wanted[digest] = (_int(a.get("size"), 0), str(a.get("name") or ""))
+        out = {}
+        if not wanted:
+            return {"matches": out}
+        conn = self.connect_ro()
+        try:
+            rows = conn.execute(f"SELECT m.id, m.file_path, m.paired_video_path, m.file_size, m.file_name "
+                                f"FROM media_items m WHERE {database.visible_media_sql('m')}").fetchall()
+        finally:
+            conn.close()
+        by_path = {}
+        for mid, fp, live, _size, _name in rows:
+            if fp:
+                by_path[self._norm(fp)] = mid
+            if live:
+                by_path.setdefault(self._norm(live), mid)
+        # 1) the import journal: bytes the phone itself sent
+        with self._import_lock:
+            iconn = self._imports_db()
+            try:
+                for part in _chunks(list(wanted)):
+                    for digest, rel in iconn.execute(
+                            f"SELECT sha256, rel_path FROM imports WHERE sha256 IN ({_qmarks(len(part))})", part):
+                        mid = by_path.get(self._norm(os.path.join(self.inbox_dir, rel)))
+                        if mid is not None:
+                            out[digest] = mid
+            finally:
+                iconn.close()
+        # 2) cached hashes of library files
+        left = [d for d in wanted if d not in out]
+        if left:
+            hconn = self._hashes_db()
+            try:
+                for part in _chunks(left):
+                    for path, size, mtime, digest in hconn.execute(
+                            f"SELECT path, size, mtime, sha256 FROM hashes WHERE sha256 IN ({_qmarks(len(part))})",
+                            part):
+                        mid = by_path.get(path)
+                        if mid is None or digest in out:
+                            continue
+                        try:
+                            st = os.stat(path)
+                        except OSError:
+                            continue
+                        if st.st_size == size and abs((mtime or 0) - st.st_mtime) < 1e-3:   # still those bytes
+                            out[digest] = mid
+            finally:
+                hconn.close()
+        # 3) hash same-size candidates (same name first), within the per-request budget
+        left = [d for d in wanted if d not in out]
+        if left:
+            files = []                                  # (path, media id, size, name)
+            for mid, fp, live, size, name in rows:
+                if fp:
+                    files.append((fp, mid, size, (name or os.path.basename(fp)).lower()))
+                if live:
+                    files.append((live, mid, None, os.path.basename(live).lower()))
+            budget = MATCH_HASH_BUDGET
+            for digest in left:
+                size, name = wanted[digest]
+                if size <= 0:
+                    continue
+                cands = []
+                for path, mid, fsize, fname in files:
+                    if fsize is None:
+                        try:
+                            fsize = os.path.getsize(path)
+                        except OSError:
+                            continue
+                    if fsize == size:
+                        cands.append((fname != name.lower(), path, mid))
+                for _, path, mid in sorted(cands)[:4]:
+                    got, cost = self._file_sha(path, budget)
+                    budget -= cost
+                    if got == digest:
+                        out[digest] = mid
+                        break
+                if budget <= 0:
+                    break
+        return {"matches": out}
+
+    # ── Trip mode: the desktop's journey (stops, day chapters, GPX legs) without any paths ──
+    def journey(self, event_id):
+        import journey as jr
+        conn = self.connect_ro()
+        try:
+            data = jr.build_journey(conn, event_id)
+        finally:
+            conn.close()
+        if data is None:
+            raise _HttpError(404, "no_journey")
+
+        def stop(s):
+            return {"lat": s["lat"], "lon": s["lon"], "start": s.get("start"), "end": s.get("end"),
+                    "city": s.get("city") or "", "count": s.get("count", 0),
+                    "entry": s.get("entry"), "exit": s.get("exit"),
+                    "best": (s.get("best") or {}).get("id"),
+                    "photos": [p["id"] for p in s.get("photos", [])]}
+
+        out = {"id": data["id"], "title": data.get("title") or "", "location": data.get("location") or "",
+               "start": data.get("start"), "end": data.get("end"), "count": data.get("count", 0),
+               "stops": [stop(s) for s in data["stops"]], "tracks": data.get("tracks") or {}, "days": []}
+        for d in data.get("days") or []:
+            out["days"].append({"n": d["n"], "date": d.get("date"), "start": d.get("start"), "end": d.get("end"),
+                                "count": d.get("count", 0), "city": d.get("city") or "",
+                                "first": d.get("first", 0), "stops": [stop(s) for s in d.get("stops") or []],
+                                "tracks": d.get("tracks") or {}})
+        return out
 
     # ── media ──
     def _media_row(self, media_id):
@@ -1224,6 +1503,17 @@ _service = None
 _service_lock = threading.Lock()
 _remote_handler = None          # desktop GUI hook, survives stop/start (set_remote_change_handler)
 last_error = None               # why the last start() failed, for the Settings status line
+
+
+_search_provider = None
+
+
+def set_search_provider(fn):
+    """fn(query, limit) -> {"ids", "confident", "semantic", "labels"}: the desktop app's warm
+    search (its embeddings cache and loaded text model), used for /v1/search. None = the bridge
+    loads the vectors itself (standalone runs)."""
+    global _search_provider
+    _search_provider = fn
 
 
 def set_remote_change_handler(fn):
