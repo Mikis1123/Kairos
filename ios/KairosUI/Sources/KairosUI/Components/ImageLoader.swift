@@ -15,9 +15,10 @@ import UniformTypeIdentifiers
 ///   grid:     those bytes decoded at grid size (640 px long edge) with the edit applied.
 ///   thumb:    the same at full thumbnail resolution with the edit (the viewer's first pass).
 ///   raw:      full resolution WITHOUT the edit (the editor's fallback source).
-///   original: streamed on demand into Caches/Kairos/originals (the newest 12 files are kept), then
-///             decoded at the size the caller asks for: the viewer's screen pass and 1:1 detail
-///             pass, or the editor's 2048 px working source.
+///   original: streamed on demand into Caches/Kairos/originals, then decoded at the size the
+///             caller asks for: the viewer's screen pass and 1:1 detail pass, or the editor's
+///             2048 px working source. The same folder holds downloaded videos and Live Photo
+///             motion halves (mediaFile). Newest first within 1.5 GB, the 3 newest always kept.
 /// Memory: one NSCache, costed in decoded bytes.
 @MainActor
 public final class ImageLoader {
@@ -26,7 +27,7 @@ public final class ImageLoader {
     private let cache = NSCache<NSString, CGImageBox>()
     private var pendingBytes: [String: PendingFetch] = [:]
     private var staleMicro: Set<MediaID> = []
-    private var originalTasks: [MediaID: Task<URL?, Never>] = [:]
+    private var fileTasks: [String: Task<Result<URL, Error>, Never>] = [:]
     /// The server allows 8 requests in flight; the sync engine, micro pages and originals need
     /// the rest.
     private let gate = FetchGate(limit: 4)
@@ -34,7 +35,8 @@ public final class ImageLoader {
 
     nonisolated static let microPixel = 48
     nonisolated static let gridPixel = 640
-    nonisolated static let originalsKept = 12
+    nonisolated static let originalsBudget: Int64 = 1536 * 1024 * 1024
+    nonisolated static let originalsAlwaysKept = 3
     nonisolated static let budgetKey = "kairos.cache.budgetBytes"
     nonisolated static let defaultBudget: Int64 = 5 * 1024 * 1024 * 1024
 
@@ -276,43 +278,75 @@ public final class ImageLoader {
         return base.appendingPathComponent("Kairos/originals", isDirectory: true)
     }
 
-    /// Local file of the original (downloaded once, keyed by id + fingerprint so a changed file
-    /// on the desktop is fetched again). Nil for videos, cloud-only originals and offline.
+    /// Local file of a still original (downloaded once, keyed by id + fingerprint so a changed
+    /// file on the desktop is fetched again). Nil for videos, cloud-only originals and offline.
     public func originalFile(_ id: MediaID) async -> URL? {
         guard let item = store?.media(id), !item.isVideo else { return nil }
-        let name = "\(id)-\(item.fingerprint ?? "x").\(item.fileExt?.trimmingCharacters(in: CharacterSet(charactersIn: ".")) ?? "img")"
+        return try? await mediaFile(id, live: false).get()
+    }
+
+    /// Cache file name: id + fingerprint + kind. A Live Photo's motion half is always a QuickTime
+    /// movie on iPhone; AVFoundation reads the container from the bytes anyway.
+    private func mediaFileName(_ id: MediaID, live: Bool) -> String? {
+        guard let item = store?.media(id) else { return nil }
+        let fp = (item.fingerprint ?? "x").map { $0.isLetter || $0.isNumber ? $0 : "_" }
+        if live { return "\(id)-\(String(fp))-live.mov" }
+        let ext = item.fileExt?.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        let suffix = ext.flatMap { $0.isEmpty ? nil : $0 } ?? (item.isVideo ? "mov" : "img")
+        return "\(id)-\(String(fp)).\(suffix)"
+    }
+
+    /// The local copy if it is already downloaded (no network). Touches it, so it stays cached.
+    public func cachedMediaFile(_ id: MediaID, live: Bool) -> URL? {
+        guard let name = mediaFileName(id, live: live) else { return nil }
         let dest = Self.originalsDirectory.appendingPathComponent(name)
-        if FileManager.default.fileExists(atPath: dest.path) {
-            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: dest.path)
-            return dest
+        guard FileManager.default.fileExists(atPath: dest.path) else { return nil }
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: dest.path)
+        return dest
+    }
+
+    /// The whole original (photo or video) or the Live Photo motion half as a local file,
+    /// downloaded once and shared by every caller asking meanwhile. The error says why not:
+    /// SyncError.server(409, "cloud_only"), or `offline` when no desktop is paired / reachable.
+    public func mediaFile(_ id: MediaID, live: Bool) async -> Result<URL, Error> {
+        if let hit = cachedMediaFile(id, live: live) { return .success(hit) }
+        guard let name = mediaFileName(id, live: live) else { return .failure(SyncError.server(404, "not_found")) }
+        if let running = fileTasks[name] { return await running.value }
+        guard let client else { return .failure(URLError(.notConnectedToInternet)) }
+        let dest = Self.originalsDirectory.appendingPathComponent(name)
+        let task = Task<Result<URL, Error>, Never>.detached(priority: .userInitiated) {
+            do {
+                let tmp = try await client.downloadOriginal(id, live: live)
+                let fm = FileManager.default
+                try? fm.createDirectory(at: ImageLoader.originalsDirectory, withIntermediateDirectories: true)
+                try? fm.removeItem(at: dest)
+                try fm.moveItem(at: tmp, to: dest)
+                ImageLoader.pruneOriginals()
+                return .success(dest)
+            } catch {
+                return .failure(error)
+            }
         }
-        if let running = originalTasks[id] { return await running.value }
-        guard let client else { return nil }
-        let task = Task<URL?, Never>.detached(priority: .userInitiated) {
-            guard let tmp = try? await client.downloadOriginal(id) else { return nil }
-            let fm = FileManager.default
-            try? fm.createDirectory(at: ImageLoader.originalsDirectory, withIntermediateDirectories: true)
-            try? fm.removeItem(at: dest)
-            do { try fm.moveItem(at: tmp, to: dest) } catch { return nil }
-            ImageLoader.pruneOriginals()
-            return dest
-        }
-        originalTasks[id] = task
-        let url = await task.value
-        originalTasks[id] = nil
-        return url
+        fileTasks[name] = task
+        let result = await task.value
+        fileTasks[name] = nil
+        return result
     }
 
     nonisolated static func pruneOriginals() {
         let fm = FileManager.default
-        let keys: [URLResourceKey] = [.contentModificationDateKey]
-        guard let files = try? fm.contentsOfDirectory(at: originalsDirectory, includingPropertiesForKeys: keys) else { return }
-        let sorted = files.sorted {
-            let a = (try? $0.resourceValues(forKeys: Set(keys)).contentModificationDate) ?? .distantPast
-            let b = (try? $1.resourceValues(forKeys: Set(keys)).contentModificationDate) ?? .distantPast
-            return a > b
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileAllocatedSizeKey, .fileSizeKey]
+        guard let files = try? fm.contentsOfDirectory(at: originalsDirectory, includingPropertiesForKeys: Array(keys))
+        else { return }
+        let entries = files.map { f -> (url: URL, date: Date, size: Int64) in
+            let v = try? f.resourceValues(forKeys: keys)
+            return (f, v?.contentModificationDate ?? .distantPast, Int64(v?.fileAllocatedSize ?? v?.fileSize ?? 0))
+        }.sorted { $0.date > $1.date }
+        var sum: Int64 = 0
+        for (i, e) in entries.enumerated() {
+            sum += e.size
+            if i >= originalsAlwaysKept && sum > originalsBudget { try? fm.removeItem(at: e.url) }
         }
-        for f in sorted.dropFirst(originalsKept) { try? fm.removeItem(at: f) }
     }
 
     /// Decoded original with the edit applied, plus the edited FULL-resolution pixel size (the

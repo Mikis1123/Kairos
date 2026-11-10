@@ -9,11 +9,14 @@ import SwiftUI
 /// for the screen. When a zoom passes what that holds, a detail pass decodes up to 6000 px.
 /// The slider button opens the touch editor (EditView). It writes the same `media_edits` JSON
 /// as the desktop's Quick Edit.
+/// Videos are pages of their own (VideoPageController: streamed, autoplay, scrubber). Live
+/// Photos play their motion while pressed and held, or once from the LIVE button.
 struct ViewerView: View {
     let ids: [MediaID]
     @State private var current: MediaID
     @State private var editing: EditRoute?
     @State private var chrome = true
+    @State private var livePlay = 0
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
 
@@ -30,7 +33,8 @@ struct ViewerView: View {
         ZStack(alignment: .top) {
             Color.black.ignoresSafeArea()
             #if os(iOS)
-            PhotoPager(ids: ids, current: $current, revision: model.revision, model: model,
+            PhotoPager(ids: ids, current: $current, revision: model.revision, model: model, chrome: chrome,
+                       livePlay: livePlay,
                        onSingleTap: { withAnimation(Kairos.Motion.standard) { chrome.toggle() } })
                 .ignoresSafeArea()
             #else
@@ -54,6 +58,16 @@ struct ViewerView: View {
         HStack(spacing: 2) {
             Button { dismiss() } label: { Image(systemName: "xmark").padding(10) }
                 .accessibilityLabel("Close")
+            if model.store?.media(current)?.live == true {
+                Button { livePlay += 1 } label: {
+                    Label("LIVE", systemImage: "livephoto")
+                        .font(.system(size: 12, weight: .semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 10)
+                }
+                .accessibilityLabel("Play Live Photo")
+                .accessibilityHint("Or touch and hold the photo")
+            }
             Spacer()
             let fav = model.store?.media(current)?.isFavorite == true
             Button { Task { await model.toggleFavorite(current) } } label: {
@@ -84,6 +98,7 @@ extension View {
 }
 
 #if os(iOS)
+import AVFoundation
 import UIKit
 
 /// UIPageViewController pager: native paging physics, 20 pt between photos, and pages created
@@ -93,6 +108,8 @@ struct PhotoPager: UIViewControllerRepresentable {
     @Binding var current: MediaID
     let revision: Int
     let model: AppModel
+    let chrome: Bool
+    let livePlay: Int
     var onSingleTap: () -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -114,7 +131,15 @@ struct PhotoPager: UIViewControllerRepresentable {
             c.revision = revision
             c.livePages().forEach { $0.reloadIfEditChanged() }
         }
-        if let shown = pvc.viewControllers?.first as? PhotoPageController, shown.id != current,
+        if c.chrome != chrome {
+            c.chrome = chrome
+            c.livePages().forEach { $0.setChrome(chrome, animated: true) }
+        }
+        if c.livePlay != livePlay {
+            c.livePlay = livePlay
+            (pvc.viewControllers?.first as? PhotoPageController)?.playLive(held: false)
+        }
+        if let shown = pvc.viewControllers?.first as? ViewerPage, shown.id != current,
            let to = c.index[current] {
             let from = c.index[shown.id] ?? 0
             pvc.setViewControllers([c.page(for: current)], direction: to > from ? .forward : .reverse, animated: false)
@@ -125,32 +150,39 @@ struct PhotoPager: UIViewControllerRepresentable {
     final class Coordinator: NSObject, UIPageViewControllerDataSource, UIPageViewControllerDelegate {
         var parent: PhotoPager
         var revision: Int
+        var chrome: Bool
+        var livePlay: Int
         let index: [MediaID: Int]
-        private let pages = NSMapTable<NSNumber, PhotoPageController>.strongToWeakObjects()
+        private let pages = NSMapTable<NSNumber, UIViewController>.strongToWeakObjects()
 
         init(_ parent: PhotoPager) {
             self.parent = parent
             revision = parent.revision
+            chrome = parent.chrome
+            livePlay = parent.livePlay
             var idx: [MediaID: Int] = [:]
             idx.reserveCapacity(parent.ids.count)
             for (i, id) in parent.ids.enumerated() where idx[id] == nil { idx[id] = i }
             index = idx
         }
 
-        func page(for id: MediaID) -> PhotoPageController {
+        func page(for id: MediaID) -> UIViewController {
             if let live = pages.object(forKey: NSNumber(value: id)) { return live }
-            let p = PhotoPageController(id: id, model: parent.model)
+            let p: ViewerPage = parent.model.store?.media(id)?.isVideo == true
+                ? VideoPageController(id: id, model: parent.model)
+                : PhotoPageController(id: id, model: parent.model)
             p.onSingleTap = { [weak self] in self?.parent.onSingleTap() }
+            p.setChrome(chrome, animated: false)
             pages.setObject(p, forKey: NSNumber(value: id))
             return p
         }
 
-        func livePages() -> [PhotoPageController] {
-            pages.objectEnumerator()?.allObjects.compactMap { $0 as? PhotoPageController } ?? []
+        func livePages() -> [ViewerPage] {
+            pages.objectEnumerator()?.allObjects.compactMap { $0 as? ViewerPage } ?? []
         }
 
         private func neighbour(of vc: UIViewController, _ step: Int) -> UIViewController? {
-            guard let p = vc as? PhotoPageController, let i = index[p.id] else { return nil }
+            guard let p = vc as? ViewerPage, let i = index[p.id] else { return nil }
             let j = i + step
             guard parent.ids.indices.contains(j) else { return nil }
             return page(for: parent.ids[j])
@@ -166,22 +198,29 @@ struct PhotoPager: UIViewControllerRepresentable {
 
         func pageViewController(_ pvc: UIPageViewController, didFinishAnimating finished: Bool,
                                 previousViewControllers: [UIViewController], transitionCompleted completed: Bool) {
-            guard completed, let shown = pvc.viewControllers?.first as? PhotoPageController else { return }
+            guard completed, let shown = pvc.viewControllers?.first as? ViewerPage else { return }
             parent.current = shown.id
-            for case let old as PhotoPageController in previousViewControllers where old !== shown {
-                old.zoom.resetZoom()                     // coming back shows the photo at Fit, as in Photos
+            for case let old as ViewerPage in previousViewControllers where old !== shown {
+                old.pageDidHide()                        // photos return to Fit, videos rewind (as in Photos)
             }
         }
     }
 }
 
-/// One page: a ZoomingImageView fed by the loading passes.
+/// One page: a ZoomingImageView fed by the loading passes. A Live Photo also gets a motion layer
+/// above it, shown over the photo's frame while the motion plays.
 @MainActor
-final class PhotoPageController: UIViewController {
+final class PhotoPageController: UIViewController, ViewerPage {
     let id: MediaID
     let model: AppModel
     let zoom = ZoomingImageView()
     var onSingleTap: (() -> Void)?
+    private let motionView = PlayerView()
+    private let motionTokens = PlayerTokens()
+    private var motionPlayer: AVPlayer?
+    private var liveTask: Task<Void, Never>?
+    private var livePlaying = false
+    private var liveHeld = false
     private var loadTask: Task<Void, Never>?
     private var detailTask: Task<Void, Never>?
     private var hasOriginal = false
@@ -199,18 +238,49 @@ final class PhotoPageController: UIViewController {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
-    override func loadView() { view = zoom }
+    private var isLive: Bool { model.store?.media(id)?.live == true }
+
+    override func loadView() {
+        let root = UIView()
+        root.backgroundColor = .clear
+        zoom.frame = root.bounds
+        zoom.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        root.addSubview(zoom)
+        motionView.isUserInteractionEnabled = false
+        motionView.playerLayer.videoGravity = .resizeAspectFill
+        motionView.clipsToBounds = true
+        motionView.alpha = 0
+        root.addSubview(motionView)
+        view = root
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
         zoom.onSingleTap = { [weak self] in self?.onSingleTap?() }
         zoom.onNeedsDetail = { [weak self] in self?.loadDetail() }
+        zoom.onZoomedChange = { [weak self] zoomed in if zoomed { self?.stopLive(animated: true) } }
         zoom.accessibilityLabel = model.store?.media(id)?.fileName
+        if isLive {
+            let hold = UILongPressGestureRecognizer(target: self, action: #selector(held(_:)))
+            hold.minimumPressDuration = 0.25
+            zoom.addGestureRecognizer(hold)
+            zoom.accessibilityHint = "Live Photo. Touch and hold to play."
+        }
         reload()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // The motion half is a few MB: fetch it while the user looks, so a hold plays at once.
+        if isLive, model.images.cachedMediaFile(id, live: true) == nil {
+            let images = model.images, id = self.id
+            Task { _ = await images.mediaFile(id, live: true) }
+        }
     }
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        stopLive(animated: false)
         detailTask?.cancel()
         if hasDetail {                               // give the big bitmap back
             hasDetail = false
@@ -224,6 +294,78 @@ final class PhotoPageController: UIViewController {
 
     func reloadIfEditChanged() {
         if currentEditKey() != editKey { reload() }
+    }
+
+    func pageDidHide() { zoom.resetZoom() }
+
+    func setChrome(_ visible: Bool, animated: Bool) {}
+
+    // ── Live Photo ──
+
+    @objc private func held(_ g: UILongPressGestureRecognizer) {
+        switch g.state {
+        case .began: playLive(held: true)
+        case .ended, .cancelled, .failed: if liveHeld { stopLive(animated: true) }
+        default: break
+        }
+    }
+
+    /// Plays the motion half over the photo, at Fit only (zoomed in, the frames would not line
+    /// up). Held: until the finger lifts or the clip ends. From the LIVE button: once through.
+    func playLive(held: Bool) {
+        guard isLive, !zoom.isZoomedIn, !livePlaying else { return }
+        livePlaying = true
+        liveHeld = held
+        Haptics.release()
+        liveTask?.cancel()
+        liveTask = Task { [weak self] in
+            guard let self else { return }
+            guard case .success(let url) = await self.model.images.mediaFile(self.id, live: true),
+                  !Task.isCancelled, self.livePlaying else {
+                self.livePlaying = false
+                return
+            }
+            self.startMotion(url)
+        }
+    }
+
+    private func startMotion(_ url: URL) {
+        let player: AVPlayer
+        if let p = motionPlayer, (p.currentItem?.asset as? AVURLAsset)?.url == url {
+            player = p
+        } else {
+            motionTokens.clear()
+            player = AVPlayer(url: url)
+            player.actionAtItemEnd = .pause
+            motionPlayer = player
+            motionTokens.player = player
+            motionView.player = player
+            motionTokens.endObserver = NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemDidPlayToEndTime, object: player.currentItem, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.stopLive(animated: true) }
+            }
+        }
+        // the photo's on-screen rect at Fit
+        motionView.frame = zoom.imageView.convert(zoom.imageView.bounds, to: view)
+        PlaybackAudio.live()
+        player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+        player.play()
+        UIView.animate(withDuration: 0.18) { self.motionView.alpha = 1 }
+    }
+
+    func stopLive(animated: Bool) {
+        guard livePlaying else { return }
+        livePlaying = false
+        liveHeld = false
+        liveTask?.cancel()
+        let player = motionPlayer
+        let hide = { self.motionView.alpha = 0 }
+        if animated {
+            UIView.animate(withDuration: 0.25, animations: hide) { _ in player?.pause() }
+        } else {
+            hide()
+            player?.pause()
+        }
     }
 
     func reload() {

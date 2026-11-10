@@ -307,6 +307,28 @@ class TestServer(_Library):
         r, body, _ = self.req("GET", "/v1/micro?ids=1,2,4")
         self.assertEqual([i for i, _ in ss.unpack_micro(body)], [1, 2])            # never the vault
 
+    def test_live_motion_streams_in_chunks(self):
+        """iOS MediaStreamLoader: the 2-byte info probe, then chunks, as AVPlayer asks for them."""
+        self.pair()
+        motion = bytes(range(256)) * 12                                            # 3 072 bytes
+        with open(os.path.join(self.tmp, "IMG_0002.MOV"), "wb") as fh:
+            fh.write(motion)
+        r, body, _ = self.req("GET", "/v1/media/2/live", headers={"Range": "bytes=0-1"})
+        self.assertEqual((r.status, body), (206, motion[:2]))
+        self.assertEqual(r.getheader("Content-Range"), "bytes 0-1/3072")
+        self.assertEqual(r.getheader("Content-Type"), "video/quicktime")
+        self.assertEqual(r.getheader("Accept-Ranges"), "bytes")
+        got = b""
+        while len(got) < len(motion):
+            end = min(len(got) + 1000, len(motion)) - 1
+            r, body, _ = self.req("GET", "/v1/media/2/live", headers={"Range": f"bytes={len(got)}-{end}"})
+            self.assertEqual(r.status, 206)
+            got += body
+        self.assertEqual(got, motion)
+        r, _, _ = self.req("GET", "/v1/media/2/live", headers={"Range": "bytes=5000-5999"})
+        self.assertEqual(r.status, 416)
+        self.assertEqual(self.req("GET", "/v1/media/1/live")[0].status, 404)       # not a Live Photo
+
     def test_packs_whitelist_and_power(self):
         self.pair()
         r, body, _ = self.req("GET", "/v1/packs")

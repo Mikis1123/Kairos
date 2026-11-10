@@ -151,6 +151,27 @@ public final class SyncClient: @unchecked Sendable {
         return try await download(r)
     }
 
+    /// One byte range of the original (videos) or of the Live Photo's motion half: the video
+    /// streamer's chunks. 409 "cloud_only" = the file is only in OneDrive on the desktop.
+    public func mediaRange(_ id: MediaID, live: Bool, offset: Int64, length: Int64) async throws -> MediaChunk {
+        var r = try request("/v1/media/\(id)/\(live ? "live" : "original")",
+                            headers: ["Range": MediaRange.header(offset: offset, length: length)])
+        r.timeoutInterval = 20
+        let (data, http) = try await send(r)
+        let ctype = http.value(forHTTPHeaderField: "Content-Type")
+        if http.statusCode == 206, let cr = http.value(forHTTPHeaderField: "Content-Range"),
+           let parsed = MediaRange.parseContentRange(cr) {
+            guard parsed.start == offset else { throw SyncError.badResponse }
+            return MediaChunk(data: data, total: parsed.total, contentType: ctype)
+        }
+        // 200: the server ignored the Range and sent the whole file
+        guard http.statusCode == 200 else { throw SyncError.badResponse }
+        let total = Int64(data.count)
+        guard offset < total else { return MediaChunk(data: Data(), total: total, contentType: ctype) }
+        let end = min(total, offset + length)
+        return MediaChunk(data: data.subdata(in: Int(offset)..<Int(end)), total: total, contentType: ctype)
+    }
+
     public func packs() async throws -> [MapPack] {
         struct Packs: Decodable { let packs: [MapPack] }
         let p: Packs = try await get("/v1/packs")

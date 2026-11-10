@@ -31,7 +31,7 @@ Contract tests: `test_ios_sync.py` writes `KairosCore/Tests/KairosCoreTests/Fixt
 | GET | `/v1/micro?ids=1,2,…` | up to 500 ids. Body is `"KMP1"` + (u32 id, u32 len, JPEG)*, big-endian |
 | GET | `/v1/media/{id}/thumb` | 840 px desktop thumbnail, **unedited**. ETag. |
 | GET | `/v1/media/{id}/original` | original bytes with Range/206, ETag and If-Range. `?bulk=1` = background backfill |
-| GET | `/v1/media/{id}/live` | the motion half of a Live Photo |
+| GET | `/v1/media/{id}/live` | the motion half of a Live Photo, Range/206 like `original` |
 | PUT/DELETE | `/v1/media/{id}/edit` | body `{"params": {...}}`. The answer is the canonical (clamped) record, or `params: null` |
 | PUT | `/v1/media/{id}/favorite` | `{"value": bool}` |
 | GET | `/v1/face/{id}/crop` | face crop JPEG |
@@ -39,6 +39,13 @@ Contract tests: `test_ios_sync.py` writes `KairosCore/Tests/KairosCoreTests/Fixt
 | GET | `/v1/packs/{id}` | pack bytes with Range (resumable) |
 | GET | `/v1/import/{sha256}` | `{status: present|absent, name}`: pre-check before sending a camera-roll file |
 | POST | `/v1/import?name=&sha256=` | raw file bytes (Content-Length required, ≤ 8 GB). See below |
+
+## Video and Live Photo playback (iOS)
+
+- Videos stream into AVPlayer through a private URL scheme (`kairos-stream://`) and an `AVAssetResourceLoaderDelegate` (`MediaStreamLoader`), because AVFoundation cannot use the pinned URLSession. Every byte request becomes 1 MB `Range` requests on `/original`; the first is a 2-byte probe for the size and type. Playback starts after the first chunk.
+- 503 `busy` and network errors are retried; 404, 401 and 409 `cloud_only` are final. If streaming fails otherwise, the phone downloads the whole file once and plays it locally.
+- Live Photo motion halves (`/live`, a few MB) are downloaded whole while the photo is on screen, so touch-and-hold plays at once.
+- Downloaded originals, videos and motion halves share `Caches/Kairos/originals`: newest first within 1.5 GB, the 3 newest always kept, cleared on unpair.
 
 ## Incremental sync
 

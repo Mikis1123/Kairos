@@ -118,7 +118,10 @@ public final class AppModel {
         endpoint = nil
         images.client = nil
         let disk = images.disk
-        Task.detached(priority: .utility) { disk.removeAll() }   // the cached thumbnails belong to that library
+        Task.detached(priority: .utility) {                     // the cached files belong to that library
+            disk.removeAll()
+            try? FileManager.default.removeItem(at: ImageLoader.originalsDirectory)
+        }
         status = .needsPairing
         revision += 1
     }
