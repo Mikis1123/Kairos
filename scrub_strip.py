@@ -37,6 +37,7 @@ from PyQt6.QtGui import QImage
 
 import governor
 import paths
+from tool_timeouts import StallWatchdog
 import video_clap
 import preview_cache
 import video_proxy
@@ -359,10 +360,14 @@ class StripBuilder(QThread):
 
         threading.Thread(target=read_err, daemon=True).start()
         buf, index, added, last_emit = b"", 0, 0, 0.0
+        # zaseknutý ffmpeg (poškozené video) by blokoval read() navždy: watchdog ho po STALL_S bez
+        # výstupu (mimo pozastavení strážcem) zabije a read() skončí
+        watchdog = StallWatchdog(proc, paused=(gov.busy if self.governed else None))
         while True:
             chunk = proc.stdout.read(65536)
             if not chunk:
                 break
+            watchdog.kick()
             buf += chunk
             while True:
                 end = buf.find(_EOI)
@@ -390,6 +395,7 @@ class StripBuilder(QThread):
                 self.cancel()                         # démon končí (zavírání aplikace)
             if self._cancel:
                 break
+        watchdog.stop()
         proc.wait()
         gov.unregister_process(proc.pid)
         self._proc = None

@@ -22,6 +22,7 @@ import subprocess
 import sys
 
 import paths
+from tool_timeouts import FFMPEG_GENERATE_TIMEOUT_S
 
 MUSIC_DIR = os.path.join(paths.RESOURCE_DIR, "assets", "music")
 # Gate 2 D: the user's own tracks live in the writable data folder (%APPDATA%\Kairos\music) -
@@ -375,7 +376,7 @@ def render_all(out_dir=MUSIC_DIR, ffmpeg_path=None):
         cmd = [ffmpeg_path or paths.FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-y",
                "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "2", "-i", "-",
                "-c:a", "libopus", "-b:a", "112k", "-metadata", f"title=Kairos – {spec['title']}", target]
-        subprocess.run(cmd, input=pcm.tobytes(), check=True)
+        subprocess.run(cmd, input=pcm.tobytes(), check=True, timeout=FFMPEG_GENERATE_TIMEOUT_S)
         made.append(target)
         print(f"{spec['title']}: {target} ({os.path.getsize(target) / 1e6:.1f} MB)")
     return made

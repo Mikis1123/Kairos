@@ -186,6 +186,12 @@ public final class AppModel {
         sendImports()
     }
 
+    /// Dismisses the "not sent" notice above the grid.
+    public func dismissImportNotices() {
+        let q = imports
+        Task { await q?.clearRejected() }
+    }
+
     /// Starts draining the outbox if paired; a no-op while a drain is already running.
     public func sendImports() {
         guard let imports, let client else { return }
@@ -230,6 +236,23 @@ public final class AppModel {
         _ = try? store?.approveAllPhoneOnly()
         phoneCounts = store?.phoneCounts() ?? phoneCounts
         runBackup()
+    }
+
+    /// The banner's "Retry" after the desktop refused some uploads: they are asked for again, and a
+    /// paused queue (desktop full / busy) is released at once.
+    public func retryFailedBackups() {
+        _ = try? store?.retryFailedBackups()
+        phoneCounts = store?.phoneCounts() ?? phoneCounts
+        retryBackupNow()
+    }
+
+    /// "Retry now" on a paused queue.
+    public func retryBackupNow() {
+        let q = imports
+        Task {
+            await q?.retryNow()
+            runBackup()
+        }
     }
 
     /// One backup pass while the desktop is reachable (a running pass absorbs the call).

@@ -335,7 +335,13 @@ class TestScannerEndToEnd(TempEnv):
     def _fake_run(self, cmd, *a, **k):
         if cmd and cmd[0] == self.fake_exiftool:
             import json as _json
-            files = [c for c in cmd[1:] if not c.startswith("-")]
+            # since the UTF-8 args file (non-ASCII names): the paths are in the file after "-@"
+            if "-@" in cmd:
+                with open(cmd[cmd.index("-@") + 1], encoding="utf-8") as fh:
+                    lines = [ln.rstrip("\n") for ln in fh]
+                files = [ln for ln in lines if ln and not ln.startswith("-")]
+            else:
+                files = [c for c in cmd[1:] if not c.startswith("-")]
             self.exif_calls.append(files)
             out = []
             for f in files:
@@ -343,7 +349,7 @@ class TestScannerEndToEnd(TempEnv):
                     continue            # ExifTool soubor "nezvládl" (nevrátí pro něj záznam)
                 out.append({"SourceFile": f.replace("\\", "/"),
                             "DateTimeOriginal": self.dates.get(os.path.basename(f), "")})
-            return types.SimpleNamespace(stdout=_json.dumps(out), stderr="", returncode=0)
+            return types.SimpleNamespace(stdout=_json.dumps(out).encode("utf-8"), stderr=b"", returncode=0)
         return self._orig_run(cmd, *a, **k)
 
     def _make(self, name, size=(640, 480), color=(10, 20, 30)):

@@ -10,6 +10,7 @@ from PIL import Image, ImageOps
 from database import get_connection
 import cv_io
 from paths import FACE_DIR as FACE_CACHE_DIR, FFMPEG_PATH, resolve_face_path
+from tool_timeouts import FFMPEG_ONESHOT_TIMEOUT_S
 
 os.makedirs(FACE_CACHE_DIR, exist_ok=True)
 
@@ -175,7 +176,15 @@ def _get_images_from_media(file_path):
                 "-q:v", "2",
                 temp_frame
             ]
-            subprocess.run(cmd, capture_output=True, startupinfo=startupinfo)
+            try:
+                subprocess.run(cmd, capture_output=True, startupinfo=startupinfo,
+                               timeout=FFMPEG_ONESHOT_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                try:                              # poškozené video: snímek přeskočit, nezastavit analýzu
+                    os.remove(temp_frame)
+                except OSError:
+                    pass
+                continue
             if os.path.exists(temp_frame):
                 img_bgr = cv_io.imread(temp_frame)
                 try:

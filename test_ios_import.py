@@ -108,6 +108,50 @@ class TestPhoneImport(unittest.TestCase):
         self.assertEqual(self.req("POST", "/v1/import?name=a.jpg&sha256=" + "0" * 64, data, auth=False)[0], 401)
         self.assertEqual(self.inbox_files(), [])
 
+    # ── Phase 1 (C1/C2): a full desktop disk is a pause for the phone, never a 500 or a rejection ──
+
+    def test_precheck_reports_free_space(self):
+        status, body = self.req("GET", "/v1/import/" + "a" * 64)
+        self.assertEqual(status, 200)
+        self.assertIsInstance(body["free_bytes"], int)
+        self.assertEqual(body["reserve_bytes"], ss.IMPORT_FREE_RESERVE)
+
+    def test_low_disk_answers_507_before_the_body_and_writes_nothing(self):
+        self.srv._inbox_free_bytes = lambda: ss.IMPORT_FREE_RESERVE + 100       # 100 bytes of headroom
+        status, body = self.upload(b"x" * 5000)
+        self.assertEqual((status, body.get("error")), (507, "insufficient_storage"))
+        self.assertEqual(self.inbox_files(), [])
+        self.assertEqual(self.events, [])
+        small = self.upload(b"y" * 50, name="IMG_0002.HEIC")                      # fits: still accepted
+        self.assertEqual(small[0], 200, small)
+
+    def test_disk_full_mid_upload_answers_507_and_cleans_partial(self):
+        import errno
+
+        real_open = open
+
+        class FullDisk:
+            def __init__(self, fh):
+                self.fh = fh
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self.fh.close()
+
+            def write(self, buf):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        ss.open = lambda path, mode="r", *a, **kw: FullDisk(real_open(path, mode)) if "w" in mode else real_open(path, mode, *a, **kw)
+        try:
+            status, body = self.upload(b"z" * 4000)
+        finally:
+            del ss.open
+        self.assertEqual((status, body.get("error")), (507, "insufficient_storage"))
+        self.assertEqual(self.inbox_files(), [])
+        self.assertEqual(os.listdir(os.path.join(self.inbox, ".partial")), [])
+
     def test_safe_import_name(self):
         f = ss.safe_import_name
         self.assertEqual(f("../../Windows/evil.JPG"), "evil.jpg")

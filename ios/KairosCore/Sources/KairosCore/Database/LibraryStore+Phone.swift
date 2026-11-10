@@ -45,7 +45,7 @@ extension LibraryStore {
         case approved      // the user said "back up" (banner, or automatic backup is on)
         case queued        // exported into the outbox, uploading
         case sent          // the desktop verified the bytes; waiting for its scanner to index them
-        case failed        // the desktop refused it for good (format, size)
+        case failed        // the desktop refused it for good (format, size, damaged); `backupError` says why
     }
 
     public struct PhoneAsset: Sendable, Hashable {
@@ -54,6 +54,7 @@ extension LibraryStore {
         public let mediaId: MediaID?
         public let match: String?
         public let backup: BackupState
+        public let backupError: String?
         public let sha256: String?
         public let fileName: String?
         public let fileSize: Int64?
@@ -69,6 +70,7 @@ extension LibraryStore {
         guard let pid = r.int("pid"), let local = r.string("local_id") else { return nil }
         return PhoneAsset(pid: pid, localId: local, mediaId: r.int("media_id"), match: r.string("match"),
                           backup: BackupState(rawValue: r.string("backup") ?? "") ?? BackupState.none,
+                          backupError: r.string("backup_error"),
                           sha256: r.string("sha256"), fileName: r.string("file_name"), fileSize: r.int("file_size"),
                           isVideo: r.string("media_type") == "video", live: r.bool("live"), inCloud: r.bool("in_cloud"))
     }
@@ -137,17 +139,39 @@ extension LibraryStore {
         guard !localIds.isEmpty else { return }
         try db.transaction {
             for id in localIds {
-                try db.run("UPDATE phone_assets SET backup = ? WHERE local_id = ?", [.text(state.rawValue), .text(id)])
+                try db.run("UPDATE phone_assets SET backup = ?, backup_error = NULL WHERE local_id = ?",
+                           [.text(state.rawValue), .text(id)])
             }
         }
+    }
+
+    /// Assets the desktop refused for good: `failed`, with the reason code for the Retry banner.
+    public func setBackupFailed(_ failures: [(localId: String, reason: String)]) throws {
+        guard !failures.isEmpty else { return }
+        try db.transaction {
+            for f in failures {
+                try db.run("UPDATE phone_assets SET backup = 'failed', backup_error = ? WHERE local_id = ?",
+                           [.text(f.reason), .text(f.localId)])
+            }
+        }
+    }
+
+    /// The banner's "Retry": failed assets are asked for again (the desktop dedupes by hash).
+    @discardableResult
+    public func retryFailedBackups() throws -> Int {
+        let n = phoneCounts().failed
+        try db.run("UPDATE phone_assets SET backup = 'approved', backup_error = NULL "
+                   + "WHERE media_id IS NULL AND backup = 'failed'")
+        return n
     }
 
     /// Every phone-only asset not yet asked for becomes `approved` (the banner's "Back up all").
     @discardableResult
     public func approveAllPhoneOnly() throws -> Int {
-        let n = phoneCounts().waiting
-        try db.run("UPDATE phone_assets SET backup = 'approved' WHERE media_id IS NULL AND backup IN ('none', 'failed')")
-        return n
+        let counts = phoneCounts()
+        try db.run("UPDATE phone_assets SET backup = 'approved', backup_error = NULL "
+                   + "WHERE media_id IS NULL AND backup IN ('none', 'failed')")
+        return counts.waiting + counts.failed
     }
 
     // ── matching ──
@@ -278,6 +302,8 @@ extension LibraryStore {
         public var both = 0
         public var phoneOnly = 0
         public var waiting = 0          // phone-only, backup not asked for
+        public var failed = 0           // the desktop refused them for good
+        public var failedReason: String?   // the most recent reason code (BackupReason)
         public var approved = 0
         public var queued = 0
         public var sent = 0
@@ -290,7 +316,8 @@ extension LibraryStore {
             SELECT COUNT(*) AS total,
                    SUM(media_id IS NOT NULL) AS both,
                    SUM(media_id IS NULL) AS phone,
-                   SUM(media_id IS NULL AND backup IN ('none', 'failed')) AS waiting,
+                   SUM(media_id IS NULL AND backup = 'none') AS waiting,
+                   SUM(media_id IS NULL AND backup = 'failed') AS failed,
                    SUM(media_id IS NULL AND backup = 'approved') AS approved,
                    SUM(media_id IS NULL AND backup = 'queued') AS queued,
                    SUM(media_id IS NULL AND backup = 'sent') AS sent
@@ -301,9 +328,15 @@ extension LibraryStore {
             c.both = Int(r.int("both") ?? 0)
             c.phoneOnly = Int(r.int("phone") ?? 0)
             c.waiting = Int(r.int("waiting") ?? 0)
+            c.failed = Int(r.int("failed") ?? 0)
             c.approved = Int(r.int("approved") ?? 0)
             c.queued = Int(r.int("queued") ?? 0)
             c.sent = Int(r.int("sent") ?? 0)
+        }
+        if c.failed > 0 {
+            c.failedReason = (try? db.query("SELECT backup_error FROM phone_assets WHERE media_id IS NULL "
+                                            + "AND backup = 'failed' AND backup_error IS NOT NULL "
+                                            + "ORDER BY pid DESC LIMIT 1"))?.first?.string("backup_error")
         }
         return c
     }

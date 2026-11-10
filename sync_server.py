@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import base64
 import datetime as _dt
+import errno
 import hashlib
 import hmac
 import json
@@ -55,6 +56,7 @@ import os
 import re
 import secrets
 import select
+import shutil
 import socket
 import socketserver
 import sqlite3
@@ -96,6 +98,7 @@ MICRO_MAGIC = b"KMP1"
 # Phone -> desktop import: the formats scanner.SUPPORTED_EXTS indexes (a test pins the subset).
 IMPORT_EXTS = frozenset({".heic", ".jpg", ".jpeg", ".png", ".dng", ".mov", ".mp4"})
 IMPORT_MAX_BYTES = 8 * 1024 ** 3   # one 4K ProRes clip fits; anything bigger is a client bug
+IMPORT_FREE_RESERVE = 512 * 1024 ** 2   # an upload may not shrink the inbox drive below this (507)
 INBOX_FOLDER_NAME = "Kairos iPhone"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -864,7 +867,9 @@ class SyncServer:
             return h.send_json(self._import(h, dev))
         if len(parts) == 3 and parts[:2] == ["v1", "import"] and method == "GET":
             rel = self._imported(_sha_param(parts[2]))
-            return h.send_json({"status": "present" if rel else "absent", "name": rel})
+            # free_bytes lets the phone stop BEFORE it exports and streams a big video (507 otherwise)
+            return h.send_json({"status": "present" if rel else "absent", "name": rel,
+                                "free_bytes": self._inbox_free_bytes(), "reserve_bytes": IMPORT_FREE_RESERVE})
         if parts == ["v1", "search"] and method == "GET":
             return h.send_json(self.search(h.query.get("q", ""), _int(h.query.get("limit"), SEARCH_LIMIT)))
         if parts == ["v1", "match"] and method == "POST":
@@ -1210,14 +1215,32 @@ class SyncServer:
         """Inbox-relative path of an earlier import with these bytes, or None. An entry whose
         file the user has since moved or deleted no longer counts: the phone may send it again."""
         with self._import_lock:
-            conn = self._imports_db()
-            try:
-                row = conn.execute("SELECT rel_path FROM imports WHERE sha256 = ?", (digest,)).fetchone()
-            finally:
-                conn.close()
+            return self._imported_locked(digest)
+
+    def _imported_locked(self, digest):
+        """_imported for a caller that already holds `_import_lock` (it is not re-entrant)."""
+        conn = self._imports_db()
+        try:
+            row = conn.execute("SELECT rel_path FROM imports WHERE sha256 = ?", (digest,)).fetchone()
+        finally:
+            conn.close()
         if row and os.path.isfile(os.path.join(self.inbox_dir, row[0])):
             return row[0].replace(os.sep, "/")
         return None
+
+    def _inbox_free_bytes(self):
+        """Free space on the drive the inbox lives on (the nearest existing parent while the inbox
+        folder has not been created yet); None when it cannot be read."""
+        path = os.path.abspath(self.inbox_dir)
+        while path and not os.path.exists(path):
+            parent = os.path.dirname(path)
+            if parent == path:
+                break
+            path = parent
+        try:
+            return int(shutil.disk_usage(path).free)
+        except OSError:
+            return None
 
     def _import(self, h, dev):
         """POST /v1/import?name=<file name>&sha256=<hex>, raw bytes as the body. Streams into
@@ -1237,28 +1260,44 @@ class SyncServer:
         if size > IMPORT_MAX_BYTES:
             h.close_connection = True
             raise _HttpError(413, "too_large")
+        free = self._inbox_free_bytes()
+        if free is not None and free < size + IMPORT_FREE_RESERVE:
+            # 507, not 500: the phone treats it as "pause and keep the file", never as a rejection
+            h.close_connection = True
+            raise _HttpError(507, "insufficient_storage", {"Retry-After": str(RETRY_AFTER_S)})
         partial = os.path.join(self.inbox_dir, ".partial")
         os.makedirs(partial, exist_ok=True)
         tmp = os.path.join(partial, uuid.uuid4().hex + ".part")
         hasher = hashlib.sha256()
         rel = None
         try:
-            with open(tmp, "wb") as fh:
-                left = size
-                while left > 0:
-                    buf = h.rfile.read(min(CHUNK, left))
-                    if not buf:                          # the phone dropped off Wi-Fi mid-upload
-                        h.close_connection = True
-                        raise _HttpError(400, "short_body")
-                    hasher.update(buf)
-                    fh.write(buf)
-                    left -= len(buf)
+            try:
+                with open(tmp, "wb") as fh:
+                    left = size
+                    while left > 0:
+                        buf = h.rfile.read(min(CHUNK, left))
+                        if not buf:                      # the phone dropped off Wi-Fi mid-upload
+                            h.close_connection = True
+                            raise _HttpError(400, "short_body")
+                        hasher.update(buf)
+                        fh.write(buf)
+                        left -= len(buf)
+            except OSError as e:
+                if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)):
+                    h.close_connection = True            # the disk filled up mid-upload
+                    raise _HttpError(507, "insufficient_storage", {"Retry-After": str(RETRY_AFTER_S)}) from None
+                raise
             if hasher.hexdigest() != digest:
                 raise _HttpError(422, "sha_mismatch")
-            known = self._imported(digest)
-            if known:
-                return {"status": "duplicate", "name": known}
+            # The bytes are streamed and verified outside the lock (a 4 GB video must not block the
+            # other lane), but "is it already here?" and "put it there" are ONE critical section.
+            # Checking before taking the lock let two uploads of the same bytes (a phone that timed
+            # out and retried while the first handler was still running) both pass the check and
+            # land as IMG_1.heic and IMG_1 (2).heic.
             with self._import_lock:
+                known = self._imported_locked(digest)
+                if known:
+                    return {"status": "duplicate", "name": known}
                 month = _dt.datetime.now().strftime("%Y-%m")
                 folder = os.path.join(self.inbox_dir, month)
                 os.makedirs(folder, exist_ok=True)

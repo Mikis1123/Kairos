@@ -6,6 +6,7 @@ import subprocess
 import json
 import math
 import re
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -20,6 +21,7 @@ from PIL import Image, ImageOps
 import color_manage
 import fs_atomic
 import imaging
+from tool_timeouts import FFMPEG_ONESHOT_TIMEOUT_S
 
 try:
     import pillow_heif
@@ -150,7 +152,9 @@ def make_thumbnail(file_path, thumb_path, m_type, paired_video, ffmpeg_path=DEFA
             "-vf", _video_thumb_filter(file_path, ffmpeg_path),
             "-q:v", "2", tmp_path,
         ]
-        subprocess.run(cmd, capture_output=True, startupinfo=startupinfo)
+        # bez limitu by poškozené video zablokovalo skener i tlačítko Zastavit; po uplynutí
+        # subprocess.run ffmpeg ukončí a TimeoutExpired vyřídí společný úklid níže
+        subprocess.run(cmd, capture_output=True, startupinfo=startupinfo, timeout=FFMPEG_ONESHOT_TIMEOUT_S)
 
     try:
         if os.path.exists(tmp_path):
@@ -196,7 +200,8 @@ def render_thumbnail_bytes(file_path, m_type, paired_video, ffmpeg_path=DEFAULT_
         "-vf", _video_thumb_filter(file_path, ffmpeg_path),
         "-q:v", "2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
     try:
-        out = subprocess.run(cmd, capture_output=True, startupinfo=_hidden_startupinfo(), timeout=60).stdout
+        out = subprocess.run(cmd, capture_output=True, startupinfo=_hidden_startupinfo(),
+                             timeout=FFMPEG_ONESHOT_TIMEOUT_S).stdout
     except Exception:
         return None
     return out or None
@@ -606,8 +611,11 @@ class MediaScannerThread(QThread):
             print(f"Chyba výpůjčky polohy: {e}")
 
     def _run_exiftool(self, file_paths):
-        cmd = [
-            self.exiftool_path, "-json", "-n",
+        """ExifTool dostane cesty v UTF-8 souboru (-@) s -charset filename=utf8. Přes příkazovou
+        řádku je exiftool.exe čte v ANSI kódové stránce: japonské / cyrilické jméno souboru
+        zmizí z výstupu a české přijde jako „???_cz.jpg“ – foto pak skončí bez data a GPS."""
+        tags = [
+            "-json", "-n",
             "-DateTimeOriginal", "-CreationDate", "-CreateDate",
             "-SubSecTimeOriginal", "-OffsetTimeOriginal",
             "-GPSLatitude", "-GPSLongitude", "-GPSAltitude",
@@ -615,18 +623,27 @@ class MediaScannerThread(QThread):
             "-Make", "-Model", "-AndroidManufacturer", "-AndroidModel",
             "-LensModel", "-FNumber", "-ExposureTime", "-ISO",
             "-FocalLength", "-FocalLengthIn35mmFormat", "-ContentIdentifier",
-        ] + list(file_paths)
+        ]
+        fd, argfile = tempfile.mkstemp(suffix=".args", prefix="kairos-scan-")
         try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                for a in tags + [str(p) for p in file_paths]:
+                    f.write(a.replace("\n", " ") + "\n")
             result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                startupinfo=_hidden_startupinfo(), timeout=600,
+                [self.exiftool_path, "-charset", "filename=utf8", "-@", argfile],
+                capture_output=True, startupinfo=_hidden_startupinfo(), timeout=600,
             )
-            if result.stdout:
-                data = json.loads(result.stdout)
+            out = result.stdout.decode("utf-8", "replace")
+            if out.strip():
+                data = json.loads(out)
                 return data if isinstance(data, list) else []
         except Exception as e:
             print(f"Chyba ExifTool: {e}")
+        finally:
+            try:
+                os.remove(argfile)
+            except OSError:
+                pass
         return []
 
     def _extract_batch_metadata(self, file_paths):

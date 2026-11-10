@@ -13,8 +13,12 @@ import KairosCore
 ///   2. approved assets are exported from PhotoKit into the outbox (original + Live motion),
 ///      hashed, checked once more against /v1/match, and queued
 ///   3. the outbox drains (ImportQueue: resumable, idempotent, the desktop verifies SHA-256)
-///   4. assets whose upload landed are `sent`; when the desktop's scanner has indexed them, the
-///      next pass links them by hash (step 1) and they turn into `both`
+///   4. the outbox's recorded outcomes settle each queued asset (BackupSettlement): `sent` only when
+///      every file was acknowledged by the desktop, `failed` (with the reason, and a Retry button)
+///      when the desktop refused one for good, and back to `approved` when nothing says what
+///      happened. A desktop that is full, busy or erroring (507, 5xx) only PAUSES the queue: the
+///      files stay queued. When the desktop's scanner has indexed a `sent` asset, the next pass
+///      links it by hash (step 1) and it turns into `both`
 /// `deep` (background processing, on power): also hash a few unmatched assets the matcher
 /// could not place (renamed, re-dated) and ask the desktop whether it has those bytes.
 actor PhoneBackup {
@@ -90,7 +94,9 @@ actor PhoneBackup {
                             break
                         }
                     }
-                    if try await imports.enqueue(moving: f.file, name: f.name, sha256: sha) != nil { queuedAny = true }
+                    if try await imports.enqueue(moving: f.file, name: f.name, sha256: sha, group: a.localId) != nil {
+                        queuedAny = true
+                    }
                 }
                 if queuedAny {
                     try? store.setBackup([a.localId], .queued)
@@ -107,14 +113,19 @@ actor PhoneBackup {
         // 3) send
         await imports.drain(using: client)
 
-        // 4) what left the outbox has landed on the desktop
-        let stillQueued = Set(await imports.pending.map(\.sha256))
-        let queued = (try? store.db.query("SELECT local_id, sha256 FROM phone_assets WHERE backup = 'queued'")) ?? []
-        let landed = queued.compactMap { r -> String? in
-            guard let id = r.string("local_id"), let sha = r.string("sha256") else { return nil }
-            return stillQueued.contains(sha) ? nil : id
+        // 4) settle from recorded facts, never from "it left the outbox"
+        let rows = (try? store.db.query("SELECT local_id, sha256 FROM phone_assets WHERE backup = 'queued'")) ?? []
+        let queued: [(localId: String, sha256: String?)] = rows.compactMap { r in
+            guard let id = r.string("local_id") else { return nil }
+            return (localId: id, sha256: r.string("sha256"))
         }
-        try? store.setBackup(landed, .sent)
+        let settled = BackupSettlement.settle(queued: queued, pending: await imports.pending,
+                                              outcomes: await imports.outcomes)
+        try? store.setBackup(settled.sent, .sent)
+        try? store.setBackupFailed(settled.failed.map { (localId: $0.localId, reason: $0.reason) })
+        try? store.setBackup(settled.requeue, .approved)
+        await imports.acknowledge(settled.consumed)
+        report.failed += settled.failed.count
         report.linked += await link(store.sentWithoutMatch(), client: client)
         return report
     }

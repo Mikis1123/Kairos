@@ -120,6 +120,20 @@ struct LibraryGridView: View {
                            message: "Ready to back up to \(model.endpoint?.name ?? "your computer").",
                            action: "Back up") { model.backUpAll() }
             }
+            // the desktop refused some files for good: say why, and let the user ask again
+            if c.failed > 0 && model.isPaired {
+                BannerCard(symbol: "exclamationmark.triangle",
+                           title: "\(c.failed) couldn't be backed up",
+                           message: BackupReason.text(c.failedReason),
+                           action: "Retry") { model.retryFailedBackups() }
+            }
+            // the desktop can't take uploads right now (disk full, busy, saving power): nothing is lost
+            if let why = model.importProgress.paused, model.isPaired {
+                BannerCard(symbol: "pause.circle",
+                           title: "Backup paused",
+                           message: BackupReason.pausedText(why),
+                           action: "Retry now") { model.retryBackupNow() }
+            }
         }
         #else
         EmptyView()
@@ -139,7 +153,7 @@ struct LibraryGridView: View {
                                             : "\(p.pending) waiting for your computer")
                 } else if !p.rejected.isEmpty {
                     Image(systemName: "exclamationmark.triangle")
-                    Text("\(p.rejected.count) not sent (unsupported format)")
+                    Text("\(p.rejected.count) not sent. \(BackupReason.text(p.rejectedReason)) Tap to dismiss.")
                 } else if let importNote {
                     Image(systemName: "exclamationmark.triangle")
                     Text(importNote)
@@ -152,6 +166,13 @@ struct LibraryGridView: View {
             .background(.ultraThinMaterial, in: Capsule())
             .padding(.bottom, Kairos.Space.sm)
             .transition(.move(edge: .bottom).combined(with: .opacity))
+            .onTapGesture {
+                // a finished notice can be dismissed; a live "Sending..." pill can't
+                if p.pending == 0 {
+                    model.dismissImportNotices()
+                    importNote = nil
+                }
+            }
         }
     }
 

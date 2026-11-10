@@ -23,6 +23,7 @@ import time
 
 import paths
 import video_clap
+from tool_timeouts import StallWatchdog
 
 PROXY_EDGE = 1920
 PROXY_FPS = 30
@@ -176,17 +177,25 @@ def build_proxy(source, governor=None, should_stop=None, threads=2, ffmpeg_path=
     err_reader.start()
     total_us = max(0, int(info.get("duration_ms") or 0)) * 1000
     cancelled = False
+    # poškozené video může ffmpeg zaseknout bez ukončení: bez postupu (mimo pozastavení strážcem)
+    # ho po STALL_S zabije watchdog a převod se označí jako nepřevoditelný
+    watchdog = StallWatchdog(proc, paused=(governor.busy if governor is not None else None))
+    seen_us = -1
     try:
         while proc.poll() is None:
             if should_stop is not None and should_stop():
                 cancelled = True
                 proc.kill()
                 break
+            if done_us[0] != seen_us:
+                seen_us = done_us[0]
+                watchdog.kick()
             if progress is not None and total_us:
                 progress(min(1.0, done_us[0] / total_us))
             time.sleep(0.2)
         proc.wait()
     finally:
+        watchdog.stop()
         if governor is not None:
             governor.unregister_process(proc.pid)
     err_reader.join(2.0)

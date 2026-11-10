@@ -19,7 +19,7 @@ public final class LibraryStore: @unchecked Sendable {
         return e
     }()
 
-    public static let schemaVersion: Int64 = 2
+    public static let schemaVersion: Int64 = 3
 
     static let migrations: [String] = [
         """
@@ -85,6 +85,10 @@ public final class LibraryStore: @unchecked Sendable {
         CREATE INDEX IF NOT EXISTS idx_phone_media ON phone_assets (media_id);
         CREATE INDEX IF NOT EXISTS idx_phone_date ON phone_assets (date_taken DESC);
         CREATE INDEX IF NOT EXISTS idx_phone_sha ON phone_assets (sha256) WHERE sha256 IS NOT NULL;
+        """,
+        // v3: why a backup failed (an ImportQueue / desktop reason code), shown with the Retry button.
+        """
+        ALTER TABLE phone_assets ADD COLUMN backup_error TEXT;
         """,
     ]
 
