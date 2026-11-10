@@ -22,6 +22,16 @@ public final class AppModel {
     public let vault: VaultAuth
     private var imports: ImportQueue?
     private var engine: SyncEngine?
+    /// Three-state library: camera-roll counts for the Library banner.
+    public private(set) var phoneCounts = LibraryStore.PhoneCounts()
+    #if os(iOS)
+    /// The camera roll, read in place (nil without a replica).
+    public private(set) var phone: PhoneLibrary?
+    public private(set) var phoneAccess: PhoneLibrary.Access = PhoneLibrary.access
+    public private(set) var phoneIndex = PhoneLibrary.IndexProgress()
+    private var backup: PhoneBackup?
+    private var backupTask: Task<Void, Never>?
+    #endif
 
     private static let endpointKey = "kairos.desktop.endpoint"
     private static var deviceId: String {
@@ -51,6 +61,20 @@ public final class AppModel {
                 }
             }
         }
+        #if os(iOS)
+        BackgroundSync.model = self
+        if let store {
+            let lib = PhoneLibrary(store: store)
+            lib.onChange = { [weak self] p in
+                Task { @MainActor in self?.phoneChanged(p) }
+            }
+            phone = lib
+            images.phone = lib
+            if let imports { backup = PhoneBackup(store: store, phone: lib, imports: imports) }
+            lib.start()                                   // no-op until the user grants access
+            phoneCounts = store.phoneCounts()
+        }
+        #endif
         if let data = UserDefaults.standard.data(forKey: Self.endpointKey),
            let ep = try? JSONDecoder().decode(DesktopEndpoint.self, from: data),
            let token = Keychain.load(account: ep.deviceId) {
@@ -78,13 +102,18 @@ public final class AppModel {
                     self.status = s
                     if s == .live, !wasLive {
                         self.sendImports()                 // desktop reachable: flush the outbox
+                        #if os(iOS)
+                        self.runBackup()                   // link proven copies, send approved ones
+                        #endif
                         self.revision += 1                 // and retry the thumbnails that failed offline
                     }
                 }
             }, changes: { [weak self] applied in
                 Task { @MainActor in
-                    self?.images.invalidate(applied.editsChanged)
-                    self?.revision += 1
+                    guard let self else { return }
+                    self.images.invalidate(applied.editsChanged)
+                    if applied.upserts + applied.deletes > 0 { self.rematchPhone() }
+                    self.revision += 1
                 }
             })
             await e.start()
@@ -117,6 +146,8 @@ public final class AppModel {
         client = nil
         endpoint = nil
         images.client = nil
+        phoneCounts = store?.phoneCounts() ?? LibraryStore.PhoneCounts()
+        try? FileManager.default.removeItem(at: Self.journeyCache)
         let disk = images.disk
         Task.detached(priority: .utility) {                     // the cached files belong to that library
             disk.removeAll()
@@ -159,6 +190,104 @@ public final class AppModel {
     public func sendImports() {
         guard let imports, let client else { return }
         Task.detached(priority: .utility) { await imports.drain(using: client) }
+    }
+
+    // ── three-state library (Parity sprint) ──
+
+    /// New desktop items may be camera-roll assets the phone already shows as phone-only.
+    func rematchPhone() {
+        guard let store else { return }
+        if (try? store.rematchPhone()) ?? 0 > 0 { revision += 1 }
+        phoneCounts = store.phoneCounts()
+    }
+
+    #if os(iOS)
+    private func phoneChanged(_ p: PhoneLibrary.IndexProgress) {
+        phoneIndex = p
+        phoneCounts = store?.phoneCounts() ?? LibraryStore.PhoneCounts()
+        revision += 1
+        if !p.indexing, PhoneBackup.automatic { runBackup() }
+    }
+
+    /// Asks for Photos access (the Library banner) and indexes the camera roll.
+    public func enablePhoneLibrary() async {
+        phoneAccess = await PhoneLibrary.requestAccess()
+        phone?.start()
+    }
+
+    /// Back up automatically (background, on power) instead of waiting for the banner.
+    public var automaticBackup: Bool {
+        get { _ = revision; return PhoneBackup.automatic }
+        set {
+            PhoneBackup.automatic = newValue
+            revision += 1
+            if newValue { backUpAll() }
+        }
+    }
+
+    /// The banner's "Back up": every phone-only asset is approved and the pass starts.
+    public func backUpAll() {
+        _ = try? store?.approveAllPhoneOnly()
+        phoneCounts = store?.phoneCounts() ?? phoneCounts
+        runBackup()
+    }
+
+    /// One backup pass while the desktop is reachable (a running pass absorbs the call).
+    public func runBackup(deep: Bool = false) {
+        guard backupTask == nil, let backup, let client else { return }
+        backupTask = Task { [weak self] in
+            await backup.run(client: client, deep: deep)
+            guard let self else { return }
+            self.backupTask = nil
+            self.phoneCounts = self.store?.phoneCounts() ?? self.phoneCounts
+            self.revision += 1
+        }
+    }
+
+    /// BGAppRefreshTask / BGProcessingTask: index the roll, pull, and (deep) back up.
+    func backgroundPass(deep: Bool, budget: TimeInterval) async {
+        await phone?.refreshNow()
+        rematchPhone()
+        if let engine { _ = try? await engine.pull() }
+        if let backup, let client, deep || PhoneBackup.automatic {
+            await backup.run(client: client, deep: deep, budget: budget)
+        }
+        phoneCounts = store?.phoneCounts() ?? phoneCounts
+        revision += 1
+    }
+    #endif
+
+    // ── semantic search + Trip mode ──
+
+    /// The desktop's semantic search; nil when unpaired, offline, or on an older desktop.
+    public func semanticSearch(_ query: String) async -> SearchAnswer? {
+        guard let client else { return nil }
+        if case .offline = status { return nil }
+        return try? await client.search(query)
+    }
+
+    nonisolated static var journeyCache: URL {
+        let base = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil,
+                                                 create: true)) ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("Kairos/journeys", isDirectory: true)
+    }
+
+    /// Trip mode data: the desktop's journey (cached for offline), else the last cached copy,
+    /// else one rebuilt from the replica's photo positions.
+    public func journey(for event: Event) async -> Journey? {
+        let file = Self.journeyCache.appendingPathComponent("\(event.id).json")
+        if let client, let data = try? await client.journeyData(event.id),
+           let j = try? JSONDecoder().decode(Journey.self, from: data) {
+            try? FileManager.default.createDirectory(at: Self.journeyCache, withIntermediateDirectories: true)
+            try? data.write(to: file, options: .atomic)
+            return j
+        }
+        if let data = try? Data(contentsOf: file), let j = try? JSONDecoder().decode(Journey.self, from: data) {
+            return j
+        }
+        guard let photos = store?.journeyPhotos(event: event.id), !photos.isEmpty else { return nil }
+        return JourneyLocal.journey(id: event.id, title: event.title ?? "", location: event.locationName ?? "",
+                                    photos: photos)
     }
 
     /// Phone edits not yet acknowledged by the desktop.

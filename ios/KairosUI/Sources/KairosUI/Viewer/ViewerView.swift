@@ -69,14 +69,22 @@ struct ViewerView: View {
                 .accessibilityHint("Or touch and hold the photo")
             }
             Spacer()
+            if current < 0 {
+                // three-state library: this one exists only in the camera roll so far
+                Label("iPhone only", systemImage: "iphone")
+                    .font(.system(size: 12, weight: .semibold))
+                    .padding(.horizontal, 8)
+                    .accessibilityLabel("Only on this iPhone, not backed up to your computer yet")
+            }
             let fav = model.store?.media(current)?.isFavorite == true
             Button { Task { await model.toggleFavorite(current) } } label: {
                 Image(systemName: fav ? "heart.fill" : "heart").padding(10)
             }
             .accessibilityLabel(fav ? "Remove from favourites" : "Add to favourites")
+            .disabled(current < 0)                       // favourites and edits live on the desktop
             Button { editing = EditRoute(id: current) } label: { Image(systemName: "slider.horizontal.3").padding(10) }
                 .accessibilityLabel("Edit")
-                .disabled(model.store?.media(current)?.isVideo == true)
+                .disabled(model.store?.media(current)?.isVideo == true || current < 0)
         }
         .font(.system(size: 17, weight: .semibold))
         .foregroundStyle(.white)
@@ -99,6 +107,8 @@ extension View {
 
 #if os(iOS)
 import AVFoundation
+import Photos
+import PhotosUI
 import UIKit
 
 /// UIPageViewController pager: native paging physics, 20 pt between photos, and pages created
@@ -210,11 +220,16 @@ struct PhotoPager: UIViewControllerRepresentable {
 /// One page: a ZoomingImageView fed by the loading passes. A Live Photo also gets a motion layer
 /// above it, shown over the photo's frame while the motion plays.
 @MainActor
-final class PhotoPageController: UIViewController, ViewerPage {
+final class PhotoPageController: UIViewController, ViewerPage, PHLivePhotoViewDelegate {
     let id: MediaID
     let model: AppModel
     let zoom = ZoomingImageView()
     var onSingleTap: (() -> Void)?
+    /// Camera-roll Live Photos play natively (PHLivePhotoView: Apple's timing, sound and fade);
+    /// desktop-only ones stream their motion half into `motionView`.
+    private let liveView = PHLivePhotoView()
+    private var localLive: PHLivePhoto?
+    private var localLiveTask: Task<PHLivePhoto?, Never>?
     private let motionView = PlayerView()
     private let motionTokens = PlayerTokens()
     private var motionPlayer: AVPlayer?
@@ -251,6 +266,13 @@ final class PhotoPageController: UIViewController, ViewerPage {
         motionView.clipsToBounds = true
         motionView.alpha = 0
         root.addSubview(motionView)
+        liveView.isUserInteractionEnabled = false
+        liveView.contentMode = .scaleAspectFill
+        liveView.clipsToBounds = true
+        liveView.isMuted = false
+        liveView.alpha = 0
+        liveView.delegate = self
+        root.addSubview(liveView)
         view = root
     }
 
@@ -272,10 +294,30 @@ final class PhotoPageController: UIViewController, ViewerPage {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         // The motion half is a few MB: fetch it while the user looks, so a hold plays at once.
-        if isLive, model.images.cachedMediaFile(id, live: true) == nil {
+        // A camera-roll Live Photo is prepared from PhotoKit instead (no network).
+        if isLive, model.images.localAsset(id) != nil {
+            _ = loadLocalLive()
+        } else if isLive, id > 0, model.images.cachedMediaFile(id, live: true) == nil {
             let images = model.images, id = self.id
             Task { _ = await images.mediaFile(id, live: true) }
         }
+    }
+
+    /// The PHLivePhoto of a camera-roll asset, requested once and shared by prefetch and play.
+    @discardableResult
+    private func loadLocalLive() -> Task<PHLivePhoto?, Never>? {
+        if let localLiveTask { return localLiveTask }
+        guard let phone = model.phone, let asset = model.images.localAsset(id) else { return nil }
+        let scale = view.window?.screen.scale ?? 3
+        let size = CGSize(width: view.bounds.width * scale, height: view.bounds.height * scale)
+        let allowNetwork = id < 0
+        let t = Task { [weak self] () -> PHLivePhoto? in
+            let lp = await phone.livePhoto(asset.localId, targetSize: size, allowNetwork: allowNetwork)
+            self?.localLive = lp
+            return lp
+        }
+        localLiveTask = t
+        return t
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -316,10 +358,18 @@ final class PhotoPageController: UIViewController, ViewerPage {
         guard isLive, !zoom.isZoomedIn, !livePlaying else { return }
         livePlaying = true
         liveHeld = held
-        Haptics.release()
+        Haptics.live()
         liveTask?.cancel()
         liveTask = Task { [weak self] in
             guard let self else { return }
+            if let lp = await self.loadLocalLive()?.value, !Task.isCancelled, self.livePlaying {
+                self.startLocal(lp)
+                return
+            }
+            guard self.id > 0 else {                    // phone-only and unreadable: nothing to play
+                self.livePlaying = false
+                return
+            }
             guard case .success(let url) = await self.model.images.mediaFile(self.id, live: true),
                   !Task.isCancelled, self.livePlaying else {
                 self.livePlaying = false
@@ -353,13 +403,29 @@ final class PhotoPageController: UIViewController, ViewerPage {
         UIView.animate(withDuration: 0.18) { self.motionView.alpha = 1 }
     }
 
+    private func startLocal(_ lp: PHLivePhoto) {
+        liveView.livePhoto = lp
+        liveView.frame = zoom.imageView.convert(zoom.imageView.bounds, to: view)
+        PlaybackAudio.live()
+        liveView.alpha = 1
+        liveView.startPlayback(with: .full)
+    }
+
+    nonisolated func livePhotoView(_ livePhotoView: PHLivePhotoView, didEndPlaybackWith playbackStyle: PHLivePhotoViewPlaybackStyle) {
+        MainActor.assumeIsolated { self.stopLive(animated: true) }
+    }
+
     func stopLive(animated: Bool) {
         guard livePlaying else { return }
         livePlaying = false
         liveHeld = false
         liveTask?.cancel()
+        liveView.stopPlayback()
         let player = motionPlayer
-        let hide = { self.motionView.alpha = 0 }
+        let hide = {
+            self.motionView.alpha = 0
+            self.liveView.alpha = 0
+        }
         if animated {
             UIView.animate(withDuration: 0.25, animations: hide) { _ in player?.pause() }
         } else {

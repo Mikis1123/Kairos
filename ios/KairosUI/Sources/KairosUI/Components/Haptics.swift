@@ -30,6 +30,20 @@ enum Haptics {
         #endif
     }
 
+    /// A Live Photo starts moving (the press Photos answers with).
+    static func live() {
+        #if os(iOS)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.9)
+        #endif
+    }
+
+    /// The timeline scrubber crossed into another month or year.
+    static func scrubStep(major: Bool) {
+        #if os(iOS)
+        if major { rigid.impactOccurred(intensity: 0.7) } else { selection.selectionChanged() }
+        #endif
+    }
+
     /// A scan or an unlock went through.
     static func success() {
         #if os(iOS)

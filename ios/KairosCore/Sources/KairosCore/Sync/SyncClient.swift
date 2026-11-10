@@ -55,7 +55,11 @@ public final class SyncClient: @unchecked Sendable {
         self.token = token
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 30
-        cfg.httpMaximumConnectionsPerHost = 6           // the server allows 8 requests in flight
+        // The bridge queues requests per lane instead of refusing them (sync_server lanes), so
+        // more parallel keep-alive connections only help: thumbnails, video ranges and the change
+        // feed never wait behind each other on one socket.
+        cfg.httpMaximumConnectionsPerHost = 8
+        cfg.httpShouldUsePipelining = false
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         cfg.waitsForConnectivity = false
         session = URLSession(configuration: cfg, delegate: PinnedTrust(fingerprint: endpoint.fingerprint),
@@ -200,6 +204,36 @@ public final class SyncClient: @unchecked Sendable {
         let keep = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.moveItem(at: url, to: keep)
         return keep
+    }
+
+    // ── Parity sprint: semantic search, content matching, Trip mode ──
+
+    /// The desktop's semantic search ("dog on the beach"). 404 = an older desktop without it.
+    public func search(_ query: String, limit: Int = 500) async throws -> SearchAnswer {
+        try await get("/v1/search", query: ["q": query, "limit": String(limit)])
+    }
+
+    /// SHA-256 -> desktop media id for the phone assets the desktop already holds (proof by
+    /// content: the import journal, then hashing same-size library files on the PC).
+    public func match(_ offers: [MatchOffer]) async throws -> [String: MediaID] {
+        guard !offers.isEmpty else { return [:] }
+        var r = try request("/v1/match", method: "POST")
+        r.httpBody = try JSONEncoder().encode(["assets": offers])
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        r.timeoutInterval = 120                         // the PC may hash a few files first
+        let (data, _) = try await send(r)
+        struct Answer: Decodable { let matches: [String: MediaID] }
+        return try decoder.decode(Answer.self, from: data).matches
+    }
+
+    /// Trip mode: the desktop's journey for one event (stops, day chapters, GPX legs).
+    public func journey(_ eventId: Int64) async throws -> Journey {
+        try await get("/v1/journey/\(eventId)")
+    }
+
+    /// Raw JSON of the journey, for the offline cache (decoded with `Journey`).
+    public func journeyData(_ eventId: Int64) async throws -> Data {
+        try await send(try request("/v1/journey/\(eventId)")).0
     }
 
     // ── writes (phone -> desktop) ──

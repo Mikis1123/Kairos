@@ -19,7 +19,7 @@ public final class LibraryStore: @unchecked Sendable {
         return e
     }()
 
-    public static let schemaVersion: Int64 = 1
+    public static let schemaVersion: Int64 = 2
 
     static let migrations: [String] = [
         """
@@ -64,6 +64,28 @@ public final class LibraryStore: @unchecked Sendable {
         );
         CREATE TABLE IF NOT EXISTS micro_previews (media_id INTEGER PRIMARY KEY, data BLOB NOT NULL);
         """,
+        // v2 (Parity sprint): the camera roll, indexed in place through PhotoKit. Only metadata:
+        // the pixels stay in the Photos library and are read from there (never copied in).
+        // A phone-only asset appears in every list as MediaID -pid (negative), a matched one
+        // (media_id set) appears once, as its desktop item.
+        """
+        CREATE TABLE IF NOT EXISTS phone_assets (
+            pid INTEGER PRIMARY KEY AUTOINCREMENT,
+            local_id TEXT NOT NULL UNIQUE,
+            date_taken TEXT, created REAL, modified REAL,
+            media_type TEXT NOT NULL DEFAULT 'photo', live INTEGER NOT NULL DEFAULT 0,
+            is_favorite INTEGER NOT NULL DEFAULT 0,
+            width INTEGER, height INTEGER, duration REAL,
+            latitude REAL, longitude REAL,
+            file_name TEXT, file_size INTEGER, sha256 TEXT,
+            media_id INTEGER, match TEXT,
+            backup TEXT NOT NULL DEFAULT 'none',
+            in_cloud INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_phone_media ON phone_assets (media_id);
+        CREATE INDEX IF NOT EXISTS idx_phone_date ON phone_assets (date_taken DESC);
+        CREATE INDEX IF NOT EXISTS idx_phone_sha ON phone_assets (sha256) WHERE sha256 IS NOT NULL;
+        """,
     ]
 
     public init(db: SQLiteDatabase) throws {
@@ -106,6 +128,8 @@ public final class LibraryStore: @unchecked Sendable {
                       "media_edits", "micro_previews", "sync_state"] {
                 try db.run("DELETE FROM \(t)")
             }
+            // the camera roll stays indexed; only its links to the old library go
+            try db.run("UPDATE phone_assets SET media_id = NULL, match = NULL")
         }
     }
 
@@ -128,6 +152,7 @@ public final class LibraryStore: @unchecked Sendable {
                           "media_edits", "micro_previews"] {
                     try db.run("DELETE FROM \(t)")
                 }
+                try db.run("UPDATE phone_assets SET media_id = NULL, match = NULL")
                 try setState("cursor", "0")
                 return
             }
@@ -217,6 +242,8 @@ public final class LibraryStore: @unchecked Sendable {
             try db.run("DELETE FROM album_items WHERE media_id = ?", one)
             try db.run("DELETE FROM media_edits WHERE media_id = ?", one)
             try db.run("DELETE FROM micro_previews WHERE media_id = ?", one)
+            // gone from the desktop: the camera-roll asset is phone-only again (never deleted here)
+            try db.run("UPDATE phone_assets SET media_id = NULL, match = NULL WHERE media_id = ?", one)
         case .event: try db.run("DELETE FROM events WHERE id = ?", one)
         case .person:
             try db.run("DELETE FROM people WHERE id = ?", one)
@@ -314,32 +341,62 @@ public final class LibraryStore: @unchecked Sendable {
 
     // ── queries for the UI ──
 
+    /// Where an item lives (three-state library).
+    public enum Origin: Int, Sendable, Hashable {
+        case pc = 0          // desktop only: streamed and cached on demand
+        case both = 1        // on the desktop and in the camera roll: pixels read locally
+        case phone = 2       // camera roll only: waiting for backup
+    }
+
     public struct TimelineEntry: Hashable, Identifiable, Sendable {
         public let id: MediaID
         public let dateTaken: String?
         public let isVideo: Bool
         public let live: Bool
         public let isFavorite: Bool
+        public var origin: Origin = .pc
+
+        public init(id: MediaID, dateTaken: String?, isVideo: Bool, live: Bool, isFavorite: Bool, origin: Origin = .pc) {
+            self.id = id
+            self.dateTaken = dateTaken
+            self.isVideo = isVideo
+            self.live = live
+            self.isFavorite = isFavorite
+            self.origin = origin
+        }
     }
 
     private func timeline(_ rows: [SQLiteDatabase.Row]) -> [TimelineEntry] {
         rows.compactMap { r in
             guard let id = r.int("id") else { return nil }
             return TimelineEntry(id: id, dateTaken: r.string("date_taken"), isVideo: r.string("media_type") == "video",
-                                 live: r.bool("live"), isFavorite: r.bool("is_favorite"))
+                                 live: r.bool("live"), isFavorite: r.bool("is_favorite"),
+                                 origin: Origin(rawValue: Int(r.int("origin") ?? 0)) ?? .pc)
         }
     }
 
     private static let timelineCols = "id, date_taken, media_type, live, is_favorite"
 
-    /// Newest first. 20 000 rows are about 1 MB of structs: the grid keeps the whole list.
+    /// Newest first: desktop items (marked `both` when the camera roll holds them too) and the
+    /// phone-only camera-roll assets in one list. 20 000 rows are about 1 MB of structs: the grid
+    /// keeps the whole list.
     public func timeline(favoritesOnly: Bool = false) -> [TimelineEntry] {
-        let filter = favoritesOnly ? "WHERE is_favorite = 1 " : ""
-        return timeline((try? db.query("SELECT \(Self.timelineCols) FROM media_items \(filter)"
-                                       + "ORDER BY date_taken DESC, id DESC")) ?? [])
+        let fav = favoritesOnly ? " AND is_favorite = 1" : ""
+        return timeline((try? db.query("""
+            SELECT m.id, m.date_taken, m.media_type, m.live, m.is_favorite,
+                   CASE WHEN p.media_id IS NULL THEN 0 ELSE 1 END AS origin
+            FROM media_items m
+            LEFT JOIN (SELECT DISTINCT media_id FROM phone_assets WHERE media_id IS NOT NULL) p ON p.media_id = m.id
+            WHERE 1 = 1\(fav.replacingOccurrences(of: "is_favorite", with: "m.is_favorite"))
+            UNION ALL
+            SELECT -pid AS id, date_taken, media_type, live, is_favorite, 2 AS origin
+            FROM phone_assets WHERE media_id IS NULL\(fav)
+            ORDER BY 2 DESC, 1 DESC
+            """)) ?? [])
     }
 
     public func media(_ id: MediaID) -> MediaItem? {
+        if id < 0 { return phoneMedia(id) }
         guard let text = (try? db.query("SELECT payload FROM media_items WHERE id = ?", [.int(id)]))?.first?.string("payload")
         else { return nil }
         return try? decoder.decode(MediaItem.self, from: Data(text.utf8))
@@ -413,7 +470,8 @@ public final class LibraryStore: @unchecked Sendable {
 
     public func geoPoints() -> [GeoPoint] {
         ((try? db.query("SELECT id, latitude, longitude FROM media_items WHERE latitude IS NOT NULL "
-                        + "AND longitude IS NOT NULL")) ?? []).compactMap { r in
+                        + "AND longitude IS NOT NULL UNION ALL SELECT -pid, latitude, longitude FROM phone_assets "
+                        + "WHERE media_id IS NULL AND latitude IS NOT NULL AND longitude IS NOT NULL")) ?? []).compactMap { r in
             guard let id = r.int("id"), let la = r.double("latitude"), let lo = r.double("longitude") else { return nil }
             return GeoPoint(id: id, latitude: la, longitude: lo)
         }

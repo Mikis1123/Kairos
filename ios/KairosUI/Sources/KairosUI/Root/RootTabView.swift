@@ -37,6 +37,10 @@ public struct RootTabView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase != .active { model.vault.lock() }        // Hidden folder: auto-lock on leaving
             if phase == .active { model.sendImports() }       // resume a batch interrupted in the background
+            #if os(iOS)
+            if phase == .active { model.runBackup() }         // approved camera-roll assets, links by hash
+            if phase == .background { BackgroundSync.schedule() }
+            #endif
         }
         .sheet(isPresented: .constant(model.status == .needsPairing && model.store != nil)) {
             PairingView()

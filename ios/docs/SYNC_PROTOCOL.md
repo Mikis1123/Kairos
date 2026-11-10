@@ -10,7 +10,7 @@ Contract tests: `test_ios_sync.py` writes `KairosCore/Tests/KairosCoreTests/Fixt
 - Pairing QR / link: `kairos://pair?h=<lan ip>&p=<port>&fp=<sha256 hex>&lib=<library id>&pin=<6 digits>&v=1`. The desktop shows it in Settings › Advanced › iPhone sync › Pair iPhone… (`phone_pairing.py`; QR from the dependency-free `qr_code.py`). Closing that sheet cancels the PIN.
 - The PIN is single-use, valid for 120 s and allows 5 guesses. A correct PIN returns a 256-bit bearer token. The desktop stores only its SHA-256 (`sync/devices.json`). The phone keeps the token in the Keychain (`AfterFirstUnlockThisDeviceOnly`).
 - Every endpoint except `hello` and `pair` requires `Authorization: Bearer <token>`.
-- Capacity: 8 HTTP requests in flight plus 4 WebSockets. Beyond that the server answers `503 busy` with `Retry-After: 2`.
+- Capacity (Parity sprint): HTTP/1.1 keep-alive with TCP_NODELAY, up to 64 connections. Requests are admitted through two lanes: **interactive** (32 in flight: thumbnails, micro pages, video ranges, search, metadata) and **bulk** (2: packs, `?bulk=1` originals, uploads), so a backup never delays browsing. A request that finds its lane full **waits** up to 20 s for a slot; `503 busy` (`Retry-After: 1`) only answers a server that stayed stuck that long. Plus 4 WebSockets.
 - JSON bodies over 1 KB are gzip-compressed when the client sends `Accept-Encoding: gzip`. URLSession does this automatically.
 
 ## Privacy rules (server-enforced)
@@ -23,7 +23,7 @@ Contract tests: `test_ios_sync.py` writes `KairosCore/Tests/KairosCoreTests/Fixt
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/v1/hello` | `{app, protocol, name, library_id, pairing, power, bulk_ok}`, no auth |
+| GET | `/v1/hello` | `{app, protocol, name, library_id, pairing, power, bulk_ok, features}`, no auth. `features` lists the additive endpoints below |
 | POST | `/v1/pair` | `{pin, device_name, device_id}` → `{token, device_id, library_id, name, protocol}`. Fails with 403 `bad_pin` or `no_pairing` |
 | POST | `/v1/unpair` | revokes the calling device's token |
 | GET | `/v1/changes?since=N&limit=L` | one page of the journal (see below), L ≤ 2000 |
@@ -39,6 +39,21 @@ Contract tests: `test_ios_sync.py` writes `KairosCore/Tests/KairosCoreTests/Fixt
 | GET | `/v1/packs/{id}` | pack bytes with Range (resumable) |
 | GET | `/v1/import/{sha256}` | `{status: present|absent, name}`: pre-check before sending a camera-roll file |
 | POST | `/v1/import?name=&sha256=` | raw file bytes (Content-Length required, ≤ 8 GB). See below |
+| GET | `/v1/search?q=&limit=` | feature `search`. The desktop's semantic search (CLIP / SigLIP, facets, OCR) → `{query, ids, confident, semantic, labels}`. Visible ids only, best first; the first `confident` are sure matches |
+| POST | `/v1/match` | feature `match`. `{"assets": [{sha256, size, name}]}` (≤ 400) → `{"matches": {sha256: media_id}}`. See "Three-state library" |
+| GET | `/v1/journey/{event_id}` | feature `journey`. Trip mode: `{id, title, location, start, end, count, stops, tracks, days}`; 404 `no_journey` under two places |
+
+## Three-state library (Parity sprint)
+
+The phone indexes its camera roll through PhotoKit into `phone_assets` (metadata only: local identifier, capture time, original file name and size, position). Pixels stay in the Photos library and are read in place. Each asset is:
+
+- **phone**: only on the iPhone. Listed as media id `-pid` (negative), badged, offered for backup.
+- **both**: matched to a desktop item, listed once as that item, and drawn from the local original (no network). An original offloaded to iCloud is fetched from the PC instead.
+- **pc**: a desktop item with no local asset: streamed and cached on demand (LIFO fetch queue).
+
+Matching runs offline on the phone (`AssetMatcher`): same name and size, same name stem within 2 s, or same size within 1 s; one-to-one, closest in time wins. The proof by content is `/v1/match`: the desktop resolves a SHA-256 through the import journal (bytes the phone sent), then by hashing same-size library files (cached in `sync/hashes.sqlite` by path, size and mtime; ≤ 1 GB hashed per request; OneDrive placeholders are never downloaded). A Live Photo's motion half resolves to its still.
+
+Backup: approved phone-only assets are exported from PhotoKit (original + Live motion under the same stem, so the desktop pairs them), hashed, checked against `/v1/match` (already there = linked, nothing uploaded), then sent through the import outbox. When the desktop has indexed the upload, the next pass links it by hash. Background: `BGAppRefreshTask` (pull + re-index) and `BGProcessingTask` (backup, on external power + network).
 
 ## Video and Live Photo playback (iOS)
 
@@ -104,4 +119,4 @@ Client loop:
 
 ## Planned for protocol 2
 
-`/v1/search` (CLIP/SigLIP on the desktop), Journey film manifests, Hidden-folder sync with its own key exchange, Bonjour discovery, and push through a relay when the PC is asleep.
+Journey film manifests (the animated film; Trip mode already draws the route), Hidden-folder sync with its own key exchange, Bonjour discovery, and push through a relay when the PC is asleep.

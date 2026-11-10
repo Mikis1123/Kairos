@@ -2,8 +2,10 @@ import KairosCore
 import SwiftUI
 
 /// Map: MapLibre Native over offline MBTiles packs. It is free and offline-first like the desktop
-/// map, and calls no paid tile APIs. Packs come from two places, both read directly by MapLibre
-/// (mbtiles://):
+/// map, and calls no paid tile APIs. A world base ships inside the app (world-lite.mbtiles, z0-4,
+/// 2.3 MB: water, land cover, borders, major roads; ios/tools/build_world_lite.py), so the map
+/// renders out of the box with no desktop and no network. Detail packs layer on top of it,
+/// from two places, both read directly by MapLibre (mbtiles://):
 ///   - Documents/Maps: region packs downloaded from the desktop (/v1/packs)
 ///   - Documents: any .mbtiles the user drops in through Finder (USB) or the Files app
 ///     (UIFileSharingEnabled + LSSupportsOpeningDocumentsInPlace in project.yml)
@@ -15,21 +17,28 @@ struct MapTabView: View {
     @State private var showPacks = false
     @State private var installed: [URL] = []
     @State private var viewer: ViewerRoute?
+    @AppStorage("kairos.map.worldHintDismissed") private var hintDismissed = false
 
     var body: some View {
         NavigationStack {
             ZStack(alignment: .bottom) {
                 Kairos.Palette.mapBackground.ignoresSafeArea()
-                MapLibreView(packs: installed, points: points, model: model) { viewer = $0 }
+                MapLibreView(packs: OfflinePacks.base + installed, points: points, model: model) { viewer = $0 }
                     .ignoresSafeArea(edges: .top)
-                if installed.isEmpty {
-                    Text("Download a map region from your computer, or copy an .mbtiles file into Kairos with the Files app.")
-                        .font(Kairos.Typography.callout)
-                        .foregroundStyle(Kairos.Palette.textSecondary)
-                        .multilineTextAlignment(.center)
-                        .padding(Kairos.Space.md)
-                        .kairosCard()
-                        .padding(Kairos.Space.lg)
+                if installed.isEmpty && !hintDismissed {
+                    HStack(spacing: Kairos.Space.sm) {
+                        Image(systemName: "globe.europe.africa")
+                        Text("World map. For street detail, download a region from your computer.")
+                            .font(Kairos.Typography.caption)
+                        Button { showPacks = true } label: { Text("Regions").font(Kairos.Typography.caption.weight(.semibold)) }
+                        Button { hintDismissed = true } label: { Image(systemName: "xmark") }
+                            .accessibilityLabel("Dismiss")
+                    }
+                    .foregroundStyle(Kairos.Palette.textSecondary)
+                    .padding(.horizontal, Kairos.Space.md)
+                    .padding(.vertical, Kairos.Space.sm)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(Kairos.Space.lg)
                 }
             }
             .navigationTitle("Map")
@@ -66,6 +75,12 @@ enum OfflinePacks {
         (try? FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true))
             ?? FileManager.default.temporaryDirectory
     }
+
+    /// The world base inside the app bundle (read-only; MapLibre opens it in place).
+    static var bundledWorld: URL? { Bundle.main.url(forResource: "world-lite", withExtension: "mbtiles") }
+
+    /// Packs every map draws first: the bundled world, under any downloaded region.
+    static var base: [URL] { bundledWorld.map { [$0] } ?? [] }
 
     /// Downloads from the desktop land here (Documents/Maps, visible in Files as "Kairos › Maps").
     static var directory: URL { documents.appendingPathComponent("Maps", isDirectory: true) }

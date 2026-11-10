@@ -14,6 +14,10 @@ targets:
     platform: iOS
     sources:
       - path: KairosApp
+        excludes: ["Resources/**"]
+      # bundled offline world base map (ios/tools/build_world_lite.py)
+      - path: KairosApp/Resources
+        buildPhase: resources
     dependencies:
       - package: Kairos
         product: KairosCore
@@ -34,6 +38,7 @@ targets:
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Kairos connects to your Kairos desktop on this network to sync your library."
         INFOPLIST_KEY_NSCameraUsageDescription: "Scan the pairing code shown by Kairos on your computer."
         INFOPLIST_KEY_NSFaceIDUsageDescription: "Unlock your Hidden folder."
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Kairos shows your camera roll next to your computer's library, without copying it, and backs up the photos that are only on this iPhone."
     info:
       path: KairosApp/Info.plist
       properties:
@@ -45,6 +50,12 @@ targets:
         # in the Files app and in Finder over USB, so users can drop their own .mbtiles packs in.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # Parity sprint: background sync (BackgroundSync.swift). "fetch" = BGAppRefreshTask,
+        # "processing" = BGProcessingTask (backup while charging).
+        UIBackgroundModes: [fetch, processing]
+        BGTaskSchedulerPermittedIdentifiers:
+          - app.kairos.ios.refresh
+          - app.kairos.ios.backup
 schemes:
   Kairos:
     build:

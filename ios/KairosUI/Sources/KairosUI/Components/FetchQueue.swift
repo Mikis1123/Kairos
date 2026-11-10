@@ -49,8 +49,9 @@ actor FetchGate {
     }
 }
 
-/// One fetch with retries. The desktop answers 503 "busy" (Retry-After: 2) when more than 8
-/// requests are in flight; a dropped Wi-Fi packet surfaces as a timeout. Both are transient, so
+/// One fetch with retries. Since the Parity sprint the desktop queues a burst instead of refusing
+/// it, so 503 "busy" (Retry-After: 1) means a server stuck for 20 s, or an older desktop with the
+/// 8-request cap; a dropped Wi-Fi packet surfaces as a timeout. Both are transient, so
 /// they are retried with jittered exponential backoff. 404 and 401 are final.
 enum FetchRetry {
     static let attempts = 6

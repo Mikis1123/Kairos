@@ -76,7 +76,7 @@ public actor ImportQueue {
     /// Takes ownership of `file` (moved, not copied: the caller staged it in tmp). Same bytes
     /// queued twice are kept once.
     @discardableResult
-    public func enqueue(moving file: URL, name: String) throws -> Item? {
+    public func enqueue(moving file: URL, name: String, sha256 known: String? = nil) throws -> Item? {
         let fm = FileManager.default
         let ext = (name as NSString).pathExtension.lowercased()
         guard Self.supportedExtensions.contains(ext) else {
@@ -85,7 +85,7 @@ public actor ImportQueue {
             publish()
             return nil
         }
-        let digest = try Self.sha256(of: file)
+        let digest = try known ?? Self.sha256(of: file)        // the camera-roll backup hashed it already
         if items.contains(where: { $0.sha256 == digest }) {
             try? fm.removeItem(at: file)
             return nil

@@ -20,17 +20,33 @@ import UniformTypeIdentifiers
 ///             2048 px working source. The same folder holds downloaded videos and Live Photo
 ///             motion halves (mediaFile). Newest first within 1.5 GB, the 3 newest always kept.
 /// Memory: one NSCache, costed in decoded bytes.
+///
+/// Three-state routing (Parity sprint): an item the camera roll holds is drawn from PhotoKit,
+/// in place, before any network: phone-only assets (negative ids) always, synchronised items
+/// (`both`) for the grid when the desktop thumbnail is not on disk yet, and for the original.
+/// An original offloaded to iCloud is not woken for a synchronised item: the PC serves it.
 @MainActor
 public final class ImageLoader {
     var store: LibraryStore?
     var client: SyncClient?
+    #if os(iOS)
+    var phone: PhoneLibrary?
+
+    /// The camera-roll asset behind a list id, when it can be read without the network
+    /// (phone-only assets may still wake iCloud: there is no other copy).
+    func localAsset(_ id: MediaID) -> LibraryStore.PhoneAsset? {
+        guard phone != nil, let a = store?.phoneAsset(for: id) else { return nil }
+        return id < 0 || !a.inCloud ? a : nil
+    }
+    #endif
     private let cache = NSCache<NSString, CGImageBox>()
     private var pendingBytes: [String: PendingFetch] = [:]
     private var staleMicro: Set<MediaID> = []
     private var fileTasks: [String: Task<Result<URL, Error>, Never>] = [:]
-    /// The server allows 8 requests in flight; the sync engine, micro pages and originals need
-    /// the rest.
-    private let gate = FetchGate(limit: 4)
+    /// Six thumbnails in flight over the client's 8 keep-alive connections: the bridge queues
+    /// instead of refusing (interactive lane, 32 slots), and the remaining connections keep video
+    /// ranges and micro pages from waiting behind a fling.
+    private let gate = FetchGate(limit: 6)
     let disk: DiskCache
 
     nonisolated static let microPixel = 48
@@ -106,8 +122,17 @@ public final class ImageLoader {
 
     /// Upright pixel size of an image file (EXIF orientations 5-8 swap width and height).
     nonisolated static func pixelSize(url: URL) -> CGSize? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return pixelSize(src)
+    }
+
+    nonisolated static func pixelSize(data: Data) -> CGSize? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        return pixelSize(src)
+    }
+
+    nonisolated static func pixelSize(_ src: CGImageSource) -> CGSize? {
+        guard let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
               let w = p[kCGImagePropertyPixelWidth] as? Int, let h = p[kCGImagePropertyPixelHeight] as? Int
         else { return nil }
         let o = p[kCGImagePropertyOrientation] as? Int ?? 1
@@ -228,14 +253,45 @@ public final class ImageLoader {
     /// The grid's thumbnail: 640 px long edge, current edit applied.
     public func gridThumbnail(_ id: MediaID) async -> CGImage? {
         if let img = cachedGridThumbnail(id) { return img }
+        #if os(iOS)
+        if id < 0 || !hasThumbnailOnDisk(id), let img = await local(id, key: "g\(id)", maxPixel: Self.gridPixel) {
+            return img
+        }
+        if id < 0 { return nil }
+        #endif
         return await decoded(id, key: "g\(id)", maxPixel: Self.gridPixel, edit: true)
     }
 
     /// The viewer's first pass: the desktop thumbnail at its full resolution, current edit applied.
     public func thumbnail(_ id: MediaID) async -> CGImage? {
         if let img = hit("t\(id)") { return img }
+        #if os(iOS)
+        if id < 0 || !hasThumbnailOnDisk(id), let img = await local(id, key: "t\(id)", maxPixel: Self.localThumbPixel) {
+            return img
+        }
+        if id < 0 { return nil }
+        #endif
         return await decoded(id, key: "t\(id)", maxPixel: nil, edit: true)
     }
+
+    #if os(iOS)
+    nonisolated static let localThumbPixel = 1600
+
+    /// A camera-roll rendition for a list id: phone-only assets as Photos shows them, synchronised
+    /// items from the original with the Kairos edit applied (the desktop's look).
+    private func local(_ id: MediaID, key: String, maxPixel: Int) async -> CGImage? {
+        guard let phone, let a = localAsset(id) else { return nil }
+        guard let img = await phone.image(a.localId, maxPixel: maxPixel, version: id < 0 ? .current : .original,
+                                          allowNetwork: id < 0), !Task.isCancelled else { return nil }
+        let adj = id < 0 ? nil : store?.edit(for: id)
+        var out = img
+        if let adj {
+            out = await Task.detached(priority: .userInitiated) { ImageLoader.edited(img, adj) }.value
+        }
+        put(out, key)
+        return out
+    }
+    #endif
 
     /// The thumbnail as the desktop serves it (unedited, full resolution).
     public func rawThumbnail(_ id: MediaID) async -> CGImage? {
@@ -281,7 +337,7 @@ public final class ImageLoader {
     /// Local file of a still original (downloaded once, keyed by id + fingerprint so a changed
     /// file on the desktop is fetched again). Nil for videos, cloud-only originals and offline.
     public func originalFile(_ id: MediaID) async -> URL? {
-        guard let item = store?.media(id), !item.isVideo else { return nil }
+        guard id > 0, let item = store?.media(id), !item.isVideo else { return nil }
         return try? await mediaFile(id, live: false).get()
     }
 
@@ -352,6 +408,22 @@ public final class ImageLoader {
     /// Decoded original with the edit applied, plus the edited FULL-resolution pixel size (the
     /// viewer's content size, so 1:1 means one photo pixel per device pixel).
     public func original(_ id: MediaID, maxPixel: Int) async -> (image: CGImage, pixelSize: CGSize)? {
+        #if os(iOS)
+        // the camera roll first: a synchronised photo opens at full resolution with no network
+        if let phone, let a = localAsset(id), !(store?.media(id)?.isVideo ?? false),
+           let data = await phone.imageData(a.localId, version: id < 0 ? .current : .original, allowNetwork: id < 0) {
+            let adj = id < 0 ? nil : store?.edit(for: id)
+            let out = await Task.detached(priority: .userInitiated) { () -> (image: CGImage, pixelSize: CGSize)? in
+                guard let full = ImageLoader.pixelSize(data: data), let img = ImageLoader.decode(data, maxPixel: maxPixel)
+                else { return nil }
+                let a = adj?.normalized() ?? Adjustments()
+                let (ow, oh) = EditMath.outputSize(width: Int(full.width), height: Int(full.height), a)
+                return (ImageLoader.edited(img, adj), CGSize(width: ow, height: oh))
+            }.value
+            if let out { return out }
+        }
+        if id < 0 { return nil }                        // phone-only: no other copy exists
+        #endif
         guard let url = await originalFile(id) else { return nil }
         let adj = store?.edit(for: id)
         return await Task.detached(priority: .userInitiated) { () -> (image: CGImage, pixelSize: CGSize)? in
@@ -366,6 +438,13 @@ public final class ImageLoader {
     /// The editor's working source: unedited, upright, at most `maxPixel` on the long edge. The
     /// original when it can be had, else the desktop thumbnail.
     public func editSource(_ id: MediaID, maxPixel: Int = 2048) async -> CGImage? {
+        #if os(iOS)
+        if id > 0, let phone, let a = localAsset(id),
+           let data = await phone.imageData(a.localId, version: .original, allowNetwork: false),
+           let img = await Task.detached(priority: .userInitiated, operation: { ImageLoader.decode(data, maxPixel: maxPixel) }).value {
+            return img
+        }
+        #endif
         if let url = await originalFile(id) {
             let img = await Task.detached(priority: .userInitiated) { ImageLoader.decode(url: url, maxPixel: maxPixel) }.value
             if let img { return img }

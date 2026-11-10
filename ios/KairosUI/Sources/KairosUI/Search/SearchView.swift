@@ -1,15 +1,24 @@
 import KairosCore
 import SwiftUI
 
-/// Search: one field with category chips. Phase 1 searches the replica offline (people, places,
-/// trips, file names, dates). Semantic "describe it" search uses the desktop's CLIP/SigLIP index.
-/// Protocol 2 forwards the query to /v1/search while the desktop is reachable.
+/// Search: one field with category chips. The replica answers offline at once (people, places,
+/// trips, file names, dates). While the desktop is reachable, the same query also goes to its
+/// semantic index (/v1/search: CLIP / SigLIP, facets, text in photos), which ranks the whole
+/// library by what the photos show ("dog on the beach", "red car in snow"). The embeddings and
+/// the model stay on the PC; the phone only gets ids. Sure semantic matches come first, then
+/// the offline hits, then the possible semantic matches.
 struct SearchView: View {
     @Environment(AppModel.self) private var model
     @State private var text = ""
     @State private var scope: LibraryStore.SearchScope = .all
-    @State private var results: [LibraryStore.TimelineEntry] = []
+    @State private var local: [LibraryStore.TimelineEntry] = []
+    @State private var semantic: SearchAnswer?
+    @State private var searchingPC = false
     @State private var viewer: ViewerRoute?
+
+    private var results: [LibraryStore.TimelineEntry] {
+        Self.merge(local: local, semantic: semantic, scope: scope, store: model.store)
+    }
 
     var body: some View {
         NavigationStack {
@@ -18,9 +27,10 @@ struct SearchView: View {
                 if text.trimmingCharacters(in: .whitespaces).isEmpty {
                     EmptyStateView(symbol: "sparkle.magnifyingglass", title: "Search your library",
                                    message: "People, places, trips and dates. Describing a scene (\u{201C}dog on the beach\u{201D}) works when your computer is reachable.")
-                } else if results.isEmpty {
+                } else if results.isEmpty && !searchingPC {
                     EmptyStateView(symbol: "magnifyingglass", title: "No results", message: "Try another word or category.")
                 } else {
+                    semanticNote
                     ScrollView {
                         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 4), spacing: 2) {
                             ForEach(results) { entry in
@@ -41,7 +51,21 @@ struct SearchView: View {
             try? await Task.sleep(nanoseconds: 120_000_000)          // debounce typing
             guard !Task.isCancelled else { return }
             let q = text.trimmingCharacters(in: .whitespaces)
-            results = q.isEmpty ? [] : (model.store?.search(q, scope: scope) ?? [])
+            local = q.isEmpty ? [] : (model.store?.search(q, scope: scope) ?? [])
+        }
+        .task(id: SemanticKey(text: text, scope: scope)) {
+            let q = text.trimmingCharacters(in: .whitespaces)
+            guard q.count >= 2, Self.semanticScopes.contains(scope), model.isPaired else {
+                semantic = nil
+                return
+            }
+            try? await Task.sleep(nanoseconds: 350_000_000)          // the PC is asked once typing pauses
+            guard !Task.isCancelled else { return }
+            searchingPC = true
+            let answer = await model.semanticSearch(q)
+            guard !Task.isCancelled else { return }
+            searchingPC = false
+            semantic = answer
         }
         .fullScreenCoverCompat(item: $viewer) { ViewerView(ids: $0.ids, start: $0.start) }
     }
@@ -50,6 +74,47 @@ struct SearchView: View {
         let text: String
         let scope: LibraryStore.SearchScope
         let revision: Int
+    }
+
+    private struct SemanticKey: Equatable {
+        let text: String
+        let scope: LibraryStore.SearchScope
+    }
+
+    /// Scopes where "describe the scene" makes sense (people / places / trips are exact facets).
+    static let semanticScopes: Set<LibraryStore.SearchScope> = [.all, .videos, .favorites]
+
+    @ViewBuilder
+    private var semanticNote: some View {
+        if searchingPC || semantic?.semantic == true {
+            HStack(spacing: Kairos.Space.xs) {
+                if searchingPC { ProgressView().controlSize(.mini) } else { Image(systemName: "sparkles") }
+                Text(searchingPC ? "Asking \(model.endpoint?.name ?? "your computer")…"
+                                 : "Ranked by what the photos show (on \(model.endpoint?.name ?? "your computer"))")
+                Spacer()
+            }
+            .font(Kairos.Typography.caption)
+            .foregroundStyle(Kairos.Palette.textSecondary)
+            .padding(.horizontal, Kairos.Space.lg)
+            .padding(.bottom, Kairos.Space.xs)
+        }
+    }
+
+    /// Sure semantic matches, then the offline hits, then the possible semantic matches; each id
+    /// once, only items the replica has (the PC may know newer ones), filtered by the chip.
+    static func merge(local: [LibraryStore.TimelineEntry], semantic: SearchAnswer?, scope: LibraryStore.SearchScope,
+                      store: LibraryStore?) -> [LibraryStore.TimelineEntry] {
+        guard let semantic, !semantic.ids.isEmpty, let store else { return local }
+        func entry(_ id: MediaID) -> LibraryStore.TimelineEntry? {
+            guard let m = store.media(id) else { return nil }
+            if scope == .videos, !m.isVideo { return nil }
+            if scope == .favorites, !m.isFavorite { return nil }
+            return .init(id: id, dateTaken: m.dateTaken, isVideo: m.isVideo, live: m.live, isFavorite: m.isFavorite)
+        }
+        let sure = semantic.ids.prefix(semantic.confident).compactMap(entry)
+        let maybe = semantic.ids.dropFirst(semantic.confident).compactMap(entry)
+        var seen = Set<MediaID>()
+        return (sure + local + maybe).filter { seen.insert($0.id).inserted }
     }
 
     private var chips: some View {

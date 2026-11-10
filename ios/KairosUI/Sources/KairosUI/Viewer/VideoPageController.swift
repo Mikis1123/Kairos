@@ -246,6 +246,28 @@ final class VideoPageController: UIViewController, ViewerPage {
     // ── player ──
 
     private func preparePlayer() {
+        // the camera roll first (three-state library): a local video plays without any network.
+        // An original offloaded to iCloud streams from the PC instead (phone-only: from iCloud).
+        if let phone = model.phone, let asset = model.images.localAsset(id) {
+            spinner.startAnimating()
+            let id = self.id
+            fallbackTask = Task { [weak self] in
+                let item = await phone.playerItem(asset.localId, allowNetwork: id < 0)
+                guard let self, !Task.isCancelled else { return }
+                if let item {
+                    self.attach(item, streaming: false)
+                } else if id > 0 {
+                    self.streamFromDesktop()
+                } else {
+                    self.fail(URLError(.resourceUnavailable))
+                }
+            }
+            return
+        }
+        streamFromDesktop()
+    }
+
+    private func streamFromDesktop() {
         if let local = model.images.cachedMediaFile(id, live: false) {
             attach(AVPlayerItem(url: local), streaming: false)
         } else if let client = model.images.client {

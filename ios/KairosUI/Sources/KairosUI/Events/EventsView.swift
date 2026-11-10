@@ -2,8 +2,8 @@ import KairosCore
 import SwiftUI
 
 /// Events: trip cards (journeys, day trips, moments) from the desktop's trips.py, each tinted with
-/// its cover colour (tint.py), plus the Journey launcher. The film player (Cesta) is Phase 2:
-/// its timeline and tile packs need the desktop director's output.
+/// its cover colour (tint.py). A trip with photo positions opens in Trip mode (TripMapView): its
+/// route, stops and day chapters on the offline map, with a play button that tours the stops.
 struct EventsView: View {
     @Environment(AppModel.self) private var model
     @State private var events: [Event] = []
@@ -86,20 +86,38 @@ struct EventDetailView: View {
     @State private var items: [LibraryStore.TimelineEntry] = []
     @State private var chapters: [Event] = []
     @State private var viewer: ViewerRoute?
-    @State private var showJourney = false
+    @State private var trip: TripRoute?
+    @State private var hasRoute = false
+
+    struct TripRoute: Identifiable {
+        let id = UUID()
+        let autoplay: Bool
+    }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Kairos.Space.lg) {
-                if event.isJourney {
-                    Button { showJourney = true } label: {
-                        Label("Play Journey", systemImage: "play.fill")
-                            .font(Kairos.Typography.headline)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, Kairos.Space.md)
+                if hasRoute {
+                    HStack(spacing: Kairos.Space.sm) {
+                        Button { trip = TripRoute(autoplay: true) } label: {
+                            Label(event.isJourney ? "Play Journey" : "Play route", systemImage: "play.fill")
+                                .font(Kairos.Typography.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, Kairos.Space.md)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Kairos.Palette.accentFill)
+                        Button { trip = TripRoute(autoplay: false) } label: {
+                            Label("Map", systemImage: "map")
+                                .font(Kairos.Typography.headline)
+                                .padding(.vertical, Kairos.Space.md)
+                                .padding(.horizontal, Kairos.Space.sm)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(Kairos.Palette.accent)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Kairos.Palette.accentFill)
+                }
+                if event.isJourney {
                     if !chapters.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack {
@@ -128,11 +146,11 @@ struct EventDetailView: View {
         .task(id: model.revision) {
             items = model.store?.media(inEvent: event.id) ?? []
             chapters = model.store?.chapters(of: event.id) ?? []
+            hasRoute = !(model.store?.journeyPhotos(event: event.id).isEmpty ?? true)
         }
         .fullScreenCoverCompat(item: $viewer) { ViewerView(ids: $0.ids, start: $0.start) }
-        .sheet(isPresented: $showJourney) {
-            EmptyStateView(symbol: "film", title: "Journey film",
-                           message: "The animated Journey film arrives in a later update. Play it on your computer meanwhile.")
+        .fullScreenCoverCompat(item: $trip) { route in
+            TripMapView(event: event, autoplay: route.autoplay)
         }
     }
 }

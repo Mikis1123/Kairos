@@ -31,6 +31,14 @@ enum OfflineMapStyle {
         for (i, url) in packs.enumerated() {
             let id = "pack\(i)"
             let tileURL = "mbtiles://" + OfflinePacks.tileURLPath(url)
+            let firstNew = layers.count
+            defer {
+                // the bundled world (z0-4) is too coarse to draw past z10: under a region pack its
+                // overzoomed coastline would show through, and alone it would only be blocky
+                if url == OfflinePacks.bundledWorld {
+                    for j in firstNew..<layers.count { layers[j]["maxzoom"] = 10 }
+                }
+            }
             if info(url).format == "pbf" {
                 sources[id] = ["type": "vector", "url": tileURL]
                 layers += [
@@ -43,6 +51,8 @@ enum OfflineMapStyle {
                     ["id": "\(id)-roads", "type": "line", "source": id, "source-layer": "transportation",
                      "paint": ["line-color": "#2E2E35",
                                "line-width": ["interpolate", ["exponential", 1.5], ["zoom"], 5, 0.4, 14, 3]]],
+                    ["id": "\(id)-waterway", "type": "line", "source": id, "source-layer": "waterway",
+                     "paint": ["line-color": "#14203A", "line-width": ["interpolate", ["linear"], ["zoom"], 3, 0.3, 12, 1.6]]],
                     ["id": "\(id)-boundary", "type": "line", "source": id, "source-layer": "boundary",
                      "paint": ["line-color": "#3A3A42", "line-dasharray": [2, 2], "line-width": 0.8]],
                 ]
@@ -192,7 +202,7 @@ struct MapLibreView: UIViewRepresentable {
                 }
                 b = (w, s, e, n)
             } else {
-                b = OfflineMapStyle.unionBounds(packs)
+                b = OfflineMapStyle.unionBounds(packs.filter { $0 != OfflinePacks.bundledWorld })
             }
             guard let b else { return }
             didFit = true
