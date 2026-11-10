@@ -73,8 +73,13 @@ public final class AppModel {
         Task {
             await e.observe(status: { [weak self] s in
                 Task { @MainActor in
-                    self?.status = s
-                    if s == .live { self?.sendImports() }   // desktop reachable: flush the outbox
+                    guard let self else { return }
+                    let wasLive = self.status == .live
+                    self.status = s
+                    if s == .live, !wasLive {
+                        self.sendImports()                 // desktop reachable: flush the outbox
+                        self.revision += 1                 // and retry the thumbnails that failed offline
+                    }
                 }
             }, changes: { [weak self] applied in
                 Task { @MainActor in
@@ -112,6 +117,8 @@ public final class AppModel {
         client = nil
         endpoint = nil
         images.client = nil
+        let disk = images.disk
+        Task.detached(priority: .utility) { disk.removeAll() }   // the cached thumbnails belong to that library
         status = .needsPairing
         revision += 1
     }

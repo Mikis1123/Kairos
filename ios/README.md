@@ -36,7 +36,7 @@ ios/
 cd ios
 swift test                         # KairosCore contract tests (no simulator needed)
 brew install xcodegen && xcodegen  # -> Kairos.xcodeproj
-open Kairos.xcodeproj              # run the "Kairos" scheme on an iPhone (iOS 17+)
+open Kairos.xcodeproj              # run the "Kairos" scheme on an iPhone (iOS 18+)
 ```
 
 ## Build without a Mac (GitHub Actions + Sideloadly)

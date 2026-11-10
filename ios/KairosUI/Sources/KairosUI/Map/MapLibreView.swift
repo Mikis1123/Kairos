@@ -261,7 +261,7 @@ struct MapLibreView: UIViewRepresentable {
                 let cover = c.cover
                 Task { [weak self] in
                     guard let self else { return }
-                    _ = await self.parent.model.images.thumbnail(cover)   // the 48 px micro is soft at 52 pt
+                    _ = await self.parent.model.images.gridThumbnail(cover)   // the 48 px micro is soft at 52 pt
                     self.thumbRequests.remove(cover)
                     self.refreshImages(for: cover)
                 }

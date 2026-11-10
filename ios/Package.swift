@@ -6,7 +6,7 @@ import PackageDescription
 
 let package = Package(
     name: "Kairos",
-    platforms: [.iOS(.v17), .macOS(.v14)],
+    platforms: [.iOS("18.0"), .macOS(.v14)],
     products: [
         .library(name: "KairosCore", targets: ["KairosCore"]),
         .library(name: "KairosUI", targets: ["KairosUI"]),

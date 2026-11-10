@@ -60,10 +60,10 @@ struct PersonCell: View {
                 .lineLimit(1)
             Text("\(person.photoCount)").font(Kairos.Typography.caption).foregroundStyle(Kairos.Palette.textTertiary)
         }
-        .task(id: person.keyFaceId) {
-            guard let fid = person.keyFaceId, let client = model.client,
-                  let data = try? await client.faceCrop(fid) else { return }
-            face = ImageLoader.decode(data, maxPixel: 256)
+        .task(id: "\(person.keyFaceId ?? 0)-\(model.revision)") {
+            // Retried through the image loader's queue and kept on disk, so faces show offline.
+            guard let fid = person.keyFaceId else { return }
+            if let img = await model.images.faceCrop(fid) { face = img }
         }
     }
 }
