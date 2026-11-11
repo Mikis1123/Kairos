@@ -412,7 +412,9 @@ class TestImportCancel(unittest.TestCase):
 
     def test_close_event_does_not_call_cancel(self):
         src = inspect.getsource(MainWindow.closeEvent)
-        self.assertNotIn(".cancel(", src)
+        # QThread scanner / daemon are never cancel()led; the offline-map job runner is the one
+        # deliberate exception (its workers must stop before the tile store closes)
+        self.assertNotIn(".cancel(", src.replace("map_precache.jobs().cancel()", ""))
         # Sprint R: sken a démon se zastavují ve společné smyčce (stop + wait, jinak úschova)
         self.assertRegex(src, r"for thread in \([^)]*self\._scanner[^)]*\):")
         self.assertIn("thread.stop()", src)
