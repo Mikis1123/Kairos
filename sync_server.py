@@ -89,6 +89,10 @@ FEATURES = ("search", "match", "journey", "lanes")
 PAGE_DEFAULT, PAGE_MAX = 500, 2000
 MICRO_BATCH_MAX = 500
 WS_KEEPALIVE_S = 20.0
+WS_PONG_TIMEOUT_S = 10.0           # a ping unanswered this long = a zombie socket (phone left Wi-Fi / slept)
+WS_ADMIT_WAIT_S = 3.0              # a reconnecting phone waits this long for the slot its dead feed frees
+BODY_DRAIN_MAX = 1024 * 1024       # unread request body up to this is discarded to keep the connection;
+                                   # more than this and the connection is closed after the reply
 NOTIFY_POLL_S = 1.0                # the change notifier polls MAX(seq), an indexed read
 BULK_PACE_S = 0.02                 # per chunk while the desktop user interacts (~12 MB/s cap)
 RETRY_AFTER_S = 300
@@ -573,6 +577,28 @@ class _HttpError(Exception):
         self.status, self.code, self.headers = status, code, headers or {}
 
 
+class _CountingReader:
+    """rfile wrapper that counts the bytes handed out, so the handler knows how much of a request
+    body a handler left unread (an early 401 / 415 / 413 reply before the body was consumed)."""
+
+    def __init__(self, raw):
+        self._raw = raw
+        self.consumed = 0
+
+    def read(self, n=-1):
+        data = self._raw.read(n)
+        self.consumed += len(data)
+        return data
+
+    def readline(self, limit=-1):
+        data = self._raw.readline(limit)
+        self.consumed += len(data)
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = False
@@ -638,10 +664,12 @@ class SyncServer:
         self._lanes = {"interactive": threading.BoundedSemaphore(INTERACTIVE_SLOTS),
                        "bulk": threading.BoundedSemaphore(BULK_SLOTS)}
         self._sockets = threading.BoundedSemaphore(MAX_SOCKETS)
+        self._ws_lock = threading.Lock()
+        self._ws_open = {}                        # feed id -> {"dev": device id, "kick": Event}
         self.search_fn = None                     # callable(query, limit) -> dict; None = _search_default
         self._vectors = (0.0, None)               # (loaded at, {id: vector}) for the default search
         self._vectors_lock = threading.Lock()
-        self.stats = {"admitted": 0, "waited": 0, "busy": 0}
+        self.stats = {"admitted": 0, "waited": 0, "busy": 0, "ws_reaped": 0, "ws_replaced": 0}
         self._seq_cond = threading.Condition()
         self._top_seq = self._read_top()
         self._stop = threading.Event()
@@ -722,6 +750,7 @@ class SyncServer:
                     # handshake on the request thread, never on the accept loop
                     self.request = server._ctx.wrap_socket(self.request, server_side=True)
                 super().setup()
+                self.rfile = _CountingReader(self.rfile)
 
             def log_message(self, fmt, *args):
                 pass
@@ -742,16 +771,68 @@ class SyncServer:
                 self._dispatch("HEAD")
 
             # ── plumbing ──
+            def _pending_body(self):
+                """Request-body bytes nobody read yet; None when the length is unknowable
+                (chunked / garbage Content-Length)."""
+                if self.headers.get("Transfer-Encoding"):
+                    return None
+                try:
+                    declared = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    return None
+                return max(0, declared - self.rfile.consumed)
+
+            def _settle_body(self):
+                """Whatever a handler left unread would be parsed as the NEXT request line on this
+                keep-alive connection (the phone then got "501 Unsupported method"). Discard a small
+                remainder; for a big or unknowable one the reply already said "Connection: close"."""
+                pending = self._pending_body()
+                if pending is None:
+                    self.close_connection = True
+                    return
+                if pending <= 0:
+                    return
+                if pending > BODY_DRAIN_MAX:
+                    self.close_connection = True       # drain a bit anyway: closing on unread data RSTs the reply
+                try:
+                    left = min(pending, BODY_DRAIN_MAX)
+                    if self.close_connection:
+                        self.request.settimeout(2.0)
+                    while left > 0:
+                        buf = self.rfile.read(min(65536, left))
+                        if not buf:
+                            self.close_connection = True
+                            return
+                        left -= len(buf)
+                except (OSError, ValueError):
+                    self.close_connection = True
+
             def _dispatch(self, method):
+                self.rfile.consumed = 0                # headers are parsed: from here on it counts body bytes
+                try:
+                    self._handle(method)
+                finally:
+                    self._settle_body()
+
+            def _handle(self, method):
                 url = urlparse(self.path)
                 self.query = {k: v[-1] for k, v in parse_qs(url.query).items()}
                 parts = [p for p in url.path.split("/") if p]
                 is_ws = parts == ["v1", "events"]
                 gate = server._sockets if is_ws else server._lanes[server.lane(method, parts, self.query)]
+                wait_s = ADMIT_WAIT_S
+                if is_ws:
+                    # a reconnecting phone: authenticate FIRST, retire the dead feed that same device
+                    # left behind (its slot is what we are about to need), then wait briefly for it
+                    try:
+                        server._ws_replace(self.device().get("id"))
+                    except _HttpError as e:
+                        return self._error(e)
+                    wait_s = WS_ADMIT_WAIT_S
                 if not gate.acquire(blocking=False):
                     server.stats["waited"] += 1
                     # a full lane queues the request (a fast scroll); only a stuck server says busy
-                    if is_ws or not gate.acquire(timeout=ADMIT_WAIT_S):
+                    if not gate.acquire(timeout=wait_s):
                         server.stats["busy"] += 1
                         # i18n-ok: HTTP header name, not UI text
                         return self._error(_HttpError(503, "busy", {"Retry-After": "1"}))
@@ -787,6 +868,9 @@ class SyncServer:
 
             def send_bytes(self, data, ctype, status=200, headers=None):
                 self.send_response(status)
+                pending = self._pending_body()
+                if pending is None or pending > BODY_DRAIN_MAX:
+                    self.send_header("Connection", "close")      # we will not read the rest of that body
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
@@ -851,7 +935,7 @@ class SyncServer:
                 conn.close()
             return h.send_json(page)
         if parts == ["v1", "events"] and method == "GET":
-            return self._websocket(h)
+            return self._websocket(h, dev)
         if parts == ["v1", "micro"] and method == "GET":
             ids = _id_list(h.query.get("ids", ""), MICRO_BATCH_MAX)
             return h.send_bytes(pack_micro(self._micro(ids)), "application/octet-stream")
@@ -1426,7 +1510,17 @@ class SyncServer:
                 h.close_connection = True
 
     # ── WebSocket change feed (RFC 6455, server -> client text frames) ──
-    def _websocket(self, h):
+    def _ws_replace(self, device_id):
+        """Retire the open feeds of this device: a phone that reconnects (Wi-Fi roam, wake from
+        sleep) is by definition not listening on the old one, but a half-open socket would hold
+        one of the MAX_SOCKETS slots until TCP gave up (minutes)."""
+        with self._ws_lock:
+            old = [f for f in self._ws_open.values() if f["dev"] == device_id]
+        for feed in old:
+            feed["kick"].set()
+            self.stats["ws_replaced"] += 1
+
+    def _websocket(self, h, dev=None):
         key = h.headers.get("Sec-WebSocket-Key", "")
         if h.headers.get("Upgrade", "").lower() != "websocket" or not key:
             raise _HttpError(400, "websocket_required")
@@ -1439,22 +1533,34 @@ class SyncServer:
         h.wfile.flush()
         h.close_connection = True
         sock = h.connection
+        feed = {"dev": (dev or {}).get("id"), "kick": threading.Event()}
+        with self._ws_lock:
+            self._ws_open[id(feed)] = feed
+        try:
+            self._ws_loop(h, sock, feed)
+        finally:
+            with self._ws_lock:
+                self._ws_open.pop(id(feed), None)
+
+    def _ws_loop(self, h, sock, feed):
         # no `since`: the client is current; with one, a stale client is told at once
         seen = _int(h.query.get("since"), self._top_seq)
+        ping_sent = None                      # monotonic time of an unanswered ping
         last_ping = time.monotonic()
         _ws_send(sock, 0x1, json.dumps({"type": "hello", "cursor": self._top_seq}).encode("utf-8"))
-        while not self._stop.is_set():
+        while not self._stop.is_set() and not feed["kick"].is_set():
             top = self.wait_change(seen, 1.0)
             if top != seen:
                 seen = top
                 _ws_send(sock, 0x1, json.dumps({"type": "changes", "cursor": top}).encode("utf-8"))
-            if time.monotonic() - last_ping >= WS_KEEPALIVE_S:
-                _ws_send(sock, 0x9, b"")
-                last_ping = time.monotonic()
-            pending = sock.pending() if isinstance(sock, ssl.SSLSocket) else 0
-            readable = pending or select.select([sock], [], [], 0)[0]
-            if readable:
+            # read what the client sent BEFORE judging it: a pong that arrived during the wait above
+            # must count, or a healthy phone is reaped by the very timer meant to catch dead ones
+            while True:
+                pending = sock.pending() if isinstance(sock, ssl.SSLSocket) else 0
+                if not (pending or select.select([sock], [], [], 0)[0]):
+                    break
                 op, payload = _ws_recv(sock)
+                ping_sent = None              # any frame from the client proves it is alive
                 if op is None or op == 0x8:
                     try:
                         _ws_send(sock, 0x8, payload[:2] if payload else b"")
@@ -1463,8 +1569,17 @@ class SyncServer:
                     return
                 if op == 0x9:
                     _ws_send(sock, 0xA, payload)
+            now = time.monotonic()
+            if ping_sent is not None and now - ping_sent >= WS_PONG_TIMEOUT_S:
+                # TCP still says "open" (the phone vanished without a FIN) but nothing answers:
+                # free the slot, or a reconnecting phone meets 503 "busy" for minutes
+                self.stats["ws_reaped"] += 1
+                return
+            if ping_sent is None and now - last_ping >= WS_KEEPALIVE_S:
+                _ws_send(sock, 0x9, b"")
+                ping_sent = last_ping = now
         try:
-            _ws_send(sock, 0x8, struct.pack(">H", 1001))
+            _ws_send(sock, 0x8, struct.pack(">H", 1001 if self._stop.is_set() else 1000))
         except OSError:
             pass
 

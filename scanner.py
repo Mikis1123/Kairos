@@ -308,6 +308,27 @@ def repair_missing_thumbnails(should_stop=None, progress=None, flush_every=50):
     return created
 
 
+def pair_live_photos(rows):
+    """[(video_path, photo_id)] for every photo that has a same-named video in the same folder.
+
+    rows: iterable of (id, file_path, media_type) with media_type 'photo' or 'video'. One pass
+    builds a {(folder, stem): first video} dict and one pass looks the photos up, O(n). The
+    SQL self-join this replaces compared every photo with every video (20 s for 30k photos) and
+    its rtrim(path, name) stripped a CHARACTER SET, not a suffix, so it also mangled folders
+    whose names end in letters of the file name. Folder and stem compare case-insensitively
+    (Windows, and a phone export that upper-cases one half of the pair)."""
+    videos, photos = {}, []
+    for media_id, path, kind in rows:
+        if not path:
+            continue
+        key = (os.path.normcase(os.path.dirname(path)), Path(path).stem.casefold())
+        if kind == "video":
+            videos.setdefault(key, path)                 # rows come in id order: the first video wins
+        else:
+            photos.append((media_id, key))
+    return [(videos[key], media_id) for media_id, key in photos if key in videos]
+
+
 def with_live_partners(files):
     """Podporované soubory + jejich partneři se stejným názvem ve stejné složce (IMG_1.HEIC
     přetažená bez IMG_1.MOV by přišla o pohyb Live Photo). Pořadí zachová, bez duplicit."""
@@ -774,22 +795,11 @@ class MediaScannerThread(QThread):
     def _pair_live_photos(self, conn):
         try:
             cursor = conn.cursor()
-            cursor.execute("""
-            SELECT p.id, p.file_path, v.file_path 
-            FROM media_items p
-            JOIN media_items v ON 
-                substr(p.file_name, 1, instr(p.file_name, '.') - 1) = substr(v.file_name, 1, instr(v.file_name, '.') - 1)
-                AND p.media_type = 'photo' 
-                AND v.media_type = 'video'
-                AND rtrim(p.file_path, p.file_name) = rtrim(v.file_path, v.file_name)
-            """)
-            pairs = cursor.fetchall()
-            for photo_id, _, video_path in pairs:
-                cursor.execute("""
-                    UPDATE media_items 
-                    SET media_type = 'live_photo', paired_video_path = ? 
-                    WHERE id = ?
-                """, (video_path, photo_id))
+            pairs = pair_live_photos(
+                cursor.execute("SELECT id, file_path, media_type FROM media_items "
+                               "WHERE media_type IN ('photo', 'video') ORDER BY id"))
+            cursor.executemany("UPDATE media_items SET media_type = 'live_photo', paired_video_path = ? "
+                               "WHERE id = ? AND media_type = 'photo'", pairs)
             conn.commit()
         except Exception as e:
             print(f"Chyba při párování Live Photos: {e}")

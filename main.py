@@ -7672,24 +7672,45 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 show_toast(self, tr("error-person-rename", e=e), "error")
 
+    def _heavy_loads(self):
+        """One-thread pool for the long library jobs (face re-grouping, fingerprint refresh +
+        duplicate search): they never run on the GUI thread, never two at once (SQLite write
+        contention), and never take a worker from the short people/events reads of _bg_loads."""
+        heavy = getattr(self, "_heavy_bg", None)
+        if heavy is None:
+            import bg_jobs
+            heavy = self._heavy_bg = bg_jobs.BackgroundLoads(self, threads=1)
+        return heavy
+
     def _recluster_faces(self):
+        heavy = self._heavy_loads()
+        if heavy.pending("recluster_faces"):
+            return                                   # the button was pressed twice: one run is enough
         threshold = float(self.config.get("face_similarity_threshold", 0.62))
+        merge_threshold = self.config.get("face_merge_threshold")
         self.lbl_status.setText(tr("people-regrouping"))
-        QCoreApplication.processEvents()
-        try:
-            stats = strict_recluster_faces(threshold=threshold,
-                                           merge_threshold=self.config.get("face_merge_threshold"))
-            invalidate_centroid_cache()
-            self._load_people()
-            if stats:
-                persons = int(stats.get("anchors", 0)) + int(stats.get("new_people", 0))
-                show_toast(self, tr("people-regroup-done", people=persons, faces=stats.get('faces', 0)), "success")
-            else:
-                show_toast(self, tr("people-regroup-none"), "info")
-        except Exception as e:
-            show_toast(self, tr("people-regroup-failed", e=e), "error")
-        finally:
+
+        def work():                                  # worker thread: strict_recluster_faces opens its own connection
+            return strict_recluster_faces(threshold=threshold, merge_threshold=merge_threshold)
+
+        def done(stats):                             # GUI thread
             self.lbl_status.setText("")
+            try:
+                invalidate_centroid_cache()
+                self._load_people()
+                if stats:
+                    persons = int(stats.get("anchors", 0)) + int(stats.get("new_people", 0))
+                    show_toast(self, tr("people-regroup-done", people=persons, faces=stats.get('faces', 0)), "success")
+                else:
+                    show_toast(self, tr("people-regroup-none"), "info")
+            except Exception as e:
+                show_toast(self, tr("people-regroup-failed", e=e), "error")
+
+        def failed(e):
+            self.lbl_status.setText("")
+            show_toast(self, tr("people-regroup-failed", e=e), "error")
+
+        heavy.run("recluster_faces", work, done, failed)
 
     def _open_borderline_review(self):
         try:
@@ -7736,26 +7757,44 @@ class MainWindow(QMainWindow):
             show_toast(self, tr("faces-confirmed-count", person_name=view.person_name, assigned=view.assigned), "success")
 
     def _open_duplicate_review(self):
+        heavy = self._heavy_loads()
+        if heavy.pending("duplicate_search"):
+            return
         self.lbl_status.setText(tr("duplicates-searching"))
-        QCoreApplication.processEvents()
-        try:
+        self._phash_progress = None
+        ticker = QTimer(self)                        # GUI-thread poll of the worker's progress (no cross-thread widget calls)
+        ticker.setInterval(200)
+        ticker.timeout.connect(self._show_phash_progress)
+        ticker.start()
+
+        def work():                                  # worker thread: own connections only
             from ai_engine import get_duplicate_pairs
             # Doplní chybějící / zastaralé otisky (jinak by nové importy v detekci chyběly)
-            refresh_phashes(progress=self._on_phash_progress)
+            refresh_phashes(progress=self._on_phash_progress,
+                            should_stop=lambda: getattr(self, "_shutting_down", False))
             conn = get_connection()
             try:
-                pairs = get_duplicate_pairs(conn)
+                return get_duplicate_pairs(conn)
             finally:
                 conn.close()
-        except Exception as e:
-            show_toast(self, tr("error-duplicates", e=e), "error")
+
+        def finish():
+            ticker.stop()
+            ticker.deleteLater()
             self.lbl_status.setText("")
-            return
-        self.lbl_status.setText("")
-        if not pairs:
-            show_toast(self, tr("duplicates-none-photos"), "success")
-            return
-        self._push_duplicate_review(pairs)
+
+        def done(pairs):                             # GUI thread
+            finish()
+            if not pairs:
+                show_toast(self, tr("duplicates-none-photos"), "success")
+                return
+            self._push_duplicate_review(pairs)
+
+        def failed(e):
+            finish()
+            show_toast(self, tr("error-duplicates", e=e), "error")
+
+        heavy.run("duplicate_search", work, done, failed)
 
     def _push_duplicate_review(self, pairs):
         view = DuplicateReviewView(pairs)
@@ -7777,9 +7816,13 @@ class MainWindow(QMainWindow):
                        action_text=tr("trash-show"), on_action=self._show_trash)
 
     def _on_phash_progress(self, i: int, n: int):
-        if i == n or i % 25 == 0:
-            self.lbl_status.setText(tr("status-fingerprints-short", done=i, total=n))
-            QCoreApplication.processEvents()
+        """Worker thread: just record it (a plain tuple store is atomic); the GUI ticker shows it."""
+        self._phash_progress = (i, n)
+
+    def _show_phash_progress(self):
+        prog = getattr(self, "_phash_progress", None)
+        if prog:
+            self.lbl_status.setText(tr("status-fingerprints-short", done=prog[0], total=prog[1]))
 
     # ── Events ────────────────────────────────────────────────────────────────
 
@@ -8188,6 +8231,10 @@ class MainWindow(QMainWindow):
         if self._search_warmup is not None:
             self._search_warmup.wait()          # načítání modelu nejde přerušit; zničení běžícího QThread = pád
         self._person_card_pool.waitForDone(2000)
+        heavy = getattr(self, "_heavy_bg", None)    # face re-grouping / duplicate search worker
+        if heavy is not None:
+            heavy.pool.clear()
+            heavy.pool.waitForDone(3000)
         bg = getattr(self, "_bg", None)              # 120 Hz pass: background library reads
         if bg is not None:
             bg.pool.clear()
