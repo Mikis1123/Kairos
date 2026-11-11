@@ -49,6 +49,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 
 from PyQt6.QtCore import QEvent, QKeyCombination, QObject, QRect, Qt, QTimer, QUrl, pyqtSignal
@@ -98,10 +99,27 @@ BRIDGE_JS = """(function () {
 
 _clr = None                      # namespace of loaded .NET types, or an Exception
 _availability = None
+_clr_lock = threading.Lock()     # the loader may run on a worker thread (prewarm) and the GUI thread
+_runtime_version = False         # False = not asked yet; str / None afterwards
 
 
 def _load_clr():
     """Loads pythonnet + the WebView2 SDK once. Returns a dict of .NET types; raises on failure."""
+    with _clr_lock:
+        return _load_clr_locked()
+
+
+def prewarm():
+    """Loads pythonnet (~150 ms of GUI-thread stall measured 2026-11-11 on the first map pan after
+    start-up) and asks for the WebView2 runtime version OFF the GUI thread; the later GUI-thread
+    calls find everything cached. Safe to call from any thread, never raises."""
+    try:
+        runtime_version()
+    except Exception:                                # noqa: BLE001 – the GUI thread reports it itself
+        pass
+
+
+def _load_clr_locked():
     global _clr
     if isinstance(_clr, dict):
         return _clr
@@ -126,11 +144,15 @@ def _load_clr():
 
 
 def runtime_version():
-    """Installed WebView2 (Evergreen) runtime version, or None."""
+    """Installed WebView2 (Evergreen) runtime version, or None (cached after the first answer)."""
+    global _runtime_version
+    if _runtime_version is not False:
+        return _runtime_version
     try:
-        return str(_load_clr()["Core"].CoreWebView2Environment.GetAvailableBrowserVersionString(None) or "") or None
+        _runtime_version = str(_load_clr()["Core"].CoreWebView2Environment.GetAvailableBrowserVersionString(None) or "") or None
     except Exception:
-        return None
+        _runtime_version = None
+    return _runtime_version
 
 
 def requested_backend():

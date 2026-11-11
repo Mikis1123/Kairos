@@ -2925,6 +2925,7 @@ PHOTO_PRECACHE_DELAY_MS = 90000   # Sprint 3 item 3: photo places offline, once 
 DEFERRED_SERVICES_MS = 500     # pillar 5: daemons / side pages start this long after the first grid frame
 DEFERRED_FALLBACK_MS = 2500    # … or after this, when the window opened somewhere without a grid frame
 MAP_PREBUILD_DELAY_MS = 1500   # map host (WebView2) built in the background after the deferred tick
+VIEWER_PREWARM_RETRY_MS = 4000   # the viewer (~0.6 s of GUI-thread work) never builds while the map is showing
 SEARCH_WARMUP_DELAY_MS = 5000   # textový model hledání se načte v klidu po startu, ne při 1. dotazu
 SIGLIP_READY_SHARE = 0.98       # přesné hledání se zapne, až má SigLIP 2 vektor ≥ 98 % knihovny
 SIGLIP_BATCH = 8
@@ -4529,10 +4530,28 @@ class MainWindow(QMainWindow):
         else:
             self._check_siglip_ready_async()
         self._start_ai_daemon()
+        self._prewarm_map_services()
         QTimer.singleShot(VIEWER_PREWARM_DELAY_MS, self._prewarm_viewer)
         QTimer.singleShot(SMART_IMPORT_DELAY_MS, self._smart_import_check)
         QTimer.singleShot(MAP_PREBUILD_DELAY_MS, self._ensure_map_view)     # map instant on first visit
         QTimer.singleShot(PHOTO_PRECACHE_DELAY_MS, self._start_photo_precache)
+
+    def _prewarm_map_services(self):
+        """The map's heavy one-off set-up OFF the GUI thread: pythonnet + WebView2 SDK load (~150 ms)
+        and the tile store (sqlite open + writer thread). Measured 2026-11-11: both showed up in the
+        GUI-thread stall sampler during the first map pan; _build_map_view_webview2 now finds them
+        ready (tile_store.start and map_host.available are idempotent / cached)."""
+        if getattr(self, "_map_services_prewarmed", False):
+            return
+        self._map_services_prewarmed = True
+        budget = int(self.config.get("tile_store_mb", tile_store.DEFAULT_BUDGET_MB))
+
+        def work():
+            if map_host.requested_backend() != "qtwebengine":
+                map_host.prewarm()
+            tile_store.start(budget)
+
+        threading.Thread(target=work, name="map-prewarm", daemon=True).start()
 
     def precache_options(self):
         """Arguments for map_precache.MapJobs.start_precache from this window (GUI thread)."""
@@ -6748,6 +6767,11 @@ class MainWindow(QMainWindow):
         aby první otevření fotky ani první video nezasekly rozhraní."""
         if not self.isVisible():
             return                      # zavřené / skryté okno nic nepřipravuje
+        if self.stack.currentIndex() == 3 and self._viewer is None:
+            # Mapa je na očích: 0,6 s stavby prohlížeče by zaseklo první tahy mapou (naměřeno
+            # 2026-11-11, 75ms škytnutí). Zkusí se znovu; první otevření fotky ho postaví samo.
+            QTimer.singleShot(VIEWER_PREWARM_RETRY_MS, self._prewarm_viewer)
+            return
         if self._viewer is None and self.nav.depth() == 0:
             self._ensure_viewer()
         if self._media_warmup is None:
