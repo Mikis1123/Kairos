@@ -53,6 +53,10 @@ targets:
         # Parity sprint: background sync (BackgroundSync.swift). "fetch" = BGAppRefreshTask,
         # "processing" = BGProcessingTask (backup while charging).
         UIBackgroundModes: [fetch, processing]
+        # Bonjour re-discovery of the desktop after its address changed (DesktopDiscovery.swift).
+        # iOS only lets an app browse the service types it declares here.
+        NSBonjourServices:
+          - _kairos._tcp
         BGTaskSchedulerPermittedIdentifiers:
           - app.kairos.ios.refresh
           - app.kairos.ios.backup

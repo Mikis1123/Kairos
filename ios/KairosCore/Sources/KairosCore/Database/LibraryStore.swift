@@ -19,7 +19,7 @@ public final class LibraryStore: @unchecked Sendable {
         return e
     }()
 
-    public static let schemaVersion: Int64 = 3
+    public static let schemaVersion: Int64 = 4
 
     static let migrations: [String] = [
         """
@@ -89,6 +89,11 @@ public final class LibraryStore: @unchecked Sendable {
         // v3: why a backup failed (an ImportQueue / desktop reason code), shown with the Retry button.
         """
         ALTER TABLE phone_assets ADD COLUMN backup_error TEXT;
+        """,
+        // v4: a favourite toggled on the phone is queued in the replica until the desktop has it
+        // (offline taps used to be lost, or reverted by the next sync). Same idea as media_edits.dirty.
+        """
+        ALTER TABLE media_items ADD COLUMN is_favorite_dirty INTEGER NOT NULL DEFAULT 0;
         """,
     ]
 
@@ -183,16 +188,23 @@ public final class LibraryStore: @unchecked Sendable {
     private func upsert(_ p: ChangePayload, _ out: inout Applied) throws {
         switch p {
         case .media(let m):
-            let old = try db.query("SELECT payload FROM media_items WHERE id = ?", [.int(m.id)]).first
+            let old = try db.query("SELECT payload, is_favorite, is_favorite_dirty FROM media_items WHERE id = ?",
+                                   [.int(m.id)]).first
             let oldItem = old?.string("payload").flatMap { try? decoder.decode(MediaItem.self, from: Data($0.utf8)) }
+            // A favourite toggled here and not yet delivered wins over what the desktop sends
+            // (same rule as an unsent edit); its upload settles the desktop and clears the flag.
+            var m = m
+            let favoritePending = old?.bool("is_favorite_dirty") ?? false
+            if favoritePending { m.isFavorite = old?.bool("is_favorite") ?? m.isFavorite }
             try db.run("""
                 INSERT OR REPLACE INTO media_items (id, date_taken, media_type, file_name, latitude, longitude,
-                    place_city, place_country, is_favorite, event_id, chapter_id, live, has_thumb, fingerprint, payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    place_city, place_country, is_favorite, event_id, chapter_id, live, has_thumb, fingerprint, payload,
+                    is_favorite_dirty)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [.int(m.id), .init(m.dateTaken), .init(m.mediaType), .init(m.fileName), .init(m.latitude),
                       .init(m.longitude), .init(m.placeCity), .init(m.placeCountry), .init(m.isFavorite),
                       .init(m.eventId), .init(m.chapterId), .init(m.live), .init(m.hasThumb), .init(m.fingerprint),
-                      .text(try json(m))])
+                      .text(try json(m)), .init(favoritePending)])
             // new photo, or the file changed (new fingerprint): fetch its LQIP
             if oldItem == nil || oldItem?.fingerprint != m.fingerprint || oldItem?.fileMtime != m.fileMtime {
                 if oldItem != nil { try db.run("DELETE FROM micro_previews WHERE media_id = ?", [.int(m.id)]) }
@@ -526,11 +538,50 @@ public final class LibraryStore: @unchecked Sendable {
         return timeline((try? db.query(sql, args)) ?? [])
     }
 
+    /// A favourite toggled on the phone: stored at once and flagged (is_favorite_dirty) until the
+    /// desktop has it, so it survives being offline, a relaunch and the sync pages that arrive meanwhile.
     public func setFavoriteLocally(_ id: MediaID, _ value: Bool) throws {
         guard var m = media(id) else { return }
         m.isFavorite = value
-        try db.run("UPDATE media_items SET is_favorite = ?, payload = ? WHERE id = ?",
+        try db.run("UPDATE media_items SET is_favorite = ?, is_favorite_dirty = 1, payload = ? WHERE id = ?",
                    [.init(value), .text(try json(m)), .int(id)])
+    }
+
+    /// One queued favourite: the value to deliver.
+    public struct PendingFavorite: Sendable, Equatable {
+        public let id: MediaID
+        public let value: Bool
+    }
+
+    public func dirtyFavorites() -> [PendingFavorite] {
+        ((try? db.query("SELECT id, is_favorite FROM media_items WHERE is_favorite_dirty = 1")) ?? []).compactMap { r in
+            r.int("id").map { PendingFavorite(id: $0, value: r.bool("is_favorite")) }
+        }
+    }
+
+    public var pendingFavoriteCount: Int {
+        Int((try? db.scalarInt("SELECT COUNT(*) FROM media_items WHERE is_favorite_dirty = 1")) ?? 0)
+    }
+
+    /// The desktop acknowledged `uploaded`. Compare-and-swap, like editUploaded: the flag clears only
+    /// while the row still holds the value that was sent, so a toggle made while the request was in
+    /// flight stays queued. `gone` (404: deleted or hidden on the desktop) drops the flag outright.
+    /// Returns false when a newer toggle won.
+    @discardableResult
+    public func favoriteUploaded(_ id: MediaID, uploaded: Bool, gone: Bool = false) throws -> Bool {
+        if gone {
+            try db.run("UPDATE media_items SET is_favorite_dirty = 0 WHERE id = ?", [.int(id)])
+            return true
+        }
+        var landed = false
+        try db.transaction {
+            let still = try db.query("SELECT 1 FROM media_items WHERE id = ? AND is_favorite_dirty = 1 AND is_favorite = ?",
+                                     [.int(id), .init(uploaded)]).first != nil
+            guard still else { return }
+            try db.run("UPDATE media_items SET is_favorite_dirty = 0 WHERE id = ?", [.int(id)])
+            landed = true
+        }
+        return landed
     }
 
     public func counts() -> (media: Int, events: Int, people: Int) {

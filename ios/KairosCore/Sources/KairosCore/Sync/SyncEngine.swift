@@ -22,6 +22,13 @@ public actor SyncEngine {
     private var runTask: Task<Void, Never>?
     private var pushing = false
     private var pushAgain = false
+    private var pushingFavorites = false
+    private var pushFavoritesAgain = false
+    /// Finds the desktop's current address after a connection failure (Bonjour in the app).
+    /// nil = no discovery; the QR address is all there is.
+    private var locate: (@Sendable (DesktopEndpoint) async -> (host: String, port: Int)?)?
+    private var onRelocated: (@Sendable (DesktopEndpoint) -> Void)?
+    private var nap: Task<Void, Never>?
 
     public init(store: LibraryStore, client: SyncClient) {
         self.store = store
@@ -33,6 +40,47 @@ public actor SyncEngine {
                         changes: @escaping @Sendable (LibraryStore.Applied) -> Void) {
         onStatus = status
         onChange = changes
+    }
+
+    /// Re-discovery (H10): after a connection failure the engine asks `locate` where the desktop
+    /// is now; a different address is applied to the client and reported through `relocated`
+    /// (the app saves it), and the loop retries at once instead of waiting out the backoff.
+    public func observeLocation(locate: @escaping @Sendable (DesktopEndpoint) async -> (host: String, port: Int)?,
+                                relocated: @escaping @Sendable (DesktopEndpoint) -> Void) {
+        self.locate = locate
+        onRelocated = relocated
+    }
+
+    /// The network changed (Wi-Fi joined, a new path): do not wait out the retry backoff.
+    public func nudge() {
+        nap?.cancel()
+    }
+
+    /// Looks for the desktop when the failure says "cannot reach it" (not a refusal from a
+    /// reachable server). True when the address changed.
+    private func relocateAfter(_ error: Error) async -> Bool {
+        guard let locate, Self.isConnectivity(error) else { return false }
+        let ep = client.endpoint
+        guard let found = await locate(ep), !Task.isCancelled,
+              let moved = DesktopDiscovery.moved(ep, to: found.host, port: found.port) else { return false }
+        client.relocate(host: moved.host, port: moved.port)
+        onRelocated?(client.endpoint)
+        return true
+    }
+
+    /// URLSession / socket failures: the desktop is unreachable at the stored address (or another
+    /// machine answers there and fails the certificate pin).
+    nonisolated static func isConnectivity(_ error: Error) -> Bool {
+        if error is URLError { return true }
+        let ns = error as NSError
+        return ns.domain == NSPOSIXErrorDomain || ns.domain == NSURLErrorDomain
+    }
+
+    private func sleep(_ seconds: UInt64) async {
+        let t = Task { try? await Task.sleep(nanoseconds: seconds * 1_000_000_000) }
+        nap = t
+        await t.value
+        nap = nil
     }
 
     private func set(_ s: Status) {
@@ -107,9 +155,35 @@ public actor SyncEngine {
         Task { try? await self.pushEdits() }
     }
 
-    public func setFavorite(_ id: MediaID, _ value: Bool) async throws {
+    /// Saves a favourite toggle: the replica row is written (flagged dirty) before this returns,
+    /// so the heart flips at once, online or not. The upload runs detached; offline, the flag
+    /// stays and the sync loop delivers it after the next pull (compare-and-swap, like edits).
+    public func setFavorite(_ id: MediaID, _ value: Bool) throws {
         try store.setFavoriteLocally(id, value)
-        try await client.setFavorite(id, value)
+        Task { try? await self.pushFavorites() }
+    }
+
+    /// Delivers queued favourites. The desktop's answer clears the flag only while the row still
+    /// holds the value that was sent (LibraryStore.favoriteUploaded); a toggle made meanwhile goes
+    /// up in the next round.
+    public func pushFavorites() async throws {
+        guard !pushingFavorites else {
+            pushFavoritesAgain = true
+            return
+        }
+        pushingFavorites = true
+        defer { pushingFavorites = false }
+        repeat {
+            pushFavoritesAgain = false
+            for f in store.dirtyFavorites() {
+                do {
+                    try await client.setFavorite(f.id, f.value)
+                    try store.favoriteUploaded(f.id, uploaded: f.value)
+                } catch SyncError.server(404, _) {
+                    try store.favoriteUploaded(f.id, uploaded: f.value, gone: true)   // deleted or hidden on the desktop
+                }
+            }
+        } while pushFavoritesAgain
     }
 
     /// The sync loop: pull, push, listen, repeat. Reconnects with capped exponential backoff.
@@ -122,6 +196,7 @@ public actor SyncEngine {
                 do {
                     try await self.pull()
                     try await self.pushEdits()
+                    try await self.pushFavorites()
                     await self.set(.live)
                     backoff = 1
                     for try await cursor in self.client.changeFeed() {
@@ -135,8 +210,12 @@ public actor SyncEngine {
                     return
                 } catch {
                     await self.set(.offline(String(describing: error)))
+                    if await self.relocateAfter(error) {
+                        backoff = 1                    // the desktop moved: reconnect now
+                        continue
+                    }
                 }
-                try? await Task.sleep(nanoseconds: backoff * 1_000_000_000)
+                await self.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             }
         }
@@ -145,7 +224,12 @@ public actor SyncEngine {
     public func stop() {
         runTask?.cancel()
         runTask = nil
-        set(.idle)
+        nap?.cancel()
+        locate = nil
+        onRelocated = nil
+        status = .idle
+        onStatus = nil                          // a replaced engine must not write a stale status
+        onChange = nil
     }
 }
 #endif

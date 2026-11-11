@@ -42,7 +42,7 @@ public final class ImageLoader {
     private let cache = NSCache<NSString, CGImageBox>()
     private var pendingBytes: [String: PendingFetch] = [:]
     private var staleMicro: Set<MediaID> = []
-    private var fileTasks: [String: Task<Result<URL, Error>, Never>] = [:]
+    private var fileTasks: [String: PendingFile] = [:]
     /// Six thumbnails in flight over the client's 8 keep-alive connections: the bridge queues
     /// instead of refusing (interactive lane, 32 slots), and the remaining connections keep video
     /// ranges and micro pages from waiting behind a fling.
@@ -73,6 +73,15 @@ public final class ImageLoader {
         let task: Task<Data?, Never>
         var waiters = 0
         init(_ t: Task<Data?, Never>) { task = t }
+    }
+
+    /// One original / video / motion-half download shared by every page asking for the same file.
+    /// Cancelled when the last of them goes away (the viewer paged past it): without this, every
+    /// page a fast swipe passed kept pulling its whole original over the LAN to the end.
+    final class PendingFile: @unchecked Sendable {
+        let task: Task<Result<URL, Error>, Never>
+        var waiters = 0
+        init(_ t: Task<Result<URL, Error>, Never>) { task = t }
     }
 
     nonisolated static var thumbsDirectory: URL {
@@ -367,10 +376,39 @@ public final class ImageLoader {
     public func mediaFile(_ id: MediaID, live: Bool) async -> Result<URL, Error> {
         if let hit = cachedMediaFile(id, live: live) { return .success(hit) }
         guard let name = mediaFileName(id, live: live) else { return .failure(SyncError.server(404, "not_found")) }
-        if let running = fileTasks[name] { return await running.value }
-        guard let client else { return .failure(URLError(.notConnectedToInternet)) }
+        let pending: PendingFile
+        if let running = fileTasks[name] {
+            pending = running
+        } else {
+            guard let client else { return .failure(URLError(.notConnectedToInternet)) }
+            pending = PendingFile(startDownload(id, live: live, name: name, client: client))
+            fileTasks[name] = pending
+        }
+        pending.waiters += 1
+        let result = await withTaskCancellationHandler {
+            await pending.task.value
+        } onCancel: {
+            Task { @MainActor [weak self] in self?.dropFileWaiter(name, pending) }
+        }
+        if !Task.isCancelled {
+            pending.waiters -= 1
+            if fileTasks[name] === pending { fileTasks[name] = nil }
+        }
+        return result
+    }
+
+    /// A waiter was cancelled: with nobody left, the download itself is cancelled (URLSession's
+    /// async download honours it) and its partial temp file goes with it.
+    private func dropFileWaiter(_ name: String, _ p: PendingFile) {
+        p.waiters -= 1
+        guard p.waiters <= 0 else { return }
+        p.task.cancel()
+        if fileTasks[name] === p { fileTasks[name] = nil }
+    }
+
+    private func startDownload(_ id: MediaID, live: Bool, name: String, client: SyncClient) -> Task<Result<URL, Error>, Never> {
         let dest = Self.originalsDirectory.appendingPathComponent(name)
-        let task = Task<Result<URL, Error>, Never>.detached(priority: .userInitiated) {
+        return Task<Result<URL, Error>, Never>.detached(priority: .userInitiated) {
             do {
                 let tmp = try await client.downloadOriginal(id, live: live)
                 let fm = FileManager.default
@@ -383,10 +421,6 @@ public final class ImageLoader {
                 return .failure(error)
             }
         }
-        fileTasks[name] = task
-        let result = await task.value
-        fileTasks[name] = nil
-        return result
     }
 
     nonisolated static func pruneOriginals() {

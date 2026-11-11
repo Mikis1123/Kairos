@@ -58,7 +58,7 @@ struct PersonCell: View {
                 .font(Kairos.Typography.callout)
                 .foregroundStyle(person.name?.isEmpty == false ? Kairos.Palette.text : Kairos.Palette.textTertiary)
                 .lineLimit(1)
-            Text("\(person.photoCount)").font(Kairos.Typography.caption).foregroundStyle(Kairos.Palette.textTertiary)
+            Text("\(person.photoCount)").font(Kairos.Typography.counter).foregroundStyle(Kairos.Palette.textTertiary)
         }
         .task(id: "\(person.keyFaceId ?? 0)-\(model.revision)") {
             // Retried through the image loader's queue and kept on disk, so faces show offline.

@@ -101,6 +101,11 @@ final class VideoPageController: UIViewController, ViewerPage {
     private var failed = false
     private var fallbackTask: Task<Void, Never>?
     private var posterTask: Task<Void, Never>?
+    private var prepareTask: Task<Void, Never>?
+    private var prepared = false
+    /// A video must stay on screen this long before it is streamed (unless it plays from disk),
+    /// so a fast swipe through a run of videos opens no stream for the ones it flies past.
+    private static let settleNanos: UInt64 = 250_000_000
 
     /// Mute is remembered for the session, like Photos.
     private static var muted = false
@@ -172,7 +177,6 @@ final class VideoPageController: UIViewController, ViewerPage {
         view.addGestureRecognizer(tap)
 
         loadPoster()
-        preparePlayer()
         applyChrome(animated: false)
     }
 
@@ -244,6 +248,52 @@ final class VideoPageController: UIViewController, ViewerPage {
     }
 
     // ── player ──
+
+    /// Streams only while the page is on screen. UIPageViewController builds the neighbours too;
+    /// they get their poster and nothing else, so a swipe never leaves AVPlayer streams behind.
+    private func schedulePrepare() {
+        guard !prepared else { return }
+        prepared = true
+        prepareTask?.cancel()
+        let local = model.images.cachedMediaFile(id, live: false) != nil || model.images.localAsset(id) != nil
+        prepareTask = Task { [weak self] in
+            if !local {
+                try? await Task.sleep(nanoseconds: Self.settleNanos)
+                guard !Task.isCancelled else { return }
+            }
+            guard let self, self.visible else { return }
+            self.preparePlayer()
+        }
+    }
+
+    /// The page left the screen: the stream, the fallback download and the player item all go.
+    /// MediaStreamLoader.cancelAll cancels its in-flight range requests, the fallback's cancellation
+    /// reaches the shared download (ImageLoader drops it with its last waiter).
+    private func releasePlayer() {
+        prepareTask?.cancel()
+        prepareTask = nil
+        fallbackTask?.cancel()
+        fallbackTask = nil
+        observations.removeAll()
+        player?.pause()
+        tokens.clear()                                  // time/end observers, then the stream loader
+        player?.replaceCurrentItem(with: nil)
+        playerView.player = nil
+        tokens.player = nil
+        player = nil
+        prepared = false
+        triedDownload = false
+        failed = false
+        scrubbing = false
+        seeking = false
+        pendingSeek = nil
+        message.isHidden = true
+        spinner.stopAnimating()
+        poster.isHidden = false
+        slider.value = 0
+        elapsed.text = "0:00"
+        remaining.text = "-0:00"
+    }
 
     private func preparePlayer() {
         // the camera roll first (three-state library): a local video plays without any network.
@@ -533,13 +583,14 @@ final class VideoPageController: UIViewController, ViewerPage {
         visible = true
         // The slider must get its touch at once, or the pager steals a horizontal drag first.
         pagerScrollView()?.delaysContentTouches = false
-        play()
+        if player == nil { schedulePrepare() } else { play() }
     }
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         visible = false
         pause()
+        releasePlayer()
         PlaybackAudio.done()
     }
 

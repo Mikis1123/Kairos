@@ -100,6 +100,12 @@ hidden_imports = [
     'pythonnet',
 ]
 hidden_imports += collect_submodules('pillow_heif')
+# Fix Block C: Bonjour (_kairos._tcp) – sync_server.advertise() importuje lan_discovery/zeroconf líně
+hidden_imports += ['lan_discovery']
+try:
+    hidden_imports += collect_submodules('zeroconf')
+except Exception:
+    pass
 # Sprint 3: OCR Windows (ocr_engine) – projekce winrt se načítají dynamicky
 try:
     hidden_imports += collect_submodules('winrt')

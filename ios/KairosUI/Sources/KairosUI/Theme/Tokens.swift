@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Kairos design tokens. These are the desktop values from tokens.py / theme.py ("Graphite Night"
 /// dark mode, Iris accent), so both apps read as one product. Change them only together with the
@@ -14,7 +17,10 @@ public enum Kairos {
         public static let placeholder = Color(hex: 0x141417)
         public static let text = Color(hex: 0xF2F2F4)
         public static let textSecondary = Color(hex: 0xA1A1AA)
-        public static let textTertiary = Color(hex: 0x6B6B74)
+        // WCAG AA (>= 4.5:1) for small text on every surface it sits on: dark 0x9898A4 is 4.5+ on
+        // surface3 (the lightest), light 0x5C5C66 is 5.2+ on the grey groups. The old 0x6B6B74 was
+        // 2.5-3.8:1 in dark. test_block_c_mobile.py recomputes the ratios from these literals.
+        public static let textTertiary = Color(dark: 0x9898A4, light: 0x5C5C66)
         public static let hairline = Color.white.opacity(20.0 / 255.0)
         public static let hairlineStrong = Color.white.opacity(36.0 / 255.0)
         public static let pill = Color.white.opacity(24.0 / 255.0)
@@ -60,10 +66,29 @@ public enum Kairos {
         public static let body = Font.body
         public static let callout = Font.callout
         public static let caption = Font.caption.weight(.semibold)
+        /// Section headers and counters: system text styles, so they follow Dynamic Type (the
+        /// rows that carry them wrap or grow instead of clipping).
+        public static let sectionHeader = Font.headline
+        public static let counter = Font.caption.weight(.semibold).monospacedDigit()
+        /// Tiny glyphs on photos (badges): Dynamic Type up to the point a grid cell can hold them.
+        public static let badge = Font.caption2.weight(.semibold)
     }
 }
 
 extension Color {
+    /// A colour that follows the interface style: `dark` in dark mode, `light` otherwise.
+    init(dark: UInt32, light: UInt32) {
+        #if canImport(UIKit)
+        func ui(_ v: UInt32) -> UIColor {
+            UIColor(red: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255,
+                    blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+        }
+        self.init(UIColor { $0.userInterfaceStyle == .light ? ui(light) : ui(dark) })
+        #else
+        self.init(hex: dark)
+        #endif
+    }
+
     init(hex: UInt32, opacity: Double = 1) {
         self.init(.sRGB, red: Double((hex >> 16) & 0xFF) / 255, green: Double((hex >> 8) & 0xFF) / 255,
                   blue: Double(hex & 0xFF) / 255, opacity: opacity)

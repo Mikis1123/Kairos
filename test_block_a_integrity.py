@@ -363,7 +363,7 @@ class TestIosBackupContract(unittest.TestCase):
         self.assertNotIn("(unsupported format)", ui, "the pill used to blame the format for every refusal")
         store = _read("ios/KairosCore/Sources/KairosCore/Database/LibraryStore.swift")
         self.assertIn("ALTER TABLE phone_assets ADD COLUMN backup_error TEXT", store)
-        self.assertIn("schemaVersion: Int64 = 3", store)
+        self.assertIn("schemaVersion: Int64 = 4", store)   # Fix Block C added v4 (favourite queue)
 
 
 if __name__ == "__main__":

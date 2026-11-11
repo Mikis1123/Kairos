@@ -27,3 +27,5 @@ xxhash>=3.4
 fluent.syntax>=0.19
 # ProRAW / camera RAW: LibRaw (raw_decode.py) – vložený náhled, jinak demosaic
 rawpy>=0.28
+# iOS-most: Bonjour (_kairos._tcp) – telefon znovu najde počítač po změně IP (lan_discovery.py, volitelné)
+zeroconf>=0.130

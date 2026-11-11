@@ -1,6 +1,9 @@
 import CoreGraphics
 import Foundation
 import KairosCore
+#if canImport(Network)
+import Network
+#endif
 import Observation
 import SwiftUI
 
@@ -31,6 +34,11 @@ public final class AppModel {
     public private(set) var phoneIndex = PhoneLibrary.IndexProgress()
     private var backup: PhoneBackup?
     private var backupTask: Task<Void, Never>?
+    #endif
+
+    #if canImport(Network)
+    /// Wi-Fi joined / changed: a sync loop sleeping in its retry backoff tries again at once.
+    private var pathMonitor: NWPathMonitor?
     #endif
 
     private static let endpointKey = "kairos.desktop.endpoint"
@@ -82,12 +90,33 @@ public final class AppModel {
         } else {
             status = .needsPairing
         }
+        watchNetwork()
+    }
+
+    private func watchNetwork() {
+        #if canImport(Network)
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            Task { @MainActor in await self?.engine?.nudge() }
+        }
+        monitor.start(queue: DispatchQueue(label: "app.kairos.path"))
+        pathMonitor = monitor
+        #endif
+    }
+
+    /// Discovery found the desktop at another address (DHCP, new router): remember it, so the next
+    /// launch dials the right one too. The token and the pinned certificate stay the same.
+    private func endpointMoved(_ ep: DesktopEndpoint) {
+        endpoint = ep
+        if let data = try? JSONEncoder().encode(ep) { UserDefaults.standard.set(data, forKey: Self.endpointKey) }
     }
 
     public var isPaired: Bool { endpoint != nil }
 
     private func connect(_ ep: DesktopEndpoint, token: String) {
         guard let store else { return }
+        if let old = engine { Task { await old.stop() } }      // a re-pair must not leave two loops (and two relocators)
         endpoint = ep
         let c = SyncClient(endpoint: ep, token: token)
         client = c
@@ -116,6 +145,12 @@ public final class AppModel {
                     self.revision += 1
                 }
             })
+            #if canImport(Network)
+            await e.observeLocation(locate: { ep in await DesktopDiscovery.find(matching: ep) },
+                                    relocated: { [weak self] moved in
+                Task { @MainActor in self?.endpointMoved(moved) }
+            })
+            #endif
             await e.start()
         }
     }
@@ -316,9 +351,18 @@ public final class AppModel {
     /// Phone edits not yet acknowledged by the desktop.
     public var pendingEdits: Int { _ = revision; return store?.pendingEditCount ?? 0 }
 
+    /// Favourites toggled here and not yet delivered to the desktop (queued while offline).
+    public var pendingFavorites: Int { _ = revision; return store?.pendingFavoriteCount ?? 0 }
+
+    /// The heart flips at once (replica row, flagged dirty); delivery happens in the engine and,
+    /// offline, after the next successful pull.
     public func toggleFavorite(_ id: MediaID) async {
         guard let item = store?.media(id) else { return }
-        if let engine { try? await engine.setFavorite(id, !item.isFavorite) }
+        if let engine {
+            try? await engine.setFavorite(id, !item.isFavorite)
+        } else {
+            try? store?.setFavoriteLocally(id, !item.isFavorite)
+        }
         revision += 1
     }
 }

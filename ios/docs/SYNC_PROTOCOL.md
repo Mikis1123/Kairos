@@ -13,6 +13,15 @@ Contract tests: `test_ios_sync.py` writes `KairosCore/Tests/KairosCoreTests/Fixt
 - Capacity (Parity sprint): HTTP/1.1 keep-alive with TCP_NODELAY, up to 64 connections. Requests are admitted through two lanes: **interactive** (32 in flight: thumbnails, micro pages, video ranges, search, metadata) and **bulk** (2: packs, `?bulk=1` originals, uploads), so a backup never delays browsing. A request that finds its lane full **waits** up to 20 s for a slot; `503 busy` (`Retry-After: 1`) only answers a server that stayed stuck that long. Plus 4 WebSockets.
 - JSON bodies over 1 KB are gzip-compressed when the client sends `Accept-Encoding: gzip`. URLSession does this automatically.
 
+## Discovery (Fix Block C)
+
+The QR address goes stale when the router hands the desktop a new IP. While the bridge runs, the desktop announces itself over Bonjour (`lan_discovery.py`, the `zeroconf` package, optional):
+
+- Service `<name>._kairos._tcp.local.`, the bridge port, TXT `fp` = certificate SHA-256 (hex, the same value as the QR), `lib` = library id, `v` = protocol, `name`.
+- The announced address is re-checked every 15 s and updated when the desktop's address changes.
+- The phone (`DesktopDiscovery.swift`, `NWBrowser`) browses `_kairos._tcp` after a connection failure and on every network change. It accepts only the advert whose `fp` equals the fingerprint it paired with, resolves the address, relocates its `SyncClient` and saves the new endpoint. The token and the pin do not change. Needs `NSBonjourServices` in Info.plist and the Local Network permission.
+- Nothing secret is announced (the fingerprint is public). A wrong or hostile advert still fails the TLS pin.
+
 ## Privacy rules (server-enforced)
 
 - Absolute paths never cross the wire.
@@ -98,6 +107,7 @@ Client loop:
 - Unknown keys are preserved on both sides.
 - Pixel math: `EditMath.swift` ports `quick_edit.py`. Fixtures pin the LUTs (±1 level) and the inverse warp.
 - Conflicts: a local edit not yet uploaded (`dirty`) wins over an incoming one. After upload, the desktop's canonical answer replaces it, but only if the row still holds exactly what was uploaded (compare-and-swap). A newer edit saved while the PUT was in flight stays dirty and goes up next. Otherwise the last writer wins (protocol 1).
+- Favourites follow the same rule (`media_items.is_favorite_dirty`, schema v4): the heart flips in the replica at once and the flag stays until `PUT /v1/media/{id}/favorite` is acknowledged. The flag clears only while the row still holds the value that was sent (compare-and-swap); a toggle made meanwhile goes up next. While the flag is set, an incoming `media` upsert does not overwrite the local value. 404 drops the flag.
 - Saving on the phone writes the replica row first (dirty), then uploads in the background. Offline edits stay queued until the next successful sync. The phone re-bakes its own micro preview from the edited rendering, so the grid matches at once.
 - Phone writes reach the desktop GUI through `sync_server.set_remote_change_handler`. main.py routes them to the same grid refresh as a local Quick Edit or favourite.
 - Thumbnails and originals are served unedited, and the client applies the edit. Micro previews are the exception: the desktop bakes the edit into them.
@@ -121,4 +131,4 @@ Client loop:
 
 ## Planned for protocol 2
 
-Journey film manifests (the animated film; Trip mode already draws the route), Hidden-folder sync with its own key exchange, Bonjour discovery, and push through a relay when the PC is asleep.
+Journey film manifests (the animated film; Trip mode already draws the route), Hidden-folder sync with its own key exchange, and push through a relay when the PC is asleep.

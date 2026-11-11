@@ -45,13 +45,20 @@ public enum SyncError: Error, Equatable, Sendable {
 /// Typed client of the desktop LAN bridge (sync_server.py, protocol 1). Stateless apart from the
 /// URLSession, so it is safe to share between the sync engine and the image loaders.
 public final class SyncClient: @unchecked Sendable {
-    public let endpoint: DesktopEndpoint
+    /// Where the desktop is now. It moves when the router hands the desktop a new address and
+    /// discovery finds it again (`relocate`): every holder of this client follows at once.
+    public var endpoint: DesktopEndpoint {
+        lock.lock(); defer { lock.unlock() }
+        return current
+    }
+    private var current: DesktopEndpoint
+    private let lock = NSLock()
     private let token: String?
     private let session: URLSession
     private let decoder = JSONDecoder()
 
     public init(endpoint: DesktopEndpoint, token: String?) {
-        self.endpoint = endpoint
+        self.current = endpoint
         self.token = token
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 30
@@ -68,14 +75,27 @@ public final class SyncClient: @unchecked Sendable {
 
     deinit { session.finishTasksAndInvalidate() }
 
+    /// Points the client at a new address of the same desktop (same pinned certificate, same
+    /// token). Requests already in flight to the old address fail and are retried by their callers.
+    /// Returns false when nothing changed.
+    @discardableResult
+    public func relocate(host: String, port: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard current.host != host || current.port != port else { return false }
+        current.host = host
+        current.port = port
+        return true
+    }
+
     // ── plumbing ──
 
     private func request(_ path: String, method: String = "GET", query: [String: String] = [:],
                          json: Any? = nil, headers: [String: String] = [:]) throws -> URLRequest {
+        let ep = endpoint
         var c = URLComponents()
         c.scheme = "https"
-        c.host = endpoint.host
-        c.port = endpoint.port
+        c.host = ep.host
+        c.port = ep.port
         c.path = path
         if !query.isEmpty { c.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) } }
         guard let url = c.url else { throw SyncError.badResponse }

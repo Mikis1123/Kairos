@@ -190,6 +190,8 @@ struct StopCard: View {
     let n: Int
     let stop: Journey.Stop
     let selected: Bool
+    /// The number badge grows with Dynamic Type (its digits are text), capped so the card holds it.
+    @ScaledMetric(relativeTo: .caption) private var badgeSize: CGFloat = 22
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -200,9 +202,9 @@ struct StopCard: View {
                     Kairos.Palette.surface2
                 }
                 Text("\(n)")
-                    .font(.system(size: 12, weight: .bold))
+                    .font(Kairos.Typography.counter)
                     .foregroundStyle(Kairos.Palette.onAccent)
-                    .frame(width: 22, height: 22)
+                    .frame(width: min(badgeSize, 40), height: min(badgeSize, 40))
                     .background(Kairos.Palette.accentFill, in: Circle())
                     .padding(6)
             }

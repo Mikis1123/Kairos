@@ -61,7 +61,7 @@ struct ViewerView: View {
             if model.store?.media(current)?.live == true {
                 Button { livePlay += 1 } label: {
                     Label("LIVE", systemImage: "livephoto")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(Kairos.Typography.caption)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 10)
                 }
@@ -72,7 +72,7 @@ struct ViewerView: View {
             if current < 0 {
                 // three-state library: this one exists only in the camera roll so far
                 Label("iPhone only", systemImage: "iphone")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(Kairos.Typography.caption)
                     .padding(.horizontal, 8)
                     .accessibilityLabel("Only on this iPhone, not backed up to your computer yet")
             }
@@ -236,14 +236,21 @@ final class PhotoPageController: UIViewController, ViewerPage, PHLivePhotoViewDe
     private var liveTask: Task<Void, Never>?
     private var livePlaying = false
     private var liveHeld = false
-    private var loadTask: Task<Void, Never>?
+    private var loadTask: Task<Void, Never>?       // the thumbnail pass (cheap: neighbours run it too)
+    private var originalTask: Task<Void, Never>?   // the original: ONLY while this page is on screen
     private var detailTask: Task<Void, Never>?
+    private var livePrefetch: Task<Void, Never>?
+    private var visible = false
+    private var hasThumb = false
     private var hasOriginal = false
     private var hasDetail = false
     private var editKey: Data?
 
     static let screenPassPixels = 3000
     static let detailPassPixels = 6000              // ~108 MB RGBA at 4:3, one page at a time
+    /// A page must stay on screen this long before its original is requested, so flicking through
+    /// a long run of photos asks the desktop for none of the originals it flies past.
+    static let settleNanos: UInt64 = 250_000_000
 
     init(id: MediaID, model: AppModel) {
         self.id = id
@@ -293,13 +300,22 @@ final class PhotoPageController: UIViewController, ViewerPage, PHLivePhotoViewDe
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        visible = true
+        startThumbnail()
+        startOriginal()
         // The motion half is a few MB: fetch it while the user looks, so a hold plays at once.
-        // A camera-roll Live Photo is prepared from PhotoKit instead (no network).
+        // A camera-roll Live Photo is prepared from PhotoKit instead (no network). Cancelled with
+        // the page (viewDidDisappear), so a swipe past it does not leave a transfer behind.
         if isLive, model.images.localAsset(id) != nil {
             _ = loadLocalLive()
         } else if isLive, id > 0, model.images.cachedMediaFile(id, live: true) == nil {
             let images = model.images, id = self.id
-            Task { _ = await images.mediaFile(id, live: true) }
+            livePrefetch?.cancel()
+            livePrefetch = Task {
+                try? await Task.sleep(nanoseconds: Self.settleNanos)
+                guard !Task.isCancelled else { return }
+                _ = await images.mediaFile(id, live: true)
+            }
         }
     }
 
@@ -322,8 +338,16 @@ final class PhotoPageController: UIViewController, ViewerPage, PHLivePhotoViewDe
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        visible = false
         stopLive(animated: false)
+        // Everything this page has in flight goes: a download for a page nobody sees is wasted LAN
+        // and battery (the loader cancels the transfer once its last waiter is gone).
+        loadTask?.cancel()
+        originalTask?.cancel()
         detailTask?.cancel()
+        detailTask = nil
+        livePrefetch?.cancel()
+        livePrefetch = nil
         if hasDetail {                               // give the big bitmap back
             hasDetail = false
             reload()
@@ -436,7 +460,10 @@ final class PhotoPageController: UIViewController, ViewerPage, PHLivePhotoViewDe
 
     func reload() {
         loadTask?.cancel()
+        originalTask?.cancel()
         detailTask?.cancel()
+        detailTask = nil
+        hasThumb = false
         hasOriginal = false
         hasDetail = false
         editKey = currentEditKey()
@@ -445,13 +472,40 @@ final class PhotoPageController: UIViewController, ViewerPage, PHLivePhotoViewDe
         } else if let m = model.images.micro(id) {
             show(m, nil)
         }
+        startThumbnail()
+        startOriginal()
+    }
+
+    /// Pass 1: the thumbnail (cheap and cancellable). Neighbour pages run it too, so a swipe
+    /// lands on a sharp preview.
+    private func startThumbnail() {
+        guard !hasThumb else { return }
+        loadTask?.cancel()
         loadTask = Task { [weak self] in
             guard let self else { return }
-            if let t = await self.model.images.thumbnail(self.id), !Task.isCancelled { self.show(t, nil) }
-            if let o = await self.model.images.original(self.id, maxPixel: Self.screenPassPixels), !Task.isCancelled {
+            if let t = await self.model.images.thumbnail(self.id), !Task.isCancelled {
+                self.hasThumb = true
+                if !self.hasOriginal { self.show(t, nil) }       // never paint over the sharper original
+            }
+        }
+    }
+
+    /// Pass 2: the original, decoded for the screen. Only for the page on screen, after it has
+    /// settled (unless the file is already local): a fast swipe through N photos requests none.
+    private func startOriginal() {
+        guard visible, !hasOriginal, originalTask == nil || originalTask?.isCancelled == true else { return }
+        originalTask = Task { [weak self] in
+            guard let self else { return }
+            let images = self.model.images
+            if self.id > 0, images.cachedMediaFile(self.id, live: false) == nil, images.localAsset(self.id) == nil {
+                try? await Task.sleep(nanoseconds: Self.settleNanos)
+                guard !Task.isCancelled else { return }
+            }
+            if let o = await images.original(self.id, maxPixel: Self.screenPassPixels), !Task.isCancelled {
                 self.show(o.image, o.pixelSize)
                 self.hasOriginal = true
             }
+            if !Task.isCancelled { self.originalTask = nil }     // a replaced task must not clear its successor
         }
     }
 

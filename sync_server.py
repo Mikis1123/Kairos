@@ -673,6 +673,7 @@ class SyncServer:
         self._seq_cond = threading.Condition()
         self._top_seq = self._read_top()
         self._stop = threading.Event()
+        self.advertiser = None                    # lan_discovery.Advertiser while announced (advertise())
         self._httpd = _Server((host, port), self._handler_class())
         self._httpd.sync_server = self
         self.host, self.port = host, self._httpd.server_address[1]
@@ -724,8 +725,21 @@ class SyncServer:
                f"&pin={pin}&v={PROTOCOL}")
         return {"pin": pin, "uri": uri, "expires_s": PIN_TTL_S}
 
+    def advertise(self):
+        """Announces the bridge as `_kairos._tcp` (Bonjour) so a phone whose paired IP went stale
+        (DHCP, a new router, another Wi-Fi) finds the desktop again. Best effort; True when live.
+        Off by default so tests that build servers never multicast."""
+        if self.advertiser is None:
+            import lan_discovery
+            adv = lan_discovery.Advertiser(self.port, self.fingerprint, self.library_id, self.name, PROTOCOL)
+            self.advertiser = adv
+        return bool(self.advertiser.start())
+
     def shutdown(self):
         self._stop.set()
+        adv, self.advertiser = self.advertiser, None
+        if adv is not None:
+            adv.stop()
         with self._seq_cond:
             self._seq_cond.notify_all()
         self._httpd.shutdown()
@@ -1681,8 +1695,9 @@ def set_remote_change_handler(fn):
         srv.on_remote_change = fn
 
 
-def start(port=DEFAULT_PORT, host="0.0.0.0"):
-    """Starts the bridge (idempotent). None when it cannot start (port taken, DB locked)."""
+def start(port=DEFAULT_PORT, host="0.0.0.0", advertise=False):
+    """Starts the bridge (idempotent). None when it cannot start (port taken, DB locked).
+    advertise = also announce it over Bonjour (the desktop app does, tests do not)."""
     global _service, last_error
     with _service_lock:
         if _service is None:
@@ -1694,13 +1709,16 @@ def start(port=DEFAULT_PORT, host="0.0.0.0"):
                 return None
             last_error = None
             _service.on_remote_change = _remote_handler
-    return _service
+        srv = _service
+    if advertise and srv is not None:
+        srv.advertise()                           # outside the lock: registering takes ~1 s
+    return srv
 
 
 def start_async(port=DEFAULT_PORT, host="0.0.0.0", on_ready=None):
     """GUI entry point: schema install, certificate and bind run on a worker thread."""
     def run():
-        srv = start(port, host)
+        srv = start(port, host, advertise=True)
         if on_ready is not None:
             on_ready(srv)
     threading.Thread(target=run, name="sync-start", daemon=True).start()
@@ -1743,6 +1761,7 @@ def main(argv=None):
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args(argv)
     srv = SyncServer(host=args.host, port=args.port)
+    srv.advertise()
     offer = srv.begin_pairing()
     print(f"Kairos sync on {srv.host}:{srv.port}  library {srv.library_id}")
     print(f"certificate sha256 {srv.fingerprint}")

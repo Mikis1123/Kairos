@@ -249,7 +249,8 @@ struct LibraryGridView: View {
             if e.live { Image(systemName: "livephoto") }
             if e.isVideo { Image(systemName: "play.fill") }
         }
-        .font(.system(size: 10, weight: .semibold))
+        .font(Kairos.Typography.badge)
+        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)         // a grid cell has a fixed size
         .foregroundStyle(.white)
         .shadow(radius: 2)
         .padding(4)
@@ -264,13 +265,17 @@ struct SectionHeader: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: Kairos.Space.sm) {
             Text(SectionHeader.title(section))
-                .font(Kairos.Typography.headline)
+                .font(Kairos.Typography.sectionHeader)
                 .foregroundStyle(Kairos.Palette.text)
+                .lineLimit(2)
             Text("\(section.entries.count)")
-                .font(Kairos.Typography.caption)
+                .font(Kairos.Typography.counter)
                 .foregroundStyle(Kairos.Palette.textTertiary)
+                .fixedSize()
             Spacer()
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
         .padding(.horizontal, Kairos.Space.md)
         .padding(.vertical, Kairos.Space.sm)
         .background(.ultraThinMaterial)
