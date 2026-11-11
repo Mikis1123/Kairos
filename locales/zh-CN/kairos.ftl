@@ -1041,3 +1041,19 @@ pair-failed = 同步服务无法启动。端口 { $port } 可能已被其他应�
 pair-done = { $device } 已配对并正在同步。
 pair-address = { $name } · { $address }
 pair-device-fallback = iPhone
+
+# Settings redesign: category rail, search, card menus
+settings-nav-library = 图库
+settings-nav-appearance = 外观
+settings-nav-music = 音乐
+settings-nav-recognition = 识别
+settings-nav-storage = 存储与缓存
+settings-nav-privacy = 隐私
+settings-search-placeholder = 搜索设置…
+settings-search-empty = 没有与“{ $query }”匹配的设置。
+settings-card-menu = 更多操作
+settings-folders-empty = 还没有文件夹。请添加第一个。
+settings-add-folder-action = + 添加文件夹
+settings-music-empty = 还没有自己的曲目。
+settings-search-card = 搜索与文字
+settings-perf-card = 性能与电池

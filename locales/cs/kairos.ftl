@@ -1213,3 +1213,19 @@ pair-failed = Synchronizaci se nepodařilo spustit. Port { $port } možná použ
 pair-done = { $device } je spárovaný a synchronizuje se.
 pair-address = { $name } · { $address }
 pair-device-fallback = iPhone
+
+# Settings redesign: category rail, search, card menus
+settings-nav-library = Knihovna
+settings-nav-appearance = Vzhled
+settings-nav-music = Hudba
+settings-nav-recognition = Rozpoznávání
+settings-nav-storage = Úložiště a mezipaměť
+settings-nav-privacy = Soukromí
+settings-search-placeholder = Hledat v nastavení…
+settings-search-empty = Nic nenalezeno pro „{ $query }“.
+settings-card-menu = Další akce
+settings-folders-empty = Zatím žádná složka. Přidejte první.
+settings-add-folder-action = + Přidat složku
+settings-music-empty = Zatím žádné vlastní skladby.
+settings-search-card = Hledání a text
+settings-perf-card = Výkon a baterie

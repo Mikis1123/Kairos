@@ -1159,3 +1159,19 @@ pair-failed = The sync service couldn't start. Another app may be using port { $
 pair-done = { $device } is paired and syncing.
 pair-address = { $name } · { $address }
 pair-device-fallback = iPhone
+
+# Settings redesign: category rail, search, card menus
+settings-nav-library = Library
+settings-nav-appearance = Appearance
+settings-nav-music = Music
+settings-nav-recognition = Recognition
+settings-nav-storage = Storage and cache
+settings-nav-privacy = Privacy
+settings-search-placeholder = Search settings…
+settings-search-empty = No settings match “{ $query }”.
+settings-card-menu = More actions
+settings-folders-empty = No folders yet. Add the first one.
+settings-add-folder-action = + Add folder
+settings-music-empty = No tracks of your own yet.
+settings-search-card = Search and text
+settings-perf-card = Performance and battery

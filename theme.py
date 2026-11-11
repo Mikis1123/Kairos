@@ -32,7 +32,7 @@ TOKENS = {
     "light": {
         "bg": "#F5F5F7", "bg_sunken": "#ECECEF", "surface": "#FFFFFF", "surface_hover": "#F0F0F2",
         "surface_pressed": "#E5E5EA", "placeholder": "#E5E5EA", "separator": "#D1D1D6",
-        "text": "#1D1D1F", "text_secondary": "#6E6E73", "text_tertiary": "#8E8E93", "text_muted": "#6E6E73",
+        "text": "#1D1D1F", "text_secondary": "#646469", "text_tertiary": "#8E8E93", "text_muted": "#646469",
         "text_on_accent": "#FFFFFF", "accent": "#007AFF", "danger": "#FF3B30", "warning": "#FF9500",
         "success": "#34C759", "hairline": "rgba(0,0,0,0.08)",
     },

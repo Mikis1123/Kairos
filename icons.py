@@ -63,6 +63,7 @@ ICONS = {
     "echo": '<rect x="3.5" y="7.5" width="10" height="10" rx="2"/><path d="M16.5 7.5a6 6 0 0 1 0 10M19 5a9.5 9.5 0 0 1 0 15"/>',
     # Alba: dva listy přes sebe (Sprint 2)
     "album": '<rect x="3.5" y="7.5" width="17" height="13" rx="2.5"/><path d="M6.5 4.5h11"/>',
+    "more": '<circle cx="5.5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="18.5" cy="12" r="1.2"/>',
     "chevron_down": '<path d="M7 10l5 5 5-5"/>',
     "sparkle":'<path d="M12 3.5q1 7.5 8.5 8.5q-7.5 1-8.5 8.5q-1-7.5-8.5-8.5q7.5-1 8.5-8.5z"/>',
     # Sprint 4: Sestřihy (filmový pás s přehráním)

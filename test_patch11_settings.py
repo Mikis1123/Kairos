@@ -468,10 +468,12 @@ class TestSettingsDialog(unittest.TestCase):
         self.addCleanup(dlg.deleteLater)
         return dlg
 
-    def test_standard_and_advanced_tabs(self):
+    def test_category_pages(self):
         dlg = self.dialog()
-        names = [dlg.tabs.tabText(i) for i in range(dlg.tabs.count())]
-        self.assertEqual(names, ["Standardní", "Pokročilé", "O aplikaci"])
+        names = [t for _b, t in dlg._nav]
+        self.assertEqual(names[:7], ["Knihovna", "Vzhled", "Hudba", "Rozpoznávání", "Úložiště a mezipaměť",
+                                     "Mapa offline", "Soukromí"])
+        self.assertEqual(names[-1], "O aplikaci")
         self.assertEqual(dlg.slider_threshold.minimum(), 30)
         self.assertEqual(dlg.slider_lru.maximum(), 4000)
 

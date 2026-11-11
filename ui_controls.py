@@ -142,7 +142,7 @@ class KButton(_Interactive, QPushButton):
         if v == "primary":
             return _c(t, "fill"), _c(t, "fill_hover"), _c(t, "fill_pressed"), _c(t, "on_accent"), clear
         if v == "danger":
-            base = _c(t, "danger")
+            base = _c(t, "danger_fill")        # white text on it >= 4.5 : 1 (WCAG AA)
             return base, tokens.mix(base, QColor("#FFFFFF"), .14), tokens.mix(base, QColor("#000000"), .12), \
                 QColor("#FFFFFF"), clear
         if v == "danger_outline":

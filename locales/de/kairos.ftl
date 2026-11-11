@@ -1158,3 +1158,19 @@ pair-failed = Die Synchronisierung konnte nicht starten. Port { $port } wird mö
 pair-done = { $device } ist gekoppelt und synchronisiert.
 pair-address = { $name } · { $address }
 pair-device-fallback = iPhone
+
+# Settings redesign: category rail, search, card menus
+settings-nav-library = Bibliothek
+settings-nav-appearance = Darstellung
+settings-nav-music = Musik
+settings-nav-recognition = Erkennung
+settings-nav-storage = Speicher und Cache
+settings-nav-privacy = Datenschutz
+settings-search-placeholder = Einstellungen durchsuchen…
+settings-search-empty = Keine Einstellung passt zu „{ $query }“.
+settings-card-menu = Weitere Aktionen
+settings-folders-empty = Noch kein Ordner. Fügen Sie den ersten hinzu.
+settings-add-folder-action = + Ordner hinzufügen
+settings-music-empty = Noch keine eigenen Titel.
+settings-search-card = Suche und Text
+settings-perf-card = Leistung und Akku

@@ -26,7 +26,7 @@ NEUTRAL_EXTRA = {
         "hover": "rgba(255, 255, 255, 14)", "pressed": "rgba(255, 255, 255, 8)",
         "scroll": "rgba(255, 255, 255, 56)", "scroll_hover": "rgba(255, 255, 255, 100)",
         "knob": "#FFFFFF", "knob_border": "rgba(0, 0, 0, 70)",
-        "danger_text": "#FF453A", "danger_border": "rgba(255, 69, 58, 90)", "danger_soft": "rgba(255, 69, 58, 34)",
+        "danger_fill": "#D92D22", "danger_text": "#FF453A", "danger_border": "rgba(255, 69, 58, 90)", "danger_soft": "rgba(255, 69, 58, 34)",
         "warning_text": "#FF9F0A", "warning_border": "rgba(255, 159, 10, 90)", "warning_soft": "rgba(255, 159, 10, 30)",
         # kreslené ovládací prvky (dávka 2)
         "pill": "rgba(255, 255, 255, 24)", "pill_border": "rgba(255, 255, 255, 16)",
@@ -40,8 +40,8 @@ NEUTRAL_EXTRA = {
         "hover": "rgba(0, 0, 0, 11)", "pressed": "rgba(0, 0, 0, 20)",
         "scroll": "rgba(0, 0, 0, 60)", "scroll_hover": "rgba(0, 0, 0, 105)",
         "knob": "#FFFFFF", "knob_border": "rgba(0, 0, 0, 55)",
-        "danger_text": "#D70015", "danger_border": "rgba(215, 0, 21, 80)", "danger_soft": "rgba(255, 59, 48, 26)",
-        "warning_text": "#C93400", "warning_border": "rgba(201, 52, 0, 80)", "warning_soft": "rgba(255, 149, 0, 30)",
+        "danger_fill": "#D70015", "danger_text": "#D70015", "danger_border": "rgba(215, 0, 21, 80)", "danger_soft": "rgba(255, 59, 48, 26)",
+        "warning_text": "#B82E00", "warning_border": "rgba(184, 46, 0, 80)", "warning_soft": "rgba(255, 149, 0, 30)",
         "pill": "#FFFFFF", "pill_border": "rgba(0, 0, 0, 18)",
         "seg_track": "#E5E5EA", "seg_thumb": "#FFFFFF", "switch_off": "#D1D1D6", "shadow": "rgba(0, 0, 0, 40)",
         "sidebar": "#ECECEF", "scrim": "rgba(0, 0, 0, 60)",
@@ -579,6 +579,10 @@ QListWidget {{
 QListWidget::item {{ padding: 3px 8px; border-radius: {RADIUS['xs']}px; }}
 QListWidget::item:hover {{ background-color: {t['hover']}; }}
 QListWidget::item:selected {{ background-color: {t['fill']}; color: {t['on_accent']}; }}
+QListWidget::indicator {{
+    width: 16px; height: 16px; border-radius: 5px; border: 1px solid {t['text_secondary']}; background-color: {t['surface']};
+}}
+QListWidget::indicator:checked {{ background-color: {t['fill']}; border-color: {t['fill']}; image: {_url(check)}; }}
 
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
 QScrollBar::handle:vertical {{ background: {t['scroll']}; border-radius: 3px; min-height: 32px; }}
@@ -668,13 +672,18 @@ QLabel#hint {{ color: {t['text_secondary']}; font-size: 12px; }}
 QDialog#settingsSheet {{ background: transparent; }}
 QLabel#sheetHeader {{ {qss_font('headline')} color: {t['text']}; padding-bottom: 2px; }}
 QLabel#impact {{ color: {t['warning_text']}; font-size: 12px; }}
-QLabel#groupTitle {{ color: {t['text_tertiary']}; font-size: 11px; font-weight: 600; padding: 12px 4px 2px 4px; }}
-QFrame#group {{ background-color: {t['surface']}; border: 1px solid {t['hairline']}; border-radius: {RADIUS['md']}px; }}
-QFrame#rowSep {{ background-color: {t['hairline']}; border: none; margin-left: 14px; }}
+QLabel#groupTitle {{ color: {t['text_secondary']}; font-size: 11px; font-weight: 600; padding: 12px 4px 2px 4px; }}
+QFrame#group {{ background-color: {t['surface']}; border: 1px solid {t['hairline']}; border-radius: {RADIUS['lg']}px; }}
+QWidget#cardHead {{ background: transparent; }}
+QLabel#cardTitle {{ color: {t['text']}; font-size: 14px; font-weight: 600; }}
+QLabel#pageHeading {{ {qss_font('headline')} color: {t['text']}; padding: 0 2px 2px 2px; }}
+QFrame#rowSep {{ background-color: {t['hairline']}; border: none; margin: 0 18px; }}
 QWidget#row {{ background: transparent; }}
 QLabel#rowValue {{ color: {t['text_secondary']}; font-size: 13px; }}
 QScrollArea {{ border: none; background: transparent; }}
-QWidget#page {{ background-color: {t['bg']}; }}
+QWidget#page {{ background: transparent; }}
+QFrame#rail {{ background: transparent; border: none; }}
+QLineEdit#settingsSearch {{ min-height: 20px; padding: 6px 10px; border-radius: {RADIUS['sm']}px; }}
 
 QTabWidget::pane {{
     border: 1px solid {t['hairline_strong']}; background-color: {t['bg']};
@@ -692,7 +701,7 @@ QPushButton {{ font-size: 12px; font-weight: 600; padding: 7px 14px; }}
 QPushButton#btnSave {{ background-color: {t['fill']}; color: {t['on_accent']}; border: none; padding: 8px 20px; }}
 QPushButton#btnSave:hover {{ background-color: {t['fill_hover']}; }}
 QPushButton#btnSave:pressed {{ background-color: {t['fill_pressed']}; }}
-QPushButton#btnDanger {{ background-color: {t['danger']}; color: #FFFFFF; border: none; padding: 8px 18px; }}
+QPushButton#btnDanger {{ background-color: {t['danger_fill']}; color: #FFFFFF; border: none; padding: 8px 18px; }}
 QPushButton#btnReset {{ color: {t['danger_text']}; border: 1px solid {t['danger_border']}; background-color: transparent; }}
 QPushButton#btnReset:hover {{ background-color: {t['danger_soft']}; border-color: {t['danger_text']}; }}
 QPushButton#btnReset:disabled {{ color: {t['text_tertiary']}; border-color: {t['hairline']}; }}

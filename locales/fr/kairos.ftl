@@ -1158,3 +1158,19 @@ pair-failed = La synchronisation n’a pas pu démarrer. Une autre app utilise p
 pair-done = { $device } est jumelé et se synchronise.
 pair-address = { $name } · { $address }
 pair-device-fallback = iPhone
+
+# Settings redesign: category rail, search, card menus
+settings-nav-library = Bibliothèque
+settings-nav-appearance = Apparence
+settings-nav-music = Musique
+settings-nav-recognition = Reconnaissance
+settings-nav-storage = Stockage et cache
+settings-nav-privacy = Confidentialité
+settings-search-placeholder = Rechercher dans les réglages…
+settings-search-empty = Aucun réglage ne correspond à « { $query } ».
+settings-card-menu = Autres actions
+settings-folders-empty = Aucun dossier pour l’instant. Ajoutez le premier.
+settings-add-folder-action = + Ajouter un dossier
+settings-music-empty = Aucun morceau personnel pour l’instant.
+settings-search-card = Recherche et texte
+settings-perf-card = Performance et batterie

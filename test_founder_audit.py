@@ -375,7 +375,8 @@ def test_settings_opens_as_in_window_sheet(tmp_path, monkeypatch):
     assert result == 1
     assert seen["visible"]
     card = seen["card"]
-    assert card.width() <= 720 and card.height() <= 820 and win.rect().contains(card)
+    from settings_dialog import PANEL_SIZE        # category rail + content: wider than the old 720 px card
+    assert card.width() <= PANEL_SIZE[0] and card.height() <= PANEL_SIZE[1] and win.rect().contains(card)
     win.close()
 
 

@@ -1041,3 +1041,19 @@ pair-failed = 同期サービスを起動できませんでした。別のアプ
 pair-done = { $device } はペアリングされ、同期中です。
 pair-address = { $name } · { $address }
 pair-device-fallback = iPhone
+
+# Settings redesign: category rail, search, card menus
+settings-nav-library = ライブラリ
+settings-nav-appearance = 外観
+settings-nav-music = 音楽
+settings-nav-recognition = 認識
+settings-nav-storage = ストレージとキャッシュ
+settings-nav-privacy = プライバシー
+settings-search-placeholder = 設定を検索…
+settings-search-empty = 「{ $query }」に一致する設定はありません。
+settings-card-menu = その他の操作
+settings-folders-empty = フォルダはまだありません。最初のフォルダを追加してください。
+settings-add-folder-action = + フォルダを追加
+settings-music-empty = 独自のトラックはまだありません。
+settings-search-card = 検索とテキスト
+settings-perf-card = パフォーマンスとバッテリー

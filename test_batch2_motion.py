@@ -225,14 +225,16 @@ class TestSettingsControls(unittest.TestCase):
                 mock.patch.object(settings_dialog, "load_config", return_value=dict(cfg or {})):
             return settings_dialog.SettingsDialog()
 
-    def test_segmented_switches_tabs_and_tab_bar_is_hidden(self):
+    def test_category_rail_switches_pages(self):
         dlg = self.make()
-        self.assertTrue(dlg.tabs.tabBar().isHidden())
-        self.assertEqual([s.text() for s in dlg.tab_switch.segments], ["Standardní", "Pokročilé", "O aplikaci"])
-        dlg.tab_switch.segments[1].click()
-        self.assertEqual(dlg.tabs.currentIndex(), 1)
-        dlg.tabs.setCurrentIndex(2)
-        self.assertEqual(dlg.tab_switch.current_key(), 2)
+        self.assertEqual([t for _b, t in dlg._nav],
+                         ["Knihovna", "Vzhled", "Hudba", "Rozpoznávání", "Úložiště a mezipaměť", "Mapa offline",
+                          "Soukromí", "O aplikaci"])
+        self.assertEqual(dlg.pages.count(), 8)
+        dlg._nav[4][0].click()
+        self.assertEqual(dlg.pages.currentIndex(), 4)
+        dlg.pages.setCurrentIndex(2)
+        self.assertTrue(dlg._nav[2][0].isChecked())
         dlg.deleteLater()
 
     def test_switches_replace_checkboxes_and_save(self):
